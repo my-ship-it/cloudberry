@@ -1,6 +1,6 @@
 #!/bin/bash
 # The subscription DDL and the launcher, source and target in one cluster (two
-# databases).  CREATE SUBSCRIPTION ... WITH (mpp) is taken apart by the
+# databases).  A loaded module means CREATE SUBSCRIPTION is taken apart by its
 # ProcessUtility hook: the server's own subscription stays disabled, so its
 # launcher starts nothing, and the state the module acts on is its own row in
 # gp_mpp_subscription.
@@ -11,6 +11,11 @@
 #      none on the segments (the server's launcher must not start a stock one)
 #   3  changes replicate
 #   4  DISABLE stops the worker and ENABLE brings it back
+#   5  the options the module owns are refused with a reason: connect (in
+#      either direction) and create_slot = true
+#   6  enabled = false creates the subscription without starting it
+#   7  mpp = false leaves the statement to the server, and the module's
+#      launcher keeps its hands off the result
 #
 # Usage: subscription_ddl.sh [-s <port>]   (default 7100, target database lrdst)
 source ~/cloudberry-db-devel/cloudberry-env.sh 2>/dev/null
@@ -27,6 +32,20 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS+1)); }
 ok()   { echo "  ok: $*"; }
 workers() { $D -c "SELECT count(*) FROM pg_stat_activity
                     WHERE backend_type = 'mpp apply worker' AND datname = current_database()"; }
+# One worker per enabled row of the registry, once things settle.  Subscription
+# DDL invalidates the subscription syscache for every worker in the database,
+# so each of them stops and is started again a few seconds later: the count
+# flaps while that happens, and only the settled value means anything.
+settled_workers() {
+  local want n k
+  want=$($D -c "SELECT count(*) FROM pg_catalog.gp_mpp_subscription WHERE enabled")
+  for k in $(seq 1 40); do
+    n=$(workers)
+    [ "$n" = "$want" ] && { echo "$n"; return 0; }
+    sleep 0.5
+  done
+  echo "$n"; return 1
+}
 echo "==== source: table + publication + seed"
 $Q -c "DROP PUBLICATION IF EXISTS r1_pub" >/dev/null 2>&1
 $Q -c "DROP TABLE IF EXISTS r1_t" >/dev/null
@@ -42,8 +61,11 @@ $D -c "DROP TABLE IF EXISTS r1_t" >/dev/null; $D -c "CREATE TABLE r1_t (id int P
 $Q -c "COPY r1_t TO STDOUT" | $D -c "COPY r1_t FROM STDIN"
 echo "source=$($Q -c 'SELECT count(*) FROM r1_t') target=$($D -c 'SELECT count(*) FROM r1_t')"
 echo "==== CREATE SUBSCRIPTION ... WITH (mpp) in a transaction block (allowed: nothing connects)"
-$D -c "DROP SUBSCRIPTION IF EXISTS r1_sub" >/dev/null 2>&1
-$D -c "BEGIN; CREATE SUBSCRIPTION r1_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (mpp, slot_name='r1_slot', copy_data=false, two_phase=on); COMMIT" 2>&1 | grep -vE '^NOTICE|^DETAIL|^$' | tail -1
+for sub in r1_sub r1_off r1_stock; do
+  $D -c "ALTER SUBSCRIPTION $sub SET (slot_name = NONE)" >/dev/null 2>&1
+  $D -c "DROP SUBSCRIPTION IF EXISTS $sub" >/dev/null 2>&1
+done
+$D -c "BEGIN; CREATE SUBSCRIPTION r1_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (slot_name='r1_slot', copy_data=false, two_phase=on); COMMIT" 2>&1 | grep -vE '^NOTICE|^DETAIL|^HINT|^$' | tail -1
 [ "$($D -c "SELECT subenabled FROM pg_subscription WHERE subname='r1_sub'")" = "f" ] \
   && ok "the server's own subscription row stays disabled" \
   || fail "pg_subscription.subenabled is true: the server's launcher will start a worker of its own"
@@ -73,6 +95,47 @@ for k in $(seq 1 20); do [ "$(workers)" = "0" ] && break; sleep 0.5; done
 $D -c "ALTER SUBSCRIPTION r1_sub ENABLE" >/dev/null
 for k in $(seq 1 20); do [ "$(workers)" = "1" ] && break; sleep 0.5; done
 [ "$(workers)" = "1" ] && ok "ENABLE started it again" || fail "no worker after ENABLE"
+
+echo; echo "==== options the module owns are refused, with a reason"
+for opt in "connect=false" "connect=true" "create_slot=true"; do
+  msg=$($D -c "CREATE SUBSCRIPTION r1_bad CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (slot_name='r1_slot', $opt)" 2>&1 | grep '^ERROR' | head -1)
+  case "$msg" in
+    *"not accepted"*|*"not supported"*) ok "$opt refused: ${msg#ERROR:  }" ;;
+    "")                                 fail "$opt was accepted" ;;
+    *)                                  fail "$opt refused for the wrong reason: $msg" ;;
+  esac
+done
+msg=$($D -c "CREATE SUBSCRIPTION r1_bad CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub" 2>&1 | grep '^ERROR' | head -1)
+case "$msg" in
+  *"requires slot_name"*) ok "a missing slot_name is refused" ;;
+  *)                      fail "a missing slot_name gave: ${msg:-no error at all}" ;;
+esac
+
+echo; echo "==== enabled = false creates the subscription without starting it"
+$D -c "DROP SUBSCRIPTION IF EXISTS r1_off" >/dev/null 2>&1
+$D -c "CREATE SUBSCRIPTION r1_off CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (slot_name='r1_slot', copy_data=false, enabled=false)" 2>&1 | grep -vE '^NOTICE|^DETAIL|^HINT|^$' | head -2
+[ "$($D -c "SELECT enabled FROM pg_catalog.gp_mpp_subscription WHERE subname='r1_off'")" = "f" ] \
+  && ok "registry row created disabled" || fail "enabled = false was ignored"
+n=$(settled_workers) \
+  && ok "still one worker, for the enabled subscription only" \
+  || fail "workers settled at $n, expected one per enabled registry row"
+$D -c "DROP SUBSCRIPTION r1_off" >/dev/null 2>&1
+
+echo; echo "==== mpp = false is left to the server, and the module ignores it"
+$D -c "DROP SUBSCRIPTION IF EXISTS r1_stock" >/dev/null 2>&1
+# a slot name of its own: dropping a subscription of the server's kind goes
+# to the publisher to drop the slot, which must not be the running one's
+$D -c "CREATE SUBSCRIPTION r1_stock CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (mpp=false, connect=false, slot_name='r1_stock_slot')" 2>&1 | grep -vE '^NOTICE|^DETAIL|^HINT|^$' | head -2
+[ "$($D -c "SELECT count(*) FROM pg_catalog.gp_mpp_subscription WHERE subname='r1_stock'")" = "0" ] \
+  && ok "no registry row: the module did not claim it" || fail "the module claimed an mpp = false subscription"
+# the launcher does look at every disabled subscription that names a slot; the
+# worker it starts must find no registry row, disown it and go, leaving only
+# the running subscription's own worker behind
+n=$(settled_workers) \
+  && ok "no worker of its own was left running" \
+  || fail "workers settled at $n, expected one per enabled registry row"
+$D -c "ALTER SUBSCRIPTION r1_stock SET (slot_name = NONE)" >/dev/null 2>&1
+$D -c "DROP SUBSCRIPTION r1_stock" >/dev/null 2>&1
 
 echo; echo "==== worker log"
 f=$(ls -t "$($Q -c 'SHOW data_directory')"/log/*.csv | head -1)

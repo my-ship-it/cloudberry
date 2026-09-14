@@ -105,26 +105,48 @@ segment and on the coordinator, under one name:
                                               false, true)
      ORDER BY 1;
 
-On the target:
+On the target, ordinary syntax -- a loaded module means the subscription
+is applied by it:
 
     CREATE SUBSCRIPTION s
         CONNECTION 'host=... port=... dbname=...'
         PUBLICATION p
-        WITH (mpp, slot_name = 'sub_s');
+        WITH (slot_name = 'sub_s');
 
-"mpp" is not a subscription option the server knows.  The module takes
-it out of the statement in ProcessUtility_hook and records the
-subscription in pg_catalog.gp_mpp_subscription instead.  It also adds
-connect = false, which leaves the pg_subscription row disabled: that is
-deliberate and is what keeps the server's own launcher from starting a
-stock apply worker, which on Cloudberry would fail for ever
-("connections to primary segments are not allowed").  ENABLE, DISABLE,
-REFRESH PUBLICATION and DROP SUBSCRIPTION are intercepted the same way,
-so they read as usual; gp_mpp_subscription.enabled, not
-pg_subscription.subenabled, is what says a subscription is running.
-
+slot_name is the one option that must be given: it names the slots made
+above, which the readers stream from, and nothing can guess it.
 WITH (copy_data = false) declares the tables already in sync, so the
-driver starts streaming without copying.
+driver starts streaming without copying, and WITH (enabled = false)
+creates the subscription without starting it.
+
+The statement is rewritten in ProcessUtility_hook: the subscription is
+recorded in pg_catalog.gp_mpp_subscription, and connect = false is added
+so that the pg_subscription row stays disabled.  That is what keeps the
+server's own launcher from starting a stock apply worker, which on
+Cloudberry would write the rows on the coordinator, where no user table
+has any.  ENABLE, DISABLE, REFRESH PUBLICATION and DROP SUBSCRIPTION are
+intercepted the same way, so they read as usual;
+gp_mpp_subscription.enabled, not pg_subscription.subenabled, is what
+says a subscription is running.
+
+Two options are therefore not the user's to give, and are refused with a
+reason rather than silently overridden:
+
+    connect          the module sets it; a subscription dumped by
+                     pg_dump carries "connect = false" and has to have
+                     it removed, or be dumped with --no-subscriptions
+    create_slot      the slots are cluster-wide and only
+                     gp_create_logical_replication_slot() can make them
+
+WITH (mpp) is still accepted and means nothing extra.  WITH (mpp = false)
+is the way to ask for a subscription of the server's own kind, which the
+module then leaves entirely alone.
+
+DROP SUBSCRIPTION does not touch the publisher: the slots were not the
+module's to create and are not its to drop, which is also what lets the
+statement run in a transaction block.  Drop them on the publisher with
+gp_drop_replication_slot('sub_s') once nothing needs them -- a forgotten
+set of slots holds down the WAL of every primary segment there.
 
 
 Requirements on the tables

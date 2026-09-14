@@ -8,15 +8,19 @@
  * function or something the server offers every extension.  The three
  * pieces that are not obviously either are here:
  *
- * 1. The subscription option.  "CREATE SUBSCRIPTION ... WITH (mpp)" is not
- *	  a syntax an extension can add, but ProcessUtility_hook sees the parsed
- *	  statement before the server acts on it, so the option can be taken out
- *	  of the list (the server would reject what it does not know) and the
- *	  subscription remembered here instead.  connect = false is added at the
- *	  same time: that leaves the catalog row disabled, and a disabled
- *	  subscription is one the server's own launcher never starts a worker
- *	  for -- which matters, because a stock apply worker on Cloudberry fails
- *	  for ever ("connections to primary segments are not allowed").
+ * 1. The subscription DDL.  A loaded library is what says a subscription is
+ *	  ours -- there is no option to write, because on Cloudberry there is no
+ *	  second kind that works -- and ProcessUtility_hook sees the parsed
+ *	  statement before the server acts on it.  It adds connect = false, which
+ *	  leaves the catalog row disabled, and a disabled subscription is one the
+ *	  server's own launcher never starts a worker for; a stock apply worker
+ *	  here would write the rows on the coordinator, where no user table has
+ *	  any.  The options that say how to do the things the module replaces
+ *	  (connect, create_slot) are therefore refused rather than obeyed, and
+ *	  the ones that are about the subscription rather than the mechanism
+ *	  (enabled, copy_data) are taken out of the statement and acted on here.
+ *	  "WITH (mpp = false)" asks for a subscription of the server's own kind,
+ *	  which this file then leaves entirely alone.
  *
  * 2. The launcher.  A background worker registered at postmaster start,
  *	  which polls this extension's own registry (mpp_subscription) on the
@@ -639,6 +643,7 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 	Node	   *parsetree = pstmt->utilityStmt;
 	const char *created = NULL;
 	bool		created_nocopy = false;
+	bool		created_enabled = true;
 	Oid			dropped = InvalidOid;
 	bool		dispatch = (Gp_role == GP_ROLE_DISPATCH);
 
@@ -647,30 +652,94 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 		CreateSubscriptionStmt *stmt = (CreateSubscriptionStmt *) parsetree;
 		List	   *keep = NIL;
 		ListCell   *lc;
-		bool		is_mpp = false;
+		bool		is_mpp = true;	/* the module is loaded: this one is ours */
 		bool		has_slot = false;
+		bool		enabled = true;
+		bool		copy_data = true;
 
+		/*
+		 * Options the module owns are taken out of the statement here, and
+		 * acted on below rather than by the server.  The server must not see
+		 * them: it would either not understand them (mpp), or understand them
+		 * as instructions to do the very things the module replaces.
+		 */
 		foreach(lc, stmt->options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc);
 
 			if (strcmp(def->defname, "mpp") == 0)
 			{
+				/*
+				 * Not needed any more -- a loaded module means an MPP
+				 * subscription -- but still accepted, and "mpp = false" is
+				 * how to ask for a subscription of the server's own kind.
+				 */
 				is_mpp = defGetBoolean(def);
-				continue;		/* the server must not see it */
+				continue;
 			}
 			if (strcmp(def->defname, "slot_name") == 0)
-				has_slot = true;
+			{
+				has_slot = (def->arg != NULL &&
+							pg_strcasecmp(defGetString(def), "none") != 0);
+				keep = lappend(keep, def);
+				continue;
+			}
+			if (strcmp(def->defname, "enabled") == 0)
+			{
+				/* ours: the server's row stays disabled either way */
+				enabled = defGetBoolean(def);
+				continue;
+			}
+			if (strcmp(def->defname, "copy_data") == 0)
+			{
+				/* ours: the initial copy is mpp_tablesync.c's, not the server's */
+				copy_data = defGetBoolean(def);
+				continue;
+			}
 			keep = lappend(keep, def);
 		}
 
 		if (is_mpp)
 		{
+			ListCell   *lc2;
+
+			foreach(lc2, keep)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc2);
+
+				/*
+				 * connect is how the module keeps the server out of the way
+				 * (below), so it is not the user's to set -- in either
+				 * direction.  Saying so plainly beats the server's "
+				 * conflicting or redundant options" from a duplicate.
+				 */
+				if (strcmp(def->defname, "connect") == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("\"connect\" is not accepted for a subscription applied by mpp_logicalrep"),
+							 errdetail("The module sets it itself: the statement must not connect to the publisher, must not create a slot, and must leave the pg_subscription row disabled so that the server's own launcher never starts a worker for it."),
+							 errhint("Leave it out.  A subscription dumped by pg_dump carries \"connect = false\" and has to have it removed, or be dumped with --no-subscriptions.")));
+
+				/*
+				 * The slots are cluster-wide -- one per primary segment plus
+				 * the coordinator, under one name, with two-phase decoding on
+				 * -- so only gp_create_logical_replication_slot() can make
+				 * them, and only before the subscription exists.
+				 */
+				if (strcmp(def->defname, "create_slot") == 0 && defGetBoolean(def))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("\"create_slot = true\" is not supported for a subscription applied by mpp_logicalrep"),
+							 errdetail("The publisher needs a slot on every primary segment and on the coordinator, under one name and with two-phase decoding enabled, which this statement cannot create."),
+							 errhint("Create them on the publisher first with gp_create_logical_replication_slot('<name>', 'pgoutput', false, true), then name them here with slot_name.")));
+			}
+
 			if (!has_slot)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("CREATE SUBSCRIPTION ... WITH (mpp) requires slot_name"),
-						 errhint("The name is that of the cluster-wide slots on the publisher, which gp_create_logical_replication_slot() creates.")));
+						 errmsg("a subscription applied by mpp_logicalrep requires slot_name"),
+						 errdetail("It names the cluster-wide slots on the publisher, which the subscription's readers stream from."),
+						 errhint("Create them with gp_create_logical_replication_slot('<name>', 'pgoutput', false, true) on the publisher.")));
 
 			/*
 			 * Leave the catalog row disabled and unconnected: the server's
@@ -683,12 +752,18 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 									   (Node *) makeString("false"), -1));
 			stmt->options = keep;
 			created = stmt->subname;
+			created_enabled = enabled;
 
 			/*
 			 * copy_data = false means the tables are declared in sync, so
 			 * the worker streams at once instead of copying.
 			 */
-			created_nocopy = !option_bool(stmt->options, "copy_data", true);
+			created_nocopy = !copy_data;
+		}
+		else
+		{
+			/* "mpp = false": the server's own, untouched */
+			stmt->options = keep;
 		}
 	}
 	else if (dispatch && IsA(parsetree, AlterSubscriptionStmt))
@@ -775,6 +850,8 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 		{
 			Oid			argtypes[1] = {OIDOID};
 			Datum		values[1];
+			Subscription *sub = GetSubscription(subid, false);
+			char	   *slotname = sub->slotname ? pstrdup(sub->slotname) : NULL;
 
 			/*
 			 * Stop the worker first, then take the slot name off the
@@ -794,6 +871,18 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 								 quote_identifier(stmt->subname)), false, 0);
 			SPI_finish();
 
+			/*
+			 * The slots outlive the subscription because they were never
+			 * ours to create.  Say so: a forgotten set of slots holds down
+			 * the WAL of every primary segment of the publisher.
+			 */
+			if (slotname != NULL)
+				ereport(NOTICE,
+						(errmsg("the replication slots named \"%s\" are left on the publisher",
+								slotname),
+						 errhint("Drop them there with gp_drop_replication_slot('%s') once no subscription needs them; until then the publisher keeps the WAL they hold.",
+								 slotname)));
+
 			dropped = subid;
 		}
 	}
@@ -808,25 +897,34 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 	if (created != NULL)
 	{
 		Oid			subid = get_subscription_oid(created, false);
-		Oid			argtypes[2] = {OIDOID, TEXTOID};
-		Datum		values[2];
+		Oid			argtypes[3] = {OIDOID, TEXTOID, BOOLOID};
+		Datum		values[3];
 
 		values[0] = ObjectIdGetDatum(subid);
 		values[1] = CStringGetTextDatum(created);
+		values[2] = BoolGetDatum(created_enabled);
 		registry_exec("INSERT INTO pg_catalog.gp_mpp_subscription"
-					  " (subid, subname, enabled) VALUES ($1, $2, true)"
+					  " (subid, subname, enabled) VALUES ($1, $2, $3)"
 					  " ON CONFLICT (subid) DO UPDATE"
-					  " SET subname = EXCLUDED.subname, enabled = true,"
+					  " SET subname = EXCLUDED.subname,"
+					  "     enabled = EXCLUDED.enabled,"
 					  "     disable_reason = NULL",
-					  2, argtypes, values);
+					  3, argtypes, values);
 
 		if (created_nocopy)
 			LrSyncMarkNoCopy(subid);
 
-		ereport(NOTICE,
-				(errmsg("subscription \"%s\" will be applied by mpp_logicalrep",
-						created),
-				 errdetail("Its pg_subscription row stays disabled so that the server's own apply worker never starts; pg_catalog.gp_mpp_subscription is what enables it.")));
+		if (created_enabled)
+			ereport(NOTICE,
+					(errmsg("subscription \"%s\" will be applied by mpp_logicalrep",
+							created),
+					 errdetail("Its pg_subscription row stays disabled so that the server's own apply worker never starts; pg_catalog.gp_mpp_subscription is what enables it.")));
+		else
+			ereport(NOTICE,
+					(errmsg("subscription \"%s\" will be applied by mpp_logicalrep, and is not enabled",
+							created),
+					 errhint("Start it with ALTER SUBSCRIPTION %s ENABLE.",
+							 quote_identifier(created))));
 	}
 	else if (OidIsValid(dropped))
 	{
