@@ -201,8 +201,15 @@ retry:
 		break;
 	}
 
-	/* Found tuple, try to lock it in the lockmode. */
-	if (found)
+	/*
+	 * Found tuple, try to lock it in the lockmode.
+	 *
+	 * Append-optimized and PAX relations have no row locks (their AMs reject
+	 * table_tuple_lock); concurrent modification of those is serialized by
+	 * the caller holding ExclusiveLock on the relation, as UPDATE and DELETE
+	 * on them do everywhere else in Cloudberry.
+	 */
+	if (found && !RelationIsNonblockRelation(rel))
 	{
 		TM_FailureData tmfd;
 		TM_Result	res;
@@ -385,8 +392,15 @@ retry:
 		break;
 	}
 
-	/* Found tuple, try to lock it in the lockmode. */
-	if (found)
+	/*
+	 * Found tuple, try to lock it in the lockmode.
+	 *
+	 * Append-optimized and PAX relations have no row locks (their AMs reject
+	 * table_tuple_lock); concurrent modification of those is serialized by
+	 * the caller holding ExclusiveLock on the relation, as UPDATE and DELETE
+	 * on them do everywhere else in Cloudberry.
+	 */
+	if (found && !RelationIsNonblockRelation(rel))
 	{
 		TM_FailureData tmfd;
 		TM_Result	res;

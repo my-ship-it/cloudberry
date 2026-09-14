@@ -456,7 +456,12 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		entry->localrelvalid = true;
 	}
 
-	if (entry->state != SUBREL_STATE_READY)
+	/*
+	 * The MPP apply operators (mpp_writer.c) use this map on writer QEs, where
+	 * no subscription is attached to the process; the per-relation sync state
+	 * is tracked by the coordinator there.
+	 */
+	if (entry->state != SUBREL_STATE_READY && MySubscription != NULL)
 		entry->state = GetSubscriptionRelState(MySubscription->oid,
 											   entry->localreloid,
 											   &entry->statelsn);
