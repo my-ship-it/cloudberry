@@ -187,6 +187,9 @@ typedef struct
 									 * prepare time */
 			char	   *origin; /* Only publish data originating from the
 								 * specified origin */
+			char	   *extra_options;	/* Cloudberry: further output plugin
+										 * options, appended verbatim, e.g.
+										 * "cbdb_gxid 'on'" */
 		}			logical;
 	}			proto;
 } WalRcvStreamOptions;

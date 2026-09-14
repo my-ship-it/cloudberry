@@ -271,6 +271,20 @@ extern void store_flush_position(XLogRecPtr remote_lsn, XLogRecPtr local_lsn);
 
 /* Function for apply error callback */
 extern void apply_error_callback(void *arg);
+
+/*
+ * Tuple and relation helpers shared with out-of-tree apply implementations
+ * (contrib/mpp_logicalrep).
+ */
+extern void slot_store_data(TupleTableSlot *slot, LogicalRepRelMapEntry *rel,
+							LogicalRepTupleData *tupleData);
+extern void slot_modify_data(TupleTableSlot *slot, TupleTableSlot *srcslot,
+							 LogicalRepRelMapEntry *rel,
+							 LogicalRepTupleData *tupleData);
+extern void slot_fill_defaults(LogicalRepRelMapEntry *rel, EState *estate,
+							   TupleTableSlot *slot);
+extern void TargetPrivilegesCheck(Relation rel, AclMode mode);
+extern void check_relation_updatable(LogicalRepRelMapEntry *rel);
 extern void set_apply_error_context_origin(char *originname);
 
 /* Parallel apply worker setup and interactions */

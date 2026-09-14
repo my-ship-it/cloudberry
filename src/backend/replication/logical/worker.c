@@ -749,7 +749,7 @@ finish_edata(ApplyExecutionData *edata)
  * This allows us to support tables which have more columns on the downstream
  * than on the upstream.
  */
-static void
+void
 slot_fill_defaults(LogicalRepRelMapEntry *rel, EState *estate,
 				   TupleTableSlot *slot)
 {
@@ -806,7 +806,7 @@ slot_fill_defaults(LogicalRepRelMapEntry *rel, EState *estate,
  *
  * Incoming data can be either text or binary format.
  */
-static void
+void
 slot_store_data(TupleTableSlot *slot, LogicalRepRelMapEntry *rel,
 				LogicalRepTupleData *tupleData)
 {
@@ -907,7 +907,7 @@ slot_store_data(TupleTableSlot *slot, LogicalRepRelMapEntry *rel,
  * storage for "srcslot".  This is OK for current usage, but someday we may
  * need to materialize "slot" at the end to make it independent of "srcslot".
  */
-static void
+void
 slot_modify_data(TupleTableSlot *slot, TupleTableSlot *srcslot,
 				 LogicalRepRelMapEntry *rel,
 				 LogicalRepTupleData *tupleData)
@@ -2350,7 +2350,7 @@ apply_handle_type(StringInfo s)
  * Check that we (the subscription owner) have sufficient privileges on the
  * target relation to perform the given operation.
  */
-static void
+void
 TargetPrivilegesCheck(Relation rel, AclMode mode)
 {
 	Oid			relid;
@@ -2490,7 +2490,7 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
  * Check if the logical replication relation is updatable and throw
  * appropriate error if it isn't.
  */
-static void
+void
 check_relation_updatable(LogicalRepRelMapEntry *rel)
 {
 	/*

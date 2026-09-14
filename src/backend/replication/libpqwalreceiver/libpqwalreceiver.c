@@ -557,6 +557,10 @@ libpqrcv_startstreaming(WalReceiverConn *conn,
 			PQserverVersion(conn->streamConn) >= 140000)
 			appendStringInfoString(&cmd, ", binary 'true'");
 
+		/* Cloudberry: options the caller knows the plugin understands */
+		if (options->proto.logical.extra_options)
+			appendStringInfo(&cmd, ", %s", options->proto.logical.extra_options);
+
 		appendStringInfoChar(&cmd, ')');
 	}
 	else
