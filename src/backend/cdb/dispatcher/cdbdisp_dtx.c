@@ -70,6 +70,7 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 							  char *gid,
 							  ErrorData **qeError,
 							  int *numresults,
+							  int **segindexes,
 							  List *dtxSegments,
 							  char *serializedDtxContextInfo,
 							  int serializedDtxContextInfoLen)
@@ -120,8 +121,38 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 	if (!pr)
 	{
 		*numresults = 0;
+		if (segindexes != NULL)
+			*segindexes = NULL;
 		cdbdisp_destroyDispatcherState(ds);
 		return NULL;
+	}
+
+	/*
+	 * Which segment each result comes from.  cdbdisp_returnResults() flattens
+	 * the per-QE results into one array and the identity is not in there, but
+	 * the caller needs it to make sense of what a QE reported (cdbtm.c reads
+	 * the write report of a PREPARE this way).  Built before the flattening,
+	 * which empties the per-QE buffers.
+	 */
+	if (segindexes != NULL)
+	{
+		int			total = 0;
+		int			n = 0;
+		int		   *segs;
+
+		for (int i = 0; i < pr->resultCount; ++i)
+			total += cdbdisp_numPGresult(&pr->resultArray[i]);
+		segs = palloc(sizeof(int) * Max(total, 1));
+		for (int i = 0; i < pr->resultCount; ++i)
+		{
+			int			nres = cdbdisp_numPGresult(&pr->resultArray[i]);
+			int			seg = pr->resultArray[i].segdbDesc != NULL ?
+				pr->resultArray[i].segdbDesc->segindex : -1;
+
+			while (nres-- > 0)
+				segs[n++] = seg;
+		}
+		*segindexes = segs;
 	}
 
 	cdbdisp_returnResults(pr, &cdb_pgresults);

@@ -1894,6 +1894,27 @@ RecordDistributedForgetCommitted(DistributedTransactionId gxid)
 }
 
 /*
+ *	RecordDistributedOnePhaseCommit
+ *
+ * Coordinator marker of a one-phase distributed commit (see xact.h).  Only
+ * the position matters, so it is not flushed: the walwriter or the next
+ * flushed record carries it out.
+ */
+XLogRecPtr
+RecordDistributedOnePhaseCommit(DistributedTransactionId gxid, int16 seg)
+{
+	xl_xact_distributed_onephase xlrec;
+
+	xlrec.gxid = gxid;
+	xlrec.seg = seg;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xl_xact_distributed_onephase));
+
+	return XLogInsert(RM_XACT_ID, XLOG_XACT_DISTRIBUTED_ONEPHASE);
+}
+
+/*
  *	AtCCI_LocalCache
  */
 static void
@@ -6982,6 +7003,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_twophase xl_twophase;
 	xl_xact_origin xl_origin;
 	xl_xact_distrib xl_distrib;
+	xl_xact_distrib_segs *xl_segs = NULL;
 	xl_xact_deldbs xl_deldbs;
 	XLogRecPtr recptr;
 	bool isDtxPrepared = isPreparedDtxTransaction();
@@ -7086,6 +7108,32 @@ XactLogCommitRecord(TimestampTz commit_time,
 	{
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_DISTRIB;
 		xl_distrib.distrib_xid = distrib_xid;
+
+		/*
+		 * The coordinator's distributed commit also lists the participating
+		 * segments, for logical decoding of the coordinator's WAL: the
+		 * segments that reported writes at PREPARE when every prepared
+		 * segment reported (possibly none), else the segments the transaction
+		 * was dispatched to.
+		 */
+		if (isDtxPrepared && MyTmGxactLocal != NULL &&
+			(MyTmGxactLocal->dtxWriteSegmentsKnown ||
+			 MyTmGxactLocal->dtxSegments != NIL))
+		{
+			List	   *segs = MyTmGxactLocal->dtxWriteSegmentsKnown ?
+				MyTmGxactLocal->dtxWriteSegments : MyTmGxactLocal->dtxSegments;
+			int			n = list_length(segs);
+			ListCell   *lc;
+			int			i = 0;
+
+			xl_segs = palloc(MinSizeOfXactDistribSegs + n * sizeof(int16));
+			xl_segs->nsegs = (int16) n;
+			foreach(lc, segs)
+				xl_segs->segs[i++] = (int16) lfirst_int(lc);
+			xl_xinfo.xinfo |= XACT_XINFO_HAS_DISTRIB_SEGS;
+			if (MyTmGxactLocal->dtxWriteSegmentsKnown)
+				xl_xinfo.xinfo |= XACT_XINFO_DISTRIB_SEGS_EXACT;
+		}
 	}
 
 #if 0
@@ -7153,6 +7201,9 @@ XactLogCommitRecord(TimestampTz commit_time,
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_DISTRIB)
 		XLogRegisterData((char *) (&xl_distrib), sizeof(xl_xact_distrib));
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_DISTRIB_SEGS)
+		XLogRegisterData((char *) xl_segs,
+						 MinSizeOfXactDistribSegs + xl_segs->nsegs * sizeof(int16));
 
 	/* we allow filtering by xacts */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
@@ -7698,6 +7749,10 @@ xact_redo(XLogReaderState *record)
 		xl_xact_distributed_forget *xlrec = (xl_xact_distributed_forget *) XLogRecGetData(record);
 
 		xact_redo_distributed_forget(xlrec, XLogRecGetXid(record));
+	}
+	else if (info == XLOG_XACT_DISTRIBUTED_ONEPHASE)
+	{
+		/* a marker for logical decoding; nothing to replay */
 	}
 	else if (info == XLOG_XACT_ASSIGNMENT)
 	{

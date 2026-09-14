@@ -187,6 +187,8 @@ typedef struct SavedTransactionCharacteristics
 #define XLOG_XACT_INVALIDATIONS		0x60
 #define XLOG_XACT_DISTRIBUTED_COMMIT 0x70
 #define XLOG_XACT_DISTRIBUTED_FORGET 0x80
+#define XLOG_XACT_DISTRIBUTED_ONEPHASE 0x90	/* coordinator marker of a one-phase
+											 * commit; logical decoding only */
 
 /* mask for filtering opcodes out of xl_info */
 #define XLOG_XACT_OPMASK			0xF0
@@ -209,6 +211,8 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_DROPPED_STATS	(1U << 8)
 #define XACT_XINFO_HAS_DISTRIB			(1U << 9)
 #define XACT_XINFO_HAS_DELDBS			(1U << 10)
+#define XACT_XINFO_HAS_DISTRIB_SEGS		(1U << 11)	/* participating segments follow xl_xact_distrib */
+#define XACT_XINFO_DISTRIB_SEGS_EXACT	(1U << 12)	/* that list is the segments that wrote, not the ones dispatched to */
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
  * need to occur when emulating transaction effects during recovery.
@@ -270,6 +274,20 @@ typedef struct xl_xact_distrib
 {
 	DistributedTransactionId distrib_xid;
 } xl_xact_distrib;
+
+/*
+ * Participating segments of a distributed commit (XACT_XINFO_HAS_DISTRIB_SEGS,
+ * only in the coordinator's XLOG_XACT_DISTRIBUTED_COMMIT record): the content
+ * ids the transaction was dispatched to, i.e. those that prepared.  Lets
+ * logical decoding tell an apply driver which segment streams carry the
+ * transaction.
+ */
+typedef struct xl_xact_distrib_segs
+{
+	int16		nsegs;
+	int16		segs[FLEXIBLE_ARRAY_MEMBER];
+} xl_xact_distrib_segs;
+#define MinSizeOfXactDistribSegs offsetof(xl_xact_distrib_segs, segs)
 
 typedef struct xl_xact_dbinfo
 {
@@ -381,6 +399,17 @@ typedef struct xl_xact_abort
 } xl_xact_abort;
 #define MinSizeOfXactAbort sizeof(xl_xact_abort)
 
+/*
+ * Header of a XLOG_XACT_PREPARE record.  This is also the header of the 2PC
+ * state file (twophase.c typedefs it as TwoPhaseFileHeader), so the layout
+ * here must match exactly what StartPrepare()/EndPrepare() write.  The body
+ * that follows is, in order, each MAXALIGN'd: the GID, the subxact XIDs, the
+ * commit rels, the abort rels, the commit dbs, the abort dbs, the commit
+ * stats, the abort stats and the invalidation messages.
+ *
+ * GPDB: ncommitdbs, nabortdbs and the two tablespace OIDs are Cloudberry
+ * additions to the upstream struct.
+ */
 typedef struct xl_xact_prepare
 {
 	uint32		magic;			/* format identifier */
@@ -392,10 +421,14 @@ typedef struct xl_xact_prepare
 	int32		nsubxacts;		/* number of following subxact XIDs */
 	int32		ncommitrels;	/* number of delete-on-commit rels */
 	int32		nabortrels;		/* number of delete-on-abort rels */
+	int32		ncommitdbs;		/* number of delete-on-commit dbs */
+	int32		nabortdbs;		/* number of delete-on-abort dbs */
 	int32		ncommitstats;	/* number of stats to drop on commit */
 	int32		nabortstats;	/* number of stats to drop on abort */
 	int32		ninvalmsgs;		/* number of cache invalidation messages */
 	bool		initfileinval;	/* does relcache init file need invalidation? */
+	Oid			tablespace_oid_to_delete_on_abort;
+	Oid			tablespace_oid_to_delete_on_commit;
 	uint16		gidlen;			/* length of the GID - GID follows the header */
 	XLogRecPtr	origin_lsn;		/* lsn of this record at origin node */
 	TimestampTz origin_timestamp;	/* time of prepare at origin node */
@@ -437,11 +470,18 @@ typedef struct xl_xact_parsed_commit
 	RelFileNodePendingDelete *abortlocators;	/* only for 2PC */
 	int			nabortstats;	/* only for 2PC */
 	xl_xact_stats_item *abortstats; /* only for 2PC */
+	int			nabortdbs;		/* only for 2PC */
+	DbDirNode  *abortdbs;		/* only for 2PC */
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
 
 	DistributedTransactionId        distribXid;
+	int			nparticipants;	/* XACT_XINFO_HAS_DISTRIB_SEGS; 0 = unknown, -1 = none wrote */
+	int16	   *participants;
+	bool		participants_exact; /* XACT_XINFO_DISTRIB_SEGS_EXACT: every
+									 * listed segment wrote, so each of them
+									 * has the transaction in its stream */
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
@@ -481,6 +521,19 @@ typedef struct xl_xact_distributed_forget
 {
 	DistributedTransactionId gxid;
 } xl_xact_distributed_forget;
+
+/*
+ * xl_xact_distributed_onephase - written by the coordinator, after the single
+ * participating segment acknowledged a one-phase commit and before the gxid
+ * is marked complete, only when wal_level is logical.  Not flushed, ignored
+ * by redo: it exists so that logical decoding of the coordinator's WAL sees
+ * every distributed commit in commit order (mpp logical replication apply).
+ */
+typedef struct xl_xact_distributed_onephase
+{
+	DistributedTransactionId gxid;
+	int16		seg;			/* content id of the participating segment */
+} xl_xact_distributed_onephase;
 
 /* ----------------
  *		extern definitions
@@ -565,6 +618,7 @@ extern void RegisterSubXactCallback(SubXactCallback callback, void *arg);
 extern void UnregisterSubXactCallback(SubXactCallback callback, void *arg);
 
 extern XLogRecPtr RecordDistributedForgetCommitted(DistributedTransactionId gxid);
+extern XLogRecPtr RecordDistributedOnePhaseCommit(DistributedTransactionId gxid, int16 seg);
 extern bool IsSubTransactionAssignmentPending(void);
 extern void MarkSubTransactionAssigned(void);
 extern bool IsSubxactTopXidLogPending(void);

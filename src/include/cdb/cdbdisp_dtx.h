@@ -24,7 +24,9 @@ struct CdbPgResults;
  * Sends a non-cancelable command to all segment dbs, primary
  *
  * Returns a malloc'ed array containing the PGresult objects thus
- * produced; the caller must PQclear() them and free() the array.
+ * produced; the caller must PQclear() them and free() the array.  When
+ * segindexes is given it is filled with an array of the same length saying
+ * which segment each result came from; the caller frees that one too.
  * A NULL entry follows the last used entry in the array.
  *
  * Any error message - whether or not it is associated with an
@@ -36,6 +38,7 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 							  char	*gid,
 							  ErrorData **qeError,
 							  int *resultCount,
+							  int **segindexes,
 							  List *dtxSegments,
 							  char *serializedDtxContextInfo,
 							  int serializedDtxContextInfoLen);

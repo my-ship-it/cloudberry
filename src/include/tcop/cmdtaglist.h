@@ -162,7 +162,13 @@ PG_CMDTAG(CMDTAG_DTX_ABORT_SOME_PREPARED,             "Distributed Abort (Some P
 PG_CMDTAG(CMDTAG_DTX_ABORT_PREPARED,                  "Distributed Abort Prepared", false, false, false)
 PG_CMDTAG(CMDTAG_DTX_COMMIT_ONEPHASE,                 "Distributed Commit (one-phase)", false, false, false)
 PG_CMDTAG(CMDTAG_DTX_COMMIT_PREPARED,                 "Distributed Commit Prepared", false, false, false)
-PG_CMDTAG(CMDTAG_DTX_PREPARE,                         "Distributed Prepare", false, false, false)
+/*
+ * Cloudberry: the row count of a Distributed Prepare carries the segment's
+ * report of whether it wrote anything, for the participant list of the
+ * coordinator's distributed commit record (cdbtm.c).  Not a row count, but
+ * it is the field the completion message already has.
+ */
+PG_CMDTAG(CMDTAG_DTX_PREPARE,                         "Distributed Prepare", false, false, true)
 PG_CMDTAG(CMDTAG_DO, "DO", false, false, false)
 PG_CMDTAG(CMDTAG_DROP_ACCESS_METHOD, "DROP ACCESS METHOD", true, false, false)
 PG_CMDTAG(CMDTAG_DROP_AGGREGATE, "DROP AGGREGATE", true, false, false)

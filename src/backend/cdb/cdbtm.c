@@ -23,6 +23,7 @@
 #include "cdb/cdbtm.h"
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
+#include "tcop/tcopprot.h"
 #include "miscadmin.h"
 #include "replication/syncrep.h"
 #include "storage/lmgr.h"
@@ -39,6 +40,7 @@
 #include "cdb/cdbvars.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "cdb/cdbfts.h"
@@ -122,6 +124,11 @@ int gp_gxid_prefetch_num;
  */
 static void doPrepareTransaction(void);
 static XLogRecPtr doInsertForgetCommitted(void);
+bool		gp_lr_onephase_marker = true;
+
+/* set by performDtxProtocolPrepare(), read by exec_mpp_dtx_protocol_command() */
+static bool dtx_prepare_wrote = false;
+
 static void doNotifyingOnePhaseCommit(void);
 static void doNotifyingCommitPrepared(void);
 static void doNotifyingAbort(void);
@@ -910,12 +917,30 @@ prepareDtxTransaction(void)
 	if (!TopXactExecutorDidWriteXLog() ||
 		(!markXidCommitted && list_length(MyTmGxactLocal->dtxSegments) < 2))
 	{
+		bool		wrote = TopXactExecutorDidWriteXLog();
+
 		setCurrentDtxState(DTX_STATE_ONE_PHASE_COMMIT);
 		/*
 		 * Notify one phase commit to QE before local transaction xlog recording
 		 * since if it fails we still have chance of aborting the transaction.
 		 */
 		doNotifyingOnePhaseCommit();
+
+		/*
+		 * Logical decoding of the coordinator's WAL sees every two-phase
+		 * commit (XLOG_XACT_DISTRIBUTED_COMMIT) but nothing of a one-phase
+		 * one: leave a marker so that a Cloudberry apply driver gets the
+		 * commit order of all distributed transactions from one stream.
+		 * Written after the segment acknowledged (its commit record is
+		 * flushed and decodable) and before the gxid is marked complete, so
+		 * that anything that saw this transaction's effects is ordered after
+		 * it.  Only for transactions that wrote WAL: a read-only one leaves
+		 * no commit record on the segment for the driver to wait for.
+		 */
+		if (wrote && gp_lr_onephase_marker && XLogLogicalInfoActive() &&
+			list_length(MyTmGxactLocal->dtxSegments) == 1)
+			RecordDistributedOnePhaseCommit(MyTmGxact->gxid,
+											(int16) linitial_int(MyTmGxactLocal->dtxSegments));
 		return;
 	}
 
@@ -1299,10 +1324,13 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 					segmentsToContentStr(dtxSegments))));
 
 	ErrorData *qeError;
+	int		   *segindexes = NULL;
+
 	results = CdbDispatchDtxProtocolCommand(dtxProtocolCommand,
 											dtxProtocolCommandStr,
 											gid,
-											&qeError, &resultCount, dtxSegments,
+											&qeError, &resultCount, &segindexes,
+											dtxSegments,
 											serializedDtxContextInfo, serializedDtxContextInfoLen);
 
 	if (qeError)
@@ -1359,12 +1387,61 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 			cmdStatus = PQcmdStatus(results[i]);
 
 			elog(DEBUG3, "DTM: status message cmd '%s' [%d] result '%s'", dtxProtocolCommandStr, i, cmdStatus);
-			if (strncmp(cmdStatus, dtxProtocolCommandStr, strlen(cmdStatus)) != 0)
+
+			/*
+			 * Compare over the expected tag, not over what came back: a
+			 * Distributed Prepare answers with a number after the tag (the
+			 * segment's report, below), and a segment that rolled back
+			 * answers with something else entirely, which still differs in
+			 * its first character.
+			 */
+			if (strncmp(cmdStatus, dtxProtocolCommandStr, strlen(dtxProtocolCommandStr)) != 0)
 			{
 				/* failed */
 				numOfFailed++;
 			}
 		}
+	}
+
+	/*
+	 * PREPARE: collect which segments wrote.  Only trust the list when every
+	 * result carried a report (an older QE binary would not send one); it is
+	 * consumed by XactLogCommitRecord for the distributed commit record.
+	 */
+	if (dtxProtocolCommand == DTX_PROTOCOL_COMMAND_PREPARE && numOfFailed == 0)
+	{
+		int			nreported = 0;
+		List	   *writers = NIL;
+
+		oldContext = MemoryContextSwitchTo(TopTransactionContext);
+		for (i = 0; i < resultCount; i++)
+		{
+			const char *status;
+			const char *space;
+
+			if (results[i] == NULL || segindexes == NULL || segindexes[i] < 0)
+				continue;
+
+			/*
+			 * "Distributed Prepare 1" when that segment wrote, "... 0" when
+			 * it did not.  A segment that does not report answers with the
+			 * bare tag, whose last space is the one inside it -- so a digit
+			 * after the last space is the test.
+			 */
+			status = PQcmdStatus(results[i]);
+			space = strrchr(status, ' ');
+			if (space == NULL || space[1] < '0' || space[1] > '9')
+				continue;
+			nreported++;
+			if (atoi(space + 1) != 0)
+				writers = lappend_int(writers, segindexes[i]);
+		}
+		MemoryContextSwitchTo(oldContext);
+		if (MyTmGxactLocal->dtxWriteSegments)
+			list_free(MyTmGxactLocal->dtxWriteSegments);
+		MyTmGxactLocal->dtxWriteSegments = writers;
+		MyTmGxactLocal->dtxWriteSegmentsKnown =
+			(nreported == resultCount && resultCount == list_length(dtxSegments));
 	}
 
 	/* gather all the waited gxids from segments and remove the duplicates */
@@ -1414,6 +1491,8 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	if (results)
 		pfree(results);
+	if (segindexes)
+		pfree(segindexes);
 
 	return (numOfFailed == 0);
 }
@@ -1503,6 +1582,8 @@ resetTmGxact(void)
 		list_free(MyTmGxactLocal->waitGxids);
 		MyTmGxactLocal->waitGxids = NULL;
 	}
+	MyTmGxactLocal->dtxWriteSegmentsKnown = false;
+	MyTmGxactLocal->dtxWriteSegments = NIL;	/* TopTransactionContext memory */
 	setCurrentDtxState(DTX_STATE_NONE);
 }
 
@@ -2061,9 +2142,19 @@ sendDtxExplicitBegin(void)
 static void
 performDtxProtocolPrepare(const char *gid)
 {
+	bool		wrote;
+
 	SIMPLE_FAULT_INJECTOR("qe_start_prepared");
 
 	StartTransactionCommand();
+
+	/*
+	 * Did this segment change anything?  A transaction gets an xid on its
+	 * first modification, so having one before PrepareTransaction() assigns
+	 * one to every prepared transaction is the precise test.  Reported to
+	 * the QD for the participant list of the distributed commit record.
+	 */
+	wrote = TransactionIdIsValid(GetTopTransactionIdIfAny());
 
 	elog(DTM_DEBUG5, "performDtxProtocolCommand going to call PrepareTransactionBlock for distributed transaction (id = '%s')", gid);
 	if (!PrepareTransactionBlock((char *) gid))
@@ -2081,6 +2172,22 @@ performDtxProtocolPrepare(const char *gid)
 	elog(DTM_DEBUG5, "Prepare of distributed transaction succeeded (id = '%s')", gid);
 
 	setDistributedTransactionContext(DTX_CONTEXT_QE_PREPARED);
+
+	/*
+	 * Tell the QD whether this segment wrote, in the row count of the
+	 * completion message this command is about to send anyway
+	 * (exec_mpp_dtx_protocol_command, cmdtaglist.h).  Which segment said it
+	 * is something the QD already knows: every result carries the connection
+	 * it came from.
+	 */
+	dtx_prepare_wrote = wrote;
+}
+
+/* did this segment write?  For the completion message of a PREPARE. */
+bool
+DtxPrepareWrote(void)
+{
+	return dtx_prepare_wrote;
 }
 
 static void

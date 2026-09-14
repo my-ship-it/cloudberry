@@ -250,6 +250,15 @@ typedef struct TMGXACTLOCAL
 	Bitmapset					*dtxSegmentsMap;
 	List						*dtxSegments;
 	List						*waitGxids;
+
+	/*
+	 * QD: the segments that reported at PREPARE that they wrote something
+	 * (a subset of dtxSegments).  Valid only when every prepared segment
+	 * reported; goes into the distributed commit record for logical decoding
+	 * (mpp apply needs to wait for exactly the writing segments).
+	 */
+	bool						dtxWriteSegmentsKnown;
+	List						*dtxWriteSegments;
 }	TMGXACTLOCAL;
 
 typedef struct TMGXACTSTATUS
@@ -313,6 +322,10 @@ extern bool getDistributedTransactionIdentifier(char *id);
 extern void setDistributedTransactionContext(DtxContext context);
 
 extern void resetTmGxact(void);
+
+/* mpp logical replication apply: coordinator marker of one-phase commits */
+extern bool gp_lr_onephase_marker;
+extern bool DtxPrepareWrote(void);
 extern void	prepareDtxTransaction(void);
 extern bool isPreparedDtxTransaction(void);
 extern bool notifyCommittedDtxTransactionIsNeeded(void);

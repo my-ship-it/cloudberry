@@ -1635,6 +1635,14 @@ exec_mpp_dtx_protocol_command(DtxProtocolCommand dtxProtocolCommand,
 
 	performDtxProtocolCommand(dtxProtocolCommand, gid, contextInfo);
 
+	/*
+	 * A Distributed Prepare reports in its row count whether this segment
+	 * wrote anything, for the participant list of the coordinator's
+	 * distributed commit record (cdbtm.c).
+	 */
+	if (dtxProtocolCommand == DTX_PROTOCOL_COMMAND_PREPARE)
+		qc.nprocessed = DtxPrepareWrote() ? 1 : 0;
+
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),"exec_mpp_dtx_protocol_command calling EndCommand for dtxProtocolCommand = %d (%s) gid = %s",
 		 dtxProtocolCommand, loggingStr, gid);
 

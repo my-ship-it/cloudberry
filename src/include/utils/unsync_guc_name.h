@@ -213,7 +213,8 @@
 		"gp_encoding_check_locale_compatibility",
 		"gp_external_enable_exec",
 		"gp_external_max_segs",
-		"gpfdist_retry_timeout",
+												"gp_lr_onephase_marker",
+				"gpfdist_retry_timeout",
 		"gp_fts_mark_mirror_down_grace_period",
 		"gp_fts_replication_attempt_count",
 #ifdef USE_INTERNAL_FTS

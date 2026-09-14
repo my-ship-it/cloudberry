@@ -30,6 +30,7 @@
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbhash.h"
 #include "cdb/cdbsreh.h"
+#include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbutil.h"
 #include "cdb/memquota.h"
@@ -3019,6 +3020,17 @@ struct config_bool ConfigureNamesBool_gp[] =
 		},
 		&create_restartpoint_on_ckpt_record_replay,
 		false, NULL, NULL
+	},
+
+	{
+		{"gp_lr_onephase_marker", PGC_USERSET, LOGGING_WHAT,
+			gettext_noop("Write a coordinator WAL marker for each one-phase distributed commit when wal_level is logical."),
+			gettext_noop("Lets logical decoding of the coordinator see the commit order of all distributed transactions (MPP logical replication apply)."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&gp_lr_onephase_marker,
+		true,
+		NULL, NULL, NULL
 	},
 
 	{
