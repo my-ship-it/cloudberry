@@ -66,7 +66,8 @@ SUBDIRS += \
 		formatter \
 		formatter_fixedwidth \
 		extprotocol \
-		indexscan
+		indexscan \
+		mpp_logicalrep
 
 ifeq ($(with_ssl),openssl)
 SUBDIRS += pgcrypto sslinfo

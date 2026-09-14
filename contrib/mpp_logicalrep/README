@@ -1,0 +1,218 @@
+mpp_logicalrep -- logical replication apply into an MPP target
+==============================================================
+
+Stock logical replication replays a stream in one process, which writes
+the rows itself.  On Cloudberry that process may not write them: every
+user table is spread over the segments, and only a segment can write its
+own part.  This module is the receiving end built the other way round.
+The process that reads the stream never touches a table; it drives an
+ordinary coordinator session, and the apply operators run on gangs:
+
+    source coordinator stream --> apply driver (one worker per subscription)
+    source segment streams    --> reader gang
+                                       |
+                                       v
+                              Explicit Redistribute Motion
+                                       |
+                                       v
+                                  writer gang --> tables
+
+The driver is a background worker on the coordinator.  It reads the
+source coordinator's stream, asks the reader gang for the pieces of each
+committed distributed transaction, batches the ready ones, and applies
+each batch in a single distributed transaction of the target, recording
+its stream position in that same transaction.  A crash therefore
+replays from a position that is exactly as old as the data.
+
+
+Reassembling a distributed transaction
+--------------------------------------
+
+A distributed transaction on the source is not one stream.  It leaves a
+piece of WAL on each participating segment plus a commit record on the
+coordinator, and the pieces have nothing in common that a receiver can
+see.  Two things from the server make them one transaction again; both
+are described in the commits that precede this one.
+
+First, commit order and identity.  The coordinator's distributed commit
+record carries the gxid and the participating segments, and pgoutput
+emits it as the non-transactional message "cbdb.dcommit" under the
+cbdb_events option.  Each segment's own stream carries the same gxid,
+as "cbdb.gxid" under cbdb_gxid.  The driver takes its commit order from
+the coordinator's events and matches each one against what the readers
+have.
+
+Second, what to wait for.  Waiting for a segment that never wrote stalls
+the stream until a timeout, and a distributed transaction is dispatched
+to many more segments than it writes on.  Each segment reports at
+PREPARE whether it holds an xid, so the event usually names the exact
+write set and is marked so; the driver then waits for all of them,
+because each really does have the transaction.  When the report is
+incomplete the event names the wider dispatch set instead, and the
+driver waits on it with much shorter patience.
+
+
+Initial synchronisation
+-----------------------
+
+Tables are copied segment to segment, not through the coordinator: each
+source segment sends its own rows to a helper process on a target
+segment (copyhelper/, driven by COPY ... ON SEGMENT), and the
+redistribution to the right target segment is done by the Motion of the
+enclosing INSERT ... SELECT.
+
+The copy is taken under a cut point: a target LSN and a distributed
+snapshot of the source.  A decoded transaction whose gxid is visible
+under that snapshot is already in the copy and is dropped rather than
+applied, which is what makes the copy and the stream meet exactly once.
+
+ALTER SUBSCRIPTION ... REFRESH PUBLICATION adds tables to a running
+subscription the same way: their changes are held aside, the tables are
+copied under a cut point of their own while everything else keeps
+streaming, the held changes are replayed, and only then do they go live.
+
+
+Installation
+------------
+
+The library must be preloaded.  It registers the launcher, and it
+registers the custom scan methods of the apply plans, which any backend
+may have to deserialize when a plan is dispatched to it:
+
+    shared_preload_libraries = 'mpp_logicalrep'
+
+There is no CREATE EXTENSION step.  The catalog objects are installed by
+initdb, from cdb_init.d, because they have to be coordinator-only tables
+like the information_schema ones: the driver writes them in the same
+distributed transaction as the batch it applied and reads them back on
+the coordinator.  A table made by an ordinary CREATE TABLE would be
+distributed, its rows would live on the segments, and the driver's own
+reads would not find them.  An existing cluster therefore needs the
+objects installed by hand, or a new initdb.
+
+The source cluster needs nothing from this module.
+
+
+Usage
+-----
+
+On the source, a publication and a replication slot on every primary
+segment and on the coordinator, under one name:
+
+    CREATE PUBLICATION p FOR TABLE ...;
+    SELECT gp_segment_id, slot_name
+      FROM gp_create_logical_replication_slot('sub_s', 'pgoutput',
+                                              false, true)
+     ORDER BY 1;
+
+On the target:
+
+    CREATE SUBSCRIPTION s
+        CONNECTION 'host=... port=... dbname=...'
+        PUBLICATION p
+        WITH (mpp, slot_name = 'sub_s');
+
+"mpp" is not a subscription option the server knows.  The module takes
+it out of the statement in ProcessUtility_hook and records the
+subscription in pg_catalog.gp_mpp_subscription instead.  It also adds
+connect = false, which leaves the pg_subscription row disabled: that is
+deliberate and is what keeps the server's own launcher from starting a
+stock apply worker, which on Cloudberry would fail for ever
+("connections to primary segments are not allowed").  ENABLE, DISABLE,
+REFRESH PUBLICATION and DROP SUBSCRIPTION are intercepted the same way,
+so they read as usual; gp_mpp_subscription.enabled, not
+pg_subscription.subenabled, is what says a subscription is running.
+
+WITH (copy_data = false) declares the tables already in sync, so the
+driver starts streaming without copying.
+
+
+Requirements on the tables
+--------------------------
+
+Two conditions are checked per table when it is synchronised, and
+reported as warnings rather than errors so that a subscription covering
+many tables still starts.
+
+The target's distribution key must be covered by the source's replica
+identity.  An UPDATE that changes a target distribution column has to
+move the row between segments, which apply does as DELETE + INSERT, and
+that needs the whole old key.  Without it the UPDATE is refused.
+
+The source's distribution key must be covered by the target's replica
+identity.  Otherwise two rows that lived on different source segments
+can collide on one target row, and the DELETE + INSERT pair for one of
+them lands out of order.
+
+
+Configuration parameters
+------------------------
+
+mpp_logicalrep.batch_max_txns (integer, default 64)
+mpp_logicalrep.batch_max_bytes (integer, default 64MB)
+mpp_logicalrep.batch_max_latency_ms (integer, default 200ms)
+    When a batch is applied: whichever comes first.
+
+mpp_logicalrep.event_wait_ms (integer, default 1s)
+    How long one drain waits for the transaction of a commit event.
+
+mpp_logicalrep.idle_drain_ms (integer, default 2s)
+    How often the readers are polled while the source is idle.
+
+mpp_logicalrep.reader_mem (integer, default 64MB)
+    Memory a reader may use to buffer changes before spilling to disk,
+    per subscription.
+
+mpp_logicalrep.apply_max_retries (integer, default 10)
+mpp_logicalrep.apply_error_action (enum, default disable)
+    What to do with an error that keeps coming back: disable the
+    subscription after that many attempts, or retry for ever.  Errors
+    that can pass on their own -- a lost connection, a reset gang, a
+    deadlock -- are always retried and reset the count.
+
+mpp_logicalrep.slot_loss_action (enum, default reinit)
+    What to do when the source's slots are gone, which a segment
+    failover does: resynchronise the subscription from scratch, or
+    disable it and leave it to an operator.
+
+mpp_logicalrep.copy_port_lo, mpp_logicalrep.copy_port_hi (integer,
+default 42000 and 42999)
+mpp_logicalrep.copy_crc (boolean, default on)
+    The copy transport's listen range, and whether to checksum each of
+    its frames.
+
+mpp_logicalrep.max_workers (integer, default 8, requires restart)
+mpp_logicalrep.launcher_naptime_ms (integer, default 5s)
+
+
+Files
+-----
+
+mpp_logicalrep.c           settings, the subscription DDL, the launcher
+mpp_apply_worker.c         the driver: events, batching, the assembly
+logicalrep_apply_driver.c  the target-neutral loop
+logicalrep_sink.h          the sink/assembly contract the loop is
+                           written against
+mpp_sink_cbdb.c            the Cloudberry sink: apply a batch, record
+                           progress
+mpp_source.c, mpp_reader.c the source streams and the reader gang
+mpp_apply_plan.c           the apply plans
+mpp_apply_sql.c            their SQL entry points
+mpp_route.c, mpp_writer.c  routing to a segment, and writing there
+mpp_tablesync.c            initial synchronisation, REFRESH PUBLICATION
+copyhelper/                the segment-to-segment copy transport
+test/                      unit tests of the apply loop, against a mock
+                           sink and no server
+
+The loop in logicalrep_apply_driver.c knows about units of work,
+progress and errors, and nothing about gangs or motions; everything
+Cloudberry-specific is behind logicalrep_sink.h.  That is what lets the
+loop be tested without a cluster, and what a different target would
+implement.
+
+
+Limitations
+-----------
+
+Append-optimized and PAX tables work as targets but not as sources: on
+Cloudberry they produce no logical decoding output at all.

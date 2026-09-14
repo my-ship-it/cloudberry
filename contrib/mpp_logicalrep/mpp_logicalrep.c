@@ -1,0 +1,1039 @@
+/*-------------------------------------------------------------------------
+ *
+ * mpp_logicalrep.c
+ *	  Extension entry point: settings, the CREATE SUBSCRIPTION option, and
+ *	  the launcher that runs one apply driver per MPP subscription.
+ *
+ * Everything the apply path needs of the server is either a normal backend
+ * function or something the server offers every extension.  The three
+ * pieces that are not obviously either are here:
+ *
+ * 1. The subscription option.  "CREATE SUBSCRIPTION ... WITH (mpp)" is not
+ *	  a syntax an extension can add, but ProcessUtility_hook sees the parsed
+ *	  statement before the server acts on it, so the option can be taken out
+ *	  of the list (the server would reject what it does not know) and the
+ *	  subscription remembered here instead.  connect = false is added at the
+ *	  same time: that leaves the catalog row disabled, and a disabled
+ *	  subscription is one the server's own launcher never starts a worker
+ *	  for -- which matters, because a stock apply worker on Cloudberry fails
+ *	  for ever ("connections to primary segments are not allowed").
+ *
+ * 2. The launcher.  A background worker registered at postmaster start,
+ *	  which polls this extension's own registry (mpp_subscription) on the
+ *	  coordinator and starts a dynamic worker per enabled subscription.
+ *
+ * 3. The custom scan methods of the apply plans (mpp_apply_plan.c).  Any
+ *	  backend may have to deserialize such a plan on dispatch, so they must
+ *	  be registered everywhere, which is what _PG_init in a preloaded
+ *	  library gives: the postmaster registers them once and every backend
+ *	  inherits the registration.
+ *
+ * Because of 2 and 3 the library must be in shared_preload_libraries.
+ *
+ * Portions Copyright (c) 2026, Apache Cloudberry
+ *
+ * IDENTIFICATION
+ *	  contrib/mpp_logicalrep/mpp_logicalrep.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "access/xact.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_subscription.h"
+#include "catalog/pg_subscription_rel.h"
+#include "cdb/cdbvars.h"
+#include "commands/defrem.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
+#include "executor/tstoreReceiver.h"
+#include "fmgr.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "libpq/pqsignal.h"
+#include "tcop/tcopprot.h"
+#include "tcop/utility.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
+#include "replication/walreceiver.h"
+#include "miscadmin.h"
+
+#include "mpp_apply.h"
+#include "mpp_apply_worker.h"
+#include "mpp_reader.h"
+
+PG_MODULE_MAGIC;
+
+void		_PG_init(void);
+
+/* how often the launcher looks for subscriptions to start or stop */
+static int	launcher_naptime_ms = 5000;
+
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+static const struct config_enum_entry slot_loss_action_options[] = {
+	{"reinit", LR_SLOT_LOSS_REINIT, false},
+	{"disable", LR_SLOT_LOSS_DISABLE, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry apply_error_action_options[] = {
+	{"disable", LR_APPLY_ERROR_DISABLE, false},
+	{"retry", LR_APPLY_ERROR_RETRY, false},
+	{NULL, 0, false}
+};
+
+/* ------------------------------------------------------------------------
+ * Settings
+ * ------------------------------------------------------------------------
+ */
+static void
+define_gucs(void)
+{
+	DefineCustomIntVariable("mpp_logicalrep.batch_max_txns",
+							"Transactions per batch before it is applied.",
+							NULL,
+							&gp_lr_batch_max_txns,
+							64, 1, 100000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.batch_max_bytes",
+							"Buffered change bytes per batch before it is applied.",
+							NULL,
+							&gp_lr_batch_max_bytes,
+							65536, 64, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.batch_max_latency_ms",
+							"Age of a batch before it is applied.",
+							NULL,
+							&gp_lr_batch_max_latency_ms,
+							200, 0, 3600000,
+							PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.apply_max_retries",
+							"How many times to retry an error that makes no progress.",
+							"Counted per run and reset by every committed batch; 0 means never "
+							"give up. What happens when the count is reached is "
+							"mpp_logicalrep.apply_error_action.",
+							&gp_lr_apply_max_retries,
+							10, 0, INT_MAX,
+							PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.event_wait_ms",
+							"How long one drain waits for the transaction of a commit event.",
+							NULL,
+							&gp_lr_event_wait_ms,
+							1000, 0, 3600000,
+							PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.idle_drain_ms",
+							"Poll the readers this often while the source is idle.",
+							NULL,
+							&gp_lr_idle_drain_ms,
+							2000, 100, 3600000,
+							PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.reader_mem",
+							"Memory a reader QE may use to buffer changes before spilling to disk.",
+							"Per subscription.",
+							&gp_lr_reader_mem,
+							65536, 64, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.copy_port_lo",
+							"Initial sync: low end of the TCP port range the copy helper listens on.",
+							NULL,
+							&gp_lr_copy_port_lo,
+							42000, 1024, 65535,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.copy_port_hi",
+							"Initial sync: high end of the TCP port range the copy helper listens on.",
+							NULL,
+							&gp_lr_copy_port_hi,
+							42999, 1024, 65535,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("mpp_logicalrep.copy_crc",
+							 "Initial sync: checksum each copy-transport frame.",
+							 NULL,
+							 &gp_lr_copy_crc,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("mpp_logicalrep.slot_loss_action",
+							 "What an apply worker does when the source's replication slots are gone.",
+							 "reinit: redo the initial synchronisation of the whole subscription. "
+							 "disable: disable the subscription and leave it to an operator.",
+							 &gp_lr_slot_loss_action,
+							 LR_SLOT_LOSS_REINIT, slot_loss_action_options,
+							 PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("mpp_logicalrep.apply_error_action",
+							 "What an apply worker does with an error that keeps coming back.",
+							 "disable: disable the subscription and say why, after "
+							 "mpp_logicalrep.apply_max_retries attempts. retry: keep retrying for "
+							 "ever. Errors that can pass on their own (a lost connection, a reset "
+							 "gang, a deadlock) are always retried.",
+							 &gp_lr_apply_error_action,
+							 LR_APPLY_ERROR_DISABLE, apply_error_action_options,
+							 PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mpp_logicalrep.launcher_naptime_ms",
+							"How often the launcher looks for subscriptions to start.",
+							NULL,
+							&launcher_naptime_ms,
+							5000, 100, 3600000,
+							PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("mpp_logicalrep");
+}
+
+/* ------------------------------------------------------------------------
+ * Shared state
+ * ------------------------------------------------------------------------
+ *
+ * The registry that says which subscriptions this extension owns is an
+ * ordinary table, so it lives in one database -- while the launcher, like
+ * the server's own, runs without a database connection and can only read
+ * shared catalogs.  It therefore works the other way round: the launcher
+ * proposes (any subscription shaped like one of ours: disabled, with a slot
+ * name) and the worker disposes (it connects, reads the registry, and says
+ * so here).  A verdict of "not ours" is remembered so the probe happens once
+ * per subscription rather than once per nap.
+ */
+typedef struct LrWorkerSlot
+{
+	Oid			subid;			/* InvalidOid: free */
+	Oid			dbid;
+	int			pid;			/* 0: no worker running */
+	bool		not_ours;		/* the worker found no registry row */
+} LrWorkerSlot;
+
+typedef struct LrSharedState
+{
+	LWLock	   *lock;
+	int			nslots;
+	LrWorkerSlot slots[FLEXIBLE_ARRAY_MEMBER];
+} LrSharedState;
+
+static LrSharedState *lr_shared = NULL;
+static int	max_workers = 8;
+
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+static Size
+lr_shmem_size(void)
+{
+	return MAXALIGN(offsetof(LrSharedState, slots) +
+					sizeof(LrWorkerSlot) * max_workers);
+}
+
+static void
+lr_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(lr_shmem_size());
+	RequestNamedLWLockTranche("mpp_logicalrep", 1);
+}
+
+static void
+lr_shmem_startup(void)
+{
+	bool		found;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	lr_shared = ShmemInitStruct("mpp_logicalrep", lr_shmem_size(), &found);
+	if (!found)
+	{
+		memset(lr_shared, 0, lr_shmem_size());
+		lr_shared->lock = &(GetNamedLWLockTranche("mpp_logicalrep"))->lock;
+		lr_shared->nslots = max_workers;
+	}
+	LWLockRelease(AddinShmemInitLock);
+}
+
+/* the slot of this subscription, or NULL; caller holds the lock */
+static LrWorkerSlot *
+slot_find(Oid subid)
+{
+	int			i;
+
+	for (i = 0; i < lr_shared->nslots; i++)
+		if (lr_shared->slots[i].subid == subid)
+			return &lr_shared->slots[i];
+	return NULL;
+}
+
+/*
+ * A worker announces itself.  Returns false if there is no room, in which
+ * case the worker must exit: without a slot the launcher cannot tell that it
+ * is running and would start a second one.
+ */
+static bool
+lr_worker_attach(Oid subid, Oid dbid)
+{
+	LrWorkerSlot *slot;
+	int			i;
+	bool		ok = false;
+
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	slot = slot_find(subid);
+	if (slot == NULL)
+	{
+		for (i = 0; i < lr_shared->nslots; i++)
+		{
+			if (!OidIsValid(lr_shared->slots[i].subid))
+			{
+				slot = &lr_shared->slots[i];
+				slot->subid = subid;
+				slot->not_ours = false;
+				break;
+			}
+		}
+	}
+	if (slot != NULL)
+	{
+		slot->dbid = dbid;
+		slot->pid = MyProcPid;
+		ok = true;
+	}
+	LWLockRelease(lr_shared->lock);
+
+	return ok;
+}
+
+static void
+lr_worker_detach(int code, Datum arg)
+{
+	LrWorkerSlot *slot;
+
+	if (lr_shared == NULL)
+		return;
+
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	slot = slot_find(DatumGetObjectId(arg));
+	if (slot != NULL && slot->pid == MyProcPid)
+		slot->pid = 0;
+	LWLockRelease(lr_shared->lock);
+}
+
+/* the worker's verdict on a subscription it could not find in the registry */
+static void
+lr_worker_disown(Oid subid)
+{
+	LrWorkerSlot *slot;
+
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	slot = slot_find(subid);
+	if (slot != NULL)
+		slot->not_ours = true;
+	LWLockRelease(lr_shared->lock);
+}
+
+/* ------------------------------------------------------------------------
+ * The subscription registry
+ * ------------------------------------------------------------------------
+ *
+ * One row per subscription this module owns, in pg_catalog of the
+ * subscription's own database: gp_mpp_subscription is created by the
+ * cdb_init.d script at initdb, which is what makes it a coordinator-only
+ * table, so these reads and writes stay local to the coordinator and in the
+ * caller's transaction.  Read by the worker, which has a connection to it.
+ */
+static bool
+registry_says_enabled(Oid subid, bool *found)
+{
+	bool		enabled = false;
+
+	*found = false;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return false;
+	{
+		Oid			argtype = OIDOID;
+		Datum		arg = ObjectIdGetDatum(subid);
+		int			ret;
+
+		ret = SPI_execute_with_args("SELECT enabled FROM pg_catalog.gp_mpp_subscription"
+									" WHERE subid = $1",
+									1, &argtype, &arg, NULL, true, 1);
+		if (ret == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			bool		isnull;
+			Datum		d = SPI_getbinval(SPI_tuptable->vals[0],
+										  SPI_tuptable->tupdesc, 1, &isnull);
+
+			*found = true;
+			enabled = !isnull && DatumGetBool(d);
+		}
+	}
+	SPI_finish();
+
+	return enabled;
+}
+
+/*
+ * Is this subscription still one we should be applying?  Called by a running
+ * worker between batches; it may or may not already be in a transaction.
+ */
+bool
+LrSubscriptionEnabled(Oid subid)
+{
+	bool		started_txn = false;
+	bool		found;
+	bool		enabled;
+
+	if (!IsTransactionState())
+	{
+		StartTransactionCommand();
+		started_txn = true;
+	}
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	enabled = registry_says_enabled(subid, &found);
+
+	PopActiveSnapshot();
+	if (started_txn)
+		CommitTransactionCommand();
+
+	return found && enabled;
+}
+
+/*
+ * The worker's own startup check: claim a slot, and confirm the subscription
+ * is ours and enabled.  Exits the process when it is not.
+ */
+void
+LrWorkerClaim(Oid subid, Oid dbid)
+{
+	bool		found;
+	bool		enabled;
+
+	if (!lr_worker_attach(subid, dbid))
+	{
+		ereport(LOG,
+				(errmsg("no mpp_logicalrep worker slot free for subscription %u",
+						subid),
+				 errhint("You might need to increase \"mpp_logicalrep.max_workers\".")));
+		proc_exit(0);
+	}
+	on_shmem_exit(lr_worker_detach, ObjectIdGetDatum(subid));
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	enabled = registry_says_enabled(subid, &found);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	if (!found)
+	{
+		/* someone else's subscription; do not probe it again */
+		lr_worker_disown(subid);
+		proc_exit(0);
+	}
+	if (!enabled)
+		proc_exit(0);
+}
+
+/* Ask a running worker to stop, and wait a little for it to go. */
+static void
+lr_worker_stop(Oid subid)
+{
+	int			pid = 0;
+	int			i;
+	LrWorkerSlot *slot;
+
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	slot = slot_find(subid);
+	if (slot != NULL)
+	{
+		pid = slot->pid;
+		slot->subid = InvalidOid;	/* forget it entirely */
+		slot->pid = 0;
+		slot->not_ours = false;
+	}
+	LWLockRelease(lr_shared->lock);
+
+	if (pid == 0)
+		return;
+
+	kill(pid, SIGTERM);
+	for (i = 0; i < 100; i++)	/* up to 10s */
+	{
+		if (kill(pid, 0) != 0)
+			break;
+		pg_usleep(100000L);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/* ------------------------------------------------------------------------
+ * The subscription DDL
+ * ------------------------------------------------------------------------
+ */
+
+/* Is this subscription in our registry at all?  Runs in the user's session. */
+static bool
+subscription_is_ours(Oid subid)
+{
+	bool		found = false;
+
+	if (!OidIsValid(subid))
+		return false;
+	(void) registry_says_enabled(subid, &found);
+	return found;
+}
+
+static void
+registry_exec(const char *sql, int nargs, Oid *argtypes, Datum *values)
+{
+	SPI_connect();
+	SPI_execute_with_args(sql, nargs, argtypes, values, NULL, false, 0);
+	SPI_finish();
+}
+
+/*
+ * The publication's table list, as relids of this database.  The stock
+ * AlterSubscription_refresh() does this and then writes pg_subscription_rel;
+ * here the state table is our own and the copying is the apply worker's job,
+ * so only the list is wanted.
+ */
+static List *
+fetch_pub_relids(Subscription *sub)
+{
+	WalReceiverConn *wrconn;
+	WalRcvExecResult *res;
+	TupleTableSlot *slot;
+	StringInfoData cmd;
+	Oid			tableRow[2] = {TEXTOID, TEXTOID};
+	List	   *relids = NIL;
+	ListCell   *lc;
+	char	   *err;
+	bool		first = true;
+
+	if (!WalReceiverFunctions)
+		libpqwalreceiver_PG_init();
+
+	wrconn = walrcv_connect(sub->conninfo, true,
+							!superuser_arg(sub->owner) && sub->passwordrequired,
+							sub->name, &err);
+	if (!wrconn)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not connect to the publisher: %s", err)));
+
+	initStringInfo(&cmd);
+	appendStringInfoString(&cmd,
+						   "SELECT DISTINCT t.schemaname, t.tablename"
+						   "  FROM pg_catalog.pg_publication_tables t"
+						   " WHERE t.pubname IN (");
+	foreach(lc, sub->publications)
+	{
+		appendStringInfo(&cmd, "%s%s", first ? "" : ", ",
+						 quote_literal_cstr(strVal(lfirst(lc))));
+		first = false;
+	}
+	appendStringInfoChar(&cmd, ')');
+
+	PG_TRY();
+	{
+		res = walrcv_exec(wrconn, cmd.data, 2, tableRow);
+		if (res->status != WALRCV_OK_TUPLES)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not receive list of replicated tables from the publisher: %s",
+							res->err)));
+
+		slot = MakeSingleTupleTableSlot(res->tupledesc, &TTSOpsMinimalTuple);
+		while (tuplestore_gettupleslot(res->tuplestore, true, false, slot))
+		{
+			bool		isnull;
+			char	   *nspname = TextDatumGetCString(slot_getattr(slot, 1, &isnull));
+			char	   *relname = TextDatumGetCString(slot_getattr(slot, 2, &isnull));
+			RangeVar   *rv = makeRangeVar(nspname, relname, -1);
+
+			relids = lappend_oid(relids,
+								 RangeVarGetRelid(rv, AccessShareLock, false));
+			ExecClearTuple(slot);
+		}
+		ExecDropSingleTupleTableSlot(slot);
+		walrcv_clear_result(res);
+	}
+	PG_FINALLY();
+	{
+		walrcv_disconnect(wrconn);
+	}
+	PG_END_TRY();
+
+	pfree(cmd.data);
+	return relids;
+}
+
+/*
+ * ALTER SUBSCRIPTION ... REFRESH PUBLICATION of one of ours: diff the
+ * publication's table list into our state table and let the apply worker
+ * copy what is new (mpp_tablesync.c).  Nothing here is non-transactional,
+ * unlike the stock path.
+ */
+static void
+refresh_mpp(Subscription *sub, bool copy_data)
+{
+	if (Gp_role == GP_ROLE_EXECUTE)
+		return;
+	LrSyncRefresh(sub->oid, fetch_pub_relids(sub), copy_data);
+}
+
+/* the value of a boolean option in a DefElem list, or a default */
+static bool
+option_bool(List *options, const char *name, bool defval)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, name) == 0)
+			return defGetBoolean(def);
+	}
+	return defval;
+}
+
+/* ------------------------------------------------------------------------
+ * ProcessUtility: the subscription statements
+ * ------------------------------------------------------------------------
+ */
+static void
+mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
+			ProcessUtilityContext context, ParamListInfo params,
+			QueryEnvironment *queryEnv, DestReceiver *dest, QueryCompletion *qc)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+	const char *created = NULL;
+	bool		created_nocopy = false;
+	Oid			dropped = InvalidOid;
+	bool		dispatch = (Gp_role == GP_ROLE_DISPATCH);
+
+	if (dispatch && IsA(parsetree, CreateSubscriptionStmt))
+	{
+		CreateSubscriptionStmt *stmt = (CreateSubscriptionStmt *) parsetree;
+		List	   *keep = NIL;
+		ListCell   *lc;
+		bool		is_mpp = false;
+		bool		has_slot = false;
+
+		foreach(lc, stmt->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "mpp") == 0)
+			{
+				is_mpp = defGetBoolean(def);
+				continue;		/* the server must not see it */
+			}
+			if (strcmp(def->defname, "slot_name") == 0)
+				has_slot = true;
+			keep = lappend(keep, def);
+		}
+
+		if (is_mpp)
+		{
+			if (!has_slot)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("CREATE SUBSCRIPTION ... WITH (mpp) requires slot_name"),
+						 errhint("The name is that of the cluster-wide slots on the publisher, which gp_create_logical_replication_slot() creates.")));
+
+			/*
+			 * Leave the catalog row disabled and unconnected: the server's
+			 * launcher then ignores the subscription, no slot is created
+			 * behind the user's back, no table list is fetched, and this
+			 * extension's launcher is the only thing that drives it.
+			 */
+			keep = lappend(keep,
+						   makeDefElem("connect",
+									   (Node *) makeString("false"), -1));
+			stmt->options = keep;
+			created = stmt->subname;
+
+			/*
+			 * copy_data = false means the tables are declared in sync, so
+			 * the worker streams at once instead of copying.
+			 */
+			created_nocopy = !option_bool(stmt->options, "copy_data", true);
+		}
+	}
+	else if (dispatch && IsA(parsetree, AlterSubscriptionStmt))
+	{
+		AlterSubscriptionStmt *stmt = (AlterSubscriptionStmt *) parsetree;
+		Oid			subid = get_subscription_oid(stmt->subname, true);
+
+		if (subscription_is_ours(subid))
+		{
+			Subscription *sub = GetSubscription(subid, false);
+
+			switch (stmt->kind)
+			{
+				case ALTER_SUBSCRIPTION_ENABLED:
+					{
+						/*
+						 * Our subscriptions stay disabled in pg_subscription
+						 * -- that is what keeps the server's own launcher off
+						 * them -- so ENABLE and DISABLE act on the registry
+						 * and the statement stops here.
+						 */
+						bool		enable = option_bool(stmt->options, "enabled", true);
+						Oid			argtypes[1] = {OIDOID};
+						Datum		values[1];
+
+						values[0] = ObjectIdGetDatum(subid);
+						if (enable)
+							registry_exec("UPDATE pg_catalog.gp_mpp_subscription"
+										  " SET enabled = true, disable_reason = NULL"
+										  " WHERE subid = $1",
+										  1, argtypes, values);
+						else
+						{
+							registry_exec("UPDATE pg_catalog.gp_mpp_subscription"
+										  " SET enabled = false WHERE subid = $1",
+										  1, argtypes, values);
+							lr_worker_stop(subid);
+						}
+						return;
+					}
+
+				case ALTER_SUBSCRIPTION_REFRESH:
+					refresh_mpp(sub, option_bool(stmt->options, "copy_data", true));
+					return;
+
+				case ALTER_SUBSCRIPTION_SET_PUBLICATION:
+				case ALTER_SUBSCRIPTION_ADD_PUBLICATION:
+				case ALTER_SUBSCRIPTION_DROP_PUBLICATION:
+					{
+						/*
+						 * Let the server change the publication list, but not
+						 * refresh: its refresh writes pg_subscription_rel and
+						 * is non-transactional, and ours is neither.
+						 */
+						bool		refresh = option_bool(stmt->options, "refresh", true);
+
+						stmt->options = lappend(stmt->options,
+												makeDefElem("refresh",
+															(Node *) makeString("false"),
+															-1));
+						if (prev_ProcessUtility)
+							prev_ProcessUtility(pstmt, queryString, readOnlyTree,
+												context, params, queryEnv, dest, qc);
+						else
+							standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+													context, params, queryEnv, dest, qc);
+						if (refresh)
+							refresh_mpp(GetSubscription(subid, false),
+										option_bool(stmt->options, "copy_data", true));
+						return;
+					}
+
+				default:
+					break;		/* options, owner, skip: the server's business */
+			}
+		}
+	}
+	else if (dispatch && IsA(parsetree, DropSubscriptionStmt))
+	{
+		DropSubscriptionStmt *stmt = (DropSubscriptionStmt *) parsetree;
+		Oid			subid = get_subscription_oid(stmt->subname, stmt->missing_ok);
+
+		if (subscription_is_ours(subid))
+		{
+			Oid			argtypes[1] = {OIDOID};
+			Datum		values[1];
+
+			/*
+			 * Stop the worker first, then take the slot name off the
+			 * subscription: our slots are cluster-wide and the user's to
+			 * manage, so DROP SUBSCRIPTION must not connect to the publisher
+			 * to drop one, which is also what lets it run in a transaction
+			 * block.
+			 */
+			values[0] = ObjectIdGetDatum(subid);
+			registry_exec("UPDATE pg_catalog.gp_mpp_subscription"
+						  " SET enabled = false WHERE subid = $1",
+						  1, argtypes, values);
+			lr_worker_stop(subid);
+
+			SPI_connect();
+			SPI_execute(psprintf("ALTER SUBSCRIPTION %s SET (slot_name = NONE)",
+								 quote_identifier(stmt->subname)), false, 0);
+			SPI_finish();
+
+			dropped = subid;
+		}
+	}
+
+	if (prev_ProcessUtility)
+		prev_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
+							queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
+								queryEnv, dest, qc);
+
+	if (created != NULL)
+	{
+		Oid			subid = get_subscription_oid(created, false);
+		Oid			argtypes[2] = {OIDOID, TEXTOID};
+		Datum		values[2];
+
+		values[0] = ObjectIdGetDatum(subid);
+		values[1] = CStringGetTextDatum(created);
+		registry_exec("INSERT INTO pg_catalog.gp_mpp_subscription"
+					  " (subid, subname, enabled) VALUES ($1, $2, true)"
+					  " ON CONFLICT (subid) DO UPDATE"
+					  " SET subname = EXCLUDED.subname, enabled = true,"
+					  "     disable_reason = NULL",
+					  2, argtypes, values);
+
+		if (created_nocopy)
+			LrSyncMarkNoCopy(subid);
+
+		ereport(NOTICE,
+				(errmsg("subscription \"%s\" will be applied by mpp_logicalrep",
+						created),
+				 errdetail("Its pg_subscription row stays disabled so that the server's own apply worker never starts; pg_catalog.gp_mpp_subscription is what enables it.")));
+	}
+	else if (OidIsValid(dropped))
+	{
+		Oid			argtypes[1] = {OIDOID};
+		Datum		values[1];
+
+		LrSyncCleanup(dropped);
+		values[0] = ObjectIdGetDatum(dropped);
+		registry_exec("DELETE FROM pg_catalog.gp_mpp_subscription WHERE subid = $1",
+					  1, argtypes, values);
+	}
+}
+
+/* ------------------------------------------------------------------------
+ * The launcher
+ * ------------------------------------------------------------------------
+ */
+PGDLLEXPORT void MppLauncherMain(Datum main_arg);
+
+static void
+launch_worker(Oid dbid, Oid subid, Oid userid, const char *subname)
+{
+	BackgroundWorker bgw;
+	BackgroundWorkerHandle *handle;
+	LrWorkerArg arg;
+
+	memset(&arg, 0, sizeof(arg));
+	arg.dbid = dbid;
+	arg.subid = subid;
+	arg.userid = userid;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "mpp_logicalrep");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "MppApplyWorkerMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN,
+			 "mpp apply worker for subscription \"%s\"", subname);
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "mpp apply worker");
+	bgw.bgw_restart_time = BGW_NEVER_RESTART;
+	bgw.bgw_notify_pid = 0;
+	memcpy(bgw.bgw_extra, &arg, sizeof(arg));
+
+	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
+		ereport(WARNING,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("out of background worker slots"),
+				 errhint("You might need to increase \"max_worker_processes\".")));
+	else
+		pfree(handle);
+}
+
+/*
+ * Subscriptions that could be ours: disabled (which is how the utility hook
+ * leaves them) and with a slot name.  pg_subscription is a shared catalog,
+ * so this needs no database connection -- which is what lets one launcher
+ * serve every database, as the server's own does.
+ */
+static void
+launch_due_workers(void)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *due = NIL;
+	ListCell   *lc;
+	MemoryContext oldctx;
+
+	StartTransactionCommand();
+
+	rel = table_open(SubscriptionRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
+	{
+		Form_pg_subscription subform = (Form_pg_subscription) GETSTRUCT(tup);
+		LrWorkerSlot *slot;
+		bool		start;
+		LrWorkerArg *arg;
+		Datum		d;
+		bool		isnull;
+
+		if (subform->subenabled)
+			continue;			/* the server's own launcher owns that one */
+
+		d = heap_getattr(tup, Anum_pg_subscription_subslotname,
+						 RelationGetDescr(rel), &isnull);
+		if (isnull)
+			continue;
+		(void) d;
+
+		LWLockAcquire(lr_shared->lock, LW_SHARED);
+		slot = slot_find(subform->oid);
+		start = (slot == NULL || (slot->pid == 0 && !slot->not_ours));
+		LWLockRelease(lr_shared->lock);
+
+		if (!start)
+			continue;
+
+		oldctx = MemoryContextSwitchTo(TopMemoryContext);
+		arg = palloc0(sizeof(LrWorkerArg));
+		arg->dbid = subform->subdbid;
+		arg->subid = subform->oid;
+		arg->userid = subform->subowner;
+		due = lappend(due, arg);
+		MemoryContextSwitchTo(oldctx);
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	CommitTransactionCommand();
+
+	foreach(lc, due)
+	{
+		LrWorkerArg *arg = (LrWorkerArg *) lfirst(lc);
+
+		launch_worker(arg->dbid, arg->subid, arg->userid, "mpp");
+		pfree(arg);
+	}
+	list_free(due);
+}
+
+void
+MppLauncherMain(Datum main_arg)
+{
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+
+	/*
+	 * The driver replicates into every segment from the coordinator, so it
+	 * runs there and nowhere else.  A segment's own catalog carries the same
+	 * subscription row after dispatch, and must not act on it.
+	 */
+	if (!IS_QUERY_DISPATCHER())
+		proc_exit(0);
+
+	/* no database: pg_subscription is a shared catalog */
+	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+
+	for (;;)
+	{
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		launch_due_workers();
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   launcher_naptime_ms, PG_WAIT_EXTENSION);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+}
+
+/* ------------------------------------------------------------------------
+ * Module load
+ * ------------------------------------------------------------------------
+ */
+void
+_PG_init(void)
+{
+	BackgroundWorker bgw;
+
+	define_gucs();
+
+	/*
+	 * Custom scan providers of the apply plans.  Every backend may have to
+	 * deserialize such a plan on dispatch, which is why this library belongs
+	 * in shared_preload_libraries: registering in the postmaster registers
+	 * for every backend it forks.
+	 */
+	LrRegisterCustomScanMethods();
+
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = mpp_utility;
+
+	if (!process_shared_preload_libraries_in_progress)
+		return;
+
+	DefineCustomIntVariable("mpp_logicalrep.max_workers",
+							"Maximum number of MPP apply workers.",
+							NULL,
+							&max_workers,
+							8, 1, 1024,
+							PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = lr_shmem_request;
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = lr_shmem_startup;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "mpp_logicalrep");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "MppLauncherMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "mpp logical replication launcher");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "mpp logical replication launcher");
+	bgw.bgw_restart_time = 5;
+	bgw.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&bgw);
+}
