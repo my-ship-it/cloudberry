@@ -203,6 +203,8 @@ mpp_tablesync.c            initial synchronisation, REFRESH PUBLICATION
 copyhelper/                the segment-to-segment copy transport
 test/                      unit tests of the apply loop, against a mock
                            sink and no server
+test/cluster/              tests that drive real clusters, and how to
+                           set the clusters up (see its own README)
 
 The loop in logicalrep_apply_driver.c knows about units of work,
 progress and errors, and nothing about gangs or motions; everything

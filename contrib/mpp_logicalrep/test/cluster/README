@@ -1,0 +1,42 @@
+Tests that need a running cluster
+=================================
+
+These drive real clusters: they create publications, slots and
+subscriptions, run a workload, kill things, and compare the two sides.
+They are not part of "make check" and print their own verdict; each one
+exits non-zero when it fails, so they can be chained.
+
+They expect psql and, where they reconfigure a cluster, the gp tools on
+PATH; each sources ~/cloudberry-db-devel/cloudberry-env.sh if it is
+there, and otherwise relies on the environment it is run in.
+
+The module must be preloaded on the target cluster and its catalog
+objects must exist there (see ../../README).  The source cluster needs
+wal_level = logical and nothing else.  An existing cluster that predates
+this module has no catalog objects, because they go in at initdb;
+install them by hand with
+
+    psql -d <database> -f \
+      $GPHOME/share/postgresql/cdb_init.d/mpp_logicalrep_cdbinit.sql
+
+
+One cluster
+-----------
+
+These replicate between two databases of one cluster (postgres ->
+lrdst), which is enough for everything that does not depend on the two
+sides being separate servers.
+
+    subscription_ddl.sh     the DDL, the catalogs, and which launcher may
+                            start a worker
+    initial_sync.sh         the initial synchronisation, including an
+                            interrupted one
+    refresh_publication.sh  a table added to a running subscription
+    faults.sh               a reader QE, the driven session and the worker
+                            killed under load
+    copy_transport.sh       the segment-to-segment copy transport alone,
+                            without any subscription
+    participants_bench.sh   how long small distributed transactions take
+                            to arrive (a measurement, not a pass/fail test)
+
+    usage: <test>.sh [-s <port>]        (default 7100)
