@@ -30,6 +30,10 @@ typedef struct PGOutputData
 	bool		messages;
 	bool		two_phase;
 	char	   *origin;
+
+	/* Cloudberry */
+	bool		cbdb_events;	/* coordinator stream: cbdb.dcommit messages */
+	bool		cbdb_gxid;		/* segment stream: cbdb.gxid before COMMIT */
 } PGOutputData;
 
 #endif							/* PGOUTPUT_H */

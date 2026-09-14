@@ -43,6 +43,11 @@ static void pgoutput_startup(LogicalDecodingContext *ctx,
 static void pgoutput_shutdown(LogicalDecodingContext *ctx);
 static void pgoutput_begin_txn(LogicalDecodingContext *ctx,
 							   ReorderBufferTXN *txn);
+static void pgoutput_write_gxid(LogicalDecodingContext *ctx, TransactionId xid,
+								DistributedTransactionId gxid, XLogRecPtr lsn);
+static void pgoutput_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+										DistributedTransactionId gxid, int nsegs,
+										const int16 *segs, bool exact);
 static void pgoutput_commit_txn(LogicalDecodingContext *ctx,
 								ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
 static void pgoutput_change(LogicalDecodingContext *ctx,
@@ -279,6 +284,9 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->stream_truncate_cb = pgoutput_truncate;
 	/* transaction streaming - two-phase commit */
 	cb->stream_prepare_cb = pgoutput_stream_prepare_txn;
+
+	/* Cloudberry */
+	cb->distributed_commit_cb = pgoutput_distributed_commit;
 }
 
 static void
@@ -291,12 +299,16 @@ parse_output_parameters(List *options, PGOutputData *data)
 	bool		messages_option_given = false;
 	bool		streaming_given = false;
 	bool		two_phase_option_given = false;
+	bool		cbdb_events_given = false;
+	bool		cbdb_gxid_given = false;
 	bool		origin_option_given = false;
 
 	data->binary = false;
 	data->streaming = LOGICALREP_STREAM_OFF;
 	data->messages = false;
 	data->two_phase = false;
+	data->cbdb_events = false;
+	data->cbdb_gxid = false;
 
 	foreach(lc, options)
 	{
@@ -384,6 +396,26 @@ parse_output_parameters(List *options, PGOutputData *data)
 			two_phase_option_given = true;
 
 			data->two_phase = defGetBoolean(defel);
+		}
+		else if (strcmp(defel->defname, "cbdb_events") == 0)
+		{
+			if (cbdb_events_given)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			cbdb_events_given = true;
+
+			data->cbdb_events = defGetBoolean(defel);
+		}
+		else if (strcmp(defel->defname, "cbdb_gxid") == 0)
+		{
+			if (cbdb_gxid_given)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			cbdb_gxid_given = true;
+
+			data->cbdb_gxid = defGetBoolean(defel);
 		}
 		else if (strcmp(defel->defname, "origin") == 0)
 		{
@@ -606,10 +638,20 @@ static void
 pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					XLogRecPtr commit_lsn)
 {
+	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
 	PGOutputTxnData *txndata = (PGOutputTxnData *) txn->output_plugin_private;
 	bool		sent_begin_txn;
 
 	Assert(txndata);
+
+	/*
+	 * Cloudberry: a one-phase distributed transaction is announced with its
+	 * gxid before COMMIT when asked to (cbdb_gxid), even when it changed
+	 * nothing the subscriber sees: the apply driver waits for the gxid on
+	 * every participating segment.
+	 */
+	if (data->cbdb_gxid && txn->distribXid != 0 && !txndata->sent_begin_txn)
+		pgoutput_send_begin(ctx, txn);
 
 	/*
 	 * We don't need to send the commit message unless some relevant change
@@ -626,9 +668,67 @@ pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		return;
 	}
 
+	if (data->cbdb_gxid && txn->distribXid != 0)
+		pgoutput_write_gxid(ctx, InvalidTransactionId, txn->distribXid, commit_lsn);
+
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_commit(ctx->out, txn, commit_lsn);
 	OutputPluginWrite(ctx, true);
+}
+
+/*
+ * Cloudberry: transactional message "cbdb.gxid" carrying the decimal gxid.
+ * With a valid xid it is written as a streamed message (inside a stream
+ * block the caller opened).
+ */
+static void
+pgoutput_write_gxid(LogicalDecodingContext *ctx, TransactionId xid,
+					DistributedTransactionId gxid, XLogRecPtr lsn)
+{
+	char		buf[32];
+
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, gxid);
+	OutputPluginPrepareWrite(ctx, true);
+	logicalrep_write_message(ctx->out, xid, lsn, true, "cbdb.gxid", strlen(buf), buf);
+	OutputPluginWrite(ctx, true);
+}
+
+/*
+ * Cloudberry: a distributed commit event of the coordinator's WAL, as a
+ * non-transactional message "cbdb.dcommit" when asked to (cbdb_events).
+ * Content: "gxid=<n> lsn=<n> segs=<a,b,...> exact=<0|1>", segs "*" when the
+ * record does not list the participants and "-" when it says none wrote.
+ * exact=1 means the list is the set of segments that actually wrote, so each
+ * of them has the transaction in its own stream; exact=0 means it is the set
+ * the transaction was dispatched to, some of which may never send it.
+ */
+static void
+pgoutput_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+							DistributedTransactionId gxid, int nsegs,
+							const int16 *segs, bool exact)
+{
+	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
+	StringInfoData buf;
+
+	if (!data->cbdb_events)
+		return;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "gxid=" UINT64_FORMAT " lsn=" UINT64_FORMAT " segs=",
+					 gxid, (uint64) lsn);
+	if (nsegs == 0)
+		appendStringInfoChar(&buf, '*');	/* participants unknown */
+	else if (nsegs < 0)
+		appendStringInfoChar(&buf, '-');	/* known: no segment wrote */
+	for (int i = 0; i < nsegs; i++)
+		appendStringInfo(&buf, "%s%d", i ? "," : "", segs[i]);
+	appendStringInfo(&buf, " exact=%d", exact ? 1 : 0);
+
+	OutputPluginPrepareWrite(ctx, true);
+	logicalrep_write_message(ctx->out, InvalidTransactionId, lsn, false,
+							 "cbdb.dcommit", buf.len, buf.data);
+	OutputPluginWrite(ctx, true);
+	pfree(buf.data);
 }
 
 /*
@@ -1867,10 +1967,27 @@ pgoutput_stream_commit(struct LogicalDecodingContext *ctx,
 	 * The commit should happen outside streaming block, even for streamed
 	 * transactions. The transaction has to be marked as streamed, though.
 	 */
+	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
+
 	Assert(!in_streaming);
 	Assert(rbtxn_is_streamed(txn));
 
 	OutputPluginUpdateProgress(ctx, false);
+
+	/*
+	 * Cloudberry: the gxid of a streamed one-phase transaction travels in
+	 * one more (tiny) stream block right before STREAM COMMIT.
+	 */
+	if (data->cbdb_gxid && txn->distribXid != 0)
+	{
+		OutputPluginPrepareWrite(ctx, true);
+		logicalrep_write_stream_start(ctx->out, txn->xid, false);
+		OutputPluginWrite(ctx, true);
+		pgoutput_write_gxid(ctx, txn->xid, txn->distribXid, commit_lsn);
+		OutputPluginPrepareWrite(ctx, true);
+		logicalrep_write_stream_stop(ctx->out);
+		OutputPluginWrite(ctx, true);
+	}
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_stream_commit(ctx->out, txn, commit_lsn);
