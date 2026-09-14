@@ -12388,6 +12388,11 @@
    proname => 'gp_backend_info', prorettype => 'record', prorows => '1', proretset => 't', proargtypes => '', proallargtypes => '{int4,char,int4,text,int4,int4}', prosrc => 'gp_backend_info', pronargs => 6,
    proargnames => '{id,type,content,host,port,pid}', proargmodes => '{o,o,o,o,o,o}', proexeclocation => 'c'}
 
+{ oid => 7006, descr => 'distributed snapshot of the current transaction',
+  proname => 'gp_current_distributed_snapshot', prorettype => 'record', provolatile => 'v', proparallel => 'u', proexeclocation => 'c',
+  proargtypes => '', proallargtypes => '{int8,int8,_int8}', proargmodes => '{o,o,o}',
+  proargnames => '{xmin,xmax,in_progress}', prosrc => 'gp_current_distributed_snapshot' },
+
 { oid => 9184, descr => 'unordered percentile_cont float8 transition function',
   proname => 'gp_percentile_cont_float8_transition',
   proisstrict => 'f',

@@ -1920,6 +1920,50 @@ $$
     SELECT pg_stat_reset_replication_slot(target) FROM gp_dist_random('gp_id');
 $$ LANGUAGE SQL;
 
+-- MPP-aware wrappers to create/drop a logical replication slot on every primary
+-- segment (and the coordinator, reported as gp_segment_id = -1).
+--
+-- Logical decoding must run on each segment because user table data lives there;
+-- these dispatch pg_create_logical_replication_slot / pg_drop_replication_slot to
+-- all segments and aggregate the per-segment results.  Pair with the existing
+-- gp_replication_slots view to monitor per-segment progress (restart_lsn lag).
+--
+-- NB: replication slots are non-transactional, so a failure partway through leaves
+-- slots created on the segments processed so far; re-run drop to clean up.
+CREATE FUNCTION gp_create_logical_replication_slot(
+    IN p_slot_name name, IN p_plugin name,
+    IN p_temporary boolean DEFAULT false, IN p_twophase boolean DEFAULT false,
+    OUT gp_segment_id integer, OUT slot_name name, OUT lsn pg_lsn)
+RETURNS SETOF record AS
+$$
+    -- Coordinator (gp_segment_id = -1): function-in-FROM is evaluated exactly once.
+    SELECT -1, r.slot_name, r.lsn
+      FROM pg_catalog.pg_create_logical_replication_slot($1, $2, $3, $4) r
+    UNION ALL
+    -- Each primary segment: putting the call in the target list of a scan over
+    -- gp_dist_random('gp_id') pushes execution down to the segments (LATERAL would
+    -- instead be pulled back to the coordinator).  The record is expanded in the
+    -- outer query so the volatile function is called only once per segment.
+    SELECT x.seg, (x.r).slot_name, (x.r).lsn
+      FROM (SELECT gp_execution_segment() AS seg,
+                   pg_catalog.pg_create_logical_replication_slot($1, $2, $3, $4) AS r
+              FROM gp_dist_random('gp_id')) x;
+$$ LANGUAGE SQL;
+
+-- Drop a cluster-wide replication slot.  Idempotent on purpose: it drops the
+-- slot wherever it exists and says nothing about the nodes where it does not,
+-- so a half-dropped state (the coordinator arm succeeded, a segment arm failed
+-- because a reader still held the slot) stays retryable.  Returns the number
+-- of nodes the slot was dropped on.
+CREATE FUNCTION gp_drop_replication_slot(IN p_slot_name name) RETURNS VOID AS
+$$
+    SELECT pg_catalog.pg_drop_replication_slot(slot_name)
+      FROM pg_catalog.pg_replication_slots WHERE slot_name = $1
+    UNION ALL
+    SELECT pg_catalog.pg_drop_replication_slot(slot_name)
+      FROM gp_dist_random('pg_replication_slots') WHERE slot_name = $1;
+$$ LANGUAGE SQL;
+
 CREATE FUNCTION gp_stat_reset_subscription_stats(subid oid) RETURNS VOID AS
 $$
     WITH sub_info AS (

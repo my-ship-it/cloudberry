@@ -22,6 +22,10 @@
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 #include "storage/procarray.h"
+#include "catalog/pg_type.h"
+#include "utils/builtins.h"
+#include "utils/array.h"
+#include "funcapi.h"
 
 int
 GetMaxSnapshotDistributedXidCount()
@@ -333,4 +337,59 @@ DistributedSnapshot_Deserialize(const char *buf, DistributedSnapshot *ds)
 
 	Assert((p - buf) == DistributedSnapshot_SerializeSize(ds));
 	return (p - buf);
+}
+
+/*
+ * gp_current_distributed_snapshot(OUT xmin int8, OUT xmax int8,
+ *                                 OUT in_progress int8[])
+ *
+ * The distributed snapshot of the current transaction, as (xmin, xmax,
+ * in-progress gxids).  A COPY taken under this
+ * snapshot covers exactly the distributed transactions G with
+ *   G < xmax  AND  G not in in_progress,
+ * which is what a logical replication receiver needs to tell what its
+ * initial copy already has (contrib/mpp_logicalrep).
+ * Must run on the coordinator inside a transaction that has a distributed
+ * snapshot (a REPEATABLE READ transaction taken at the sync cut point).
+ * Avoids parsing pg_export_snapshot's ds* lines and needing pg_read_file.
+ */
+Datum
+gp_current_distributed_snapshot(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+	HeapTuple	tuple;
+	Snapshot	snap;
+	DistributedSnapshot *ds;
+	Datum	   *elems;
+
+	if (Gp_role != GP_ROLE_DISPATCH)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gp_current_distributed_snapshot() must run on the coordinator")));
+
+	snap = GetTransactionSnapshot();
+	ds = &snap->distribSnapshotWithLocalMapping.ds;
+	if (ds->distribSnapshotId == 0 && ds->xmax == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no distributed snapshot in the current transaction"),
+				 errhint("Run inside a transaction (ideally REPEATABLE READ) on the coordinator.")));
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) ds->xmin);
+	values[1] = Int64GetDatum((int64) ds->xmax);
+
+	elems = (Datum *) palloc(sizeof(Datum) * Max(ds->count, 1));
+	for (int i = 0; i < ds->count; i++)
+		elems[i] = Int64GetDatum((int64) ds->inProgressXidArray[i]);
+	values[2] = PointerGetDatum(construct_array(elems, ds->count, INT8OID,
+												8, FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
