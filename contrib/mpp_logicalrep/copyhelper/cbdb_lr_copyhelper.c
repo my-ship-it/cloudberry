@@ -24,6 +24,13 @@
  * Frame: [uint32 net length][length bytes].  A zero-length frame ends the
  * stream.  Optional CRC32C per frame when --crc is given on both sides.
  *
+ * The first frame a sender writes is its --job, and the receiver drops any
+ * connection that does not open with its own.  The socket carries no other
+ * authentication -- it is a plain TCP port, on the target segment, that
+ * writes what it is given straight into a table -- so the job name is not a
+ * label but a secret: whoever generates it makes it unguessable, and the
+ * ports should be reachable only from the source cluster.
+ *
  * Portions Copyright (c) 2026, Apache Cloudberry
  *
  * IDENTIFICATION
@@ -38,6 +45,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -204,7 +212,6 @@ do_send(const char *job, int seg, char *targets)
 	char	   *buf = pg_malloc(LR_CHUNK);
 	uint64		total = 0;
 
-	(void) job;
 	for (tok = strtok_r(targets, ",", &save); tok && ntargets < 4096;
 		 tok = strtok_r(NULL, ",", &save))
 		list[ntargets++] = tok;
@@ -213,6 +220,7 @@ do_send(const char *job, int seg, char *targets)
 
 	/* N_src == N_dst: seg i -> target i; otherwise round-robin by seg */
 	fd = connect_target(list[seg % ntargets]);
+	send_frame(fd, job, (uint32) strlen(job));	/* who we are */
 
 	for (;;)
 	{
@@ -279,6 +287,56 @@ listen_port(const char *bindaddr, int lo, int hi, int *chosen)
 	}
 	pg_fatal("no free port in range %d-%d", lo, hi);
 	return -1;					/* unreachable */
+}
+
+/*
+ * The opening frame has to be the job name.  Anything else is not a sender of
+ * this copy -- a port scan, a stale helper of a job that has been redone -- so
+ * the connection is dropped without counting towards the clients waited for.
+ */
+/* fopen(path, "w") with the mode pinned to 0600 */
+static FILE *
+open_private(const char *path)
+{
+	int			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	FILE	   *f;
+
+	if (fd < 0)
+		return NULL;
+	if (fchmod(fd, 0600) != 0)	/* an existing file keeps its own mode */
+	{
+		close(fd);
+		return NULL;
+	}
+	f = fdopen(fd, "w");
+	if (f == NULL)
+		close(fd);
+	return f;
+}
+
+static bool
+recv_greeting(int cfd, const char *job)
+{
+	char		hdr[4];
+	uint32		len;
+	char		buf[128];
+
+	if (!read_full(cfd, hdr, 4))
+		return false;
+	len = pg_ntoh32(*(uint32 *) hdr);
+	if (len == 0 || len > sizeof(buf) - 1)
+		return false;
+	if (use_crc)
+	{
+		char		crcbuf[4];
+
+		if (!read_full(cfd, crcbuf, 4))
+			return false;
+	}
+	if (!read_full(cfd, buf, len))
+		return false;
+	buf[len] = '\0';
+	return strcmp(buf, job) == 0;
 }
 
 static bool
@@ -353,11 +411,16 @@ do_recv(const char *job, int seg, int nclients, int lo, int hi, const char *bind
 
 	lfd = listen_port(bindaddr, lo, hi, &port);
 
+	/*
+	 * The job name is a secret (see the frame description above), and it is
+	 * the name of these files, so they are the owner's business only rather
+	 * than whatever the inherited umask happens to allow.
+	 */
 	snprintf(dir, sizeof(dir), "%s/gp_lr", pgdata);
 	mkdir(dir, 0700);
 	snprintf(portpath, sizeof(portpath), "%s/%s.%d.port", dir, job, seg);
 	snprintf(tmppath, sizeof(tmppath), "%s.tmp", portpath);
-	f = fopen(tmppath, "w");
+	f = open_private(tmppath);
 	if (f == NULL)
 		pg_fatal("could not write %s: %m", tmppath);
 	fprintf(f, "%d\n", port);
@@ -384,6 +447,12 @@ do_recv(const char *job, int seg, int nclients, int lo, int hi, const char *bind
 				continue;
 			pg_fatal("accept failed: %m");
 		}
+		if (!recv_greeting(cfd, job))
+		{
+			pg_log_warning("rejected a connection that did not open with this job");
+			close(cfd);
+			continue;
+		}
 		if (!recv_one_client(cfd, &bytes))
 			pg_fatal("source connection closed before the end marker");
 		close(cfd);				/* signals the sender we are done */
@@ -392,7 +461,7 @@ do_recv(const char *job, int seg, int nclients, int lo, int hi, const char *bind
 	close(lfd);
 
 	snprintf(donepath, sizeof(donepath), "%s/%s.%d.done", dir, job, seg);
-	f = fopen(donepath, "w");
+	f = open_private(donepath);
 	if (f)
 	{
 		fprintf(f, "%llu\n", (unsigned long long) bytes);

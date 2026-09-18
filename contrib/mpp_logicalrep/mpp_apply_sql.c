@@ -334,6 +334,16 @@ int			gp_lr_copy_port_lo = 42000;
 int			gp_lr_copy_port_hi = 42999;
 bool		gp_lr_copy_crc = true;
 
+/*
+ * Which address the copy transport listens on.  Empty means every interface,
+ * which is what a single-homed host wants and what a host with a public
+ * interface does not: the socket writes what it is given into the table being
+ * copied, and its only authentication is that the sender opens with the job
+ * name (a secret, see mpp_tablesync.c).  On a multi-homed host name the
+ * address the source cluster reaches this segment on.
+ */
+char	   *gp_lr_copy_bind_address = "";
+
 typedef struct LrCopyRecvState
 {
 	Relation	rel;
@@ -427,6 +437,19 @@ gp_lr_copy_recv(PG_FUNCTION_ARGS)
 						 gp_lr_copy_port_lo, gp_lr_copy_port_hi);
 		if (gp_lr_copy_crc)
 			appendStringInfoString(&cmd, " --crc");
+		if (gp_lr_copy_bind_address[0] != '\0')
+		{
+			/* the command line goes to a shell: let nothing else through */
+			for (const char *c = gp_lr_copy_bind_address; *c; c++)
+				if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+					  (*c >= '0' && *c <= '9') || *c == '.' || *c == ':' ||
+					  *c == '-' || *c == '_'))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid mpp_logicalrep.copy_bind_address"),
+							 errdetail("It must be a host address: letters, digits and \".:-_\".")));
+			appendStringInfo(&cmd, " --bindaddr %s", gp_lr_copy_bind_address);
+		}
 
 		st->estate = CreateExecutorState();
 		st->econtext = GetPerTupleExprContext(st->estate);

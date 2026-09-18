@@ -42,6 +42,10 @@ sides being separate servers.
     monitoring.sh           gp_stat_mpp_subscription and its per-segment
                             companion, running and stopped; and that the
                             launcher is woken rather than slept out
+    security.sh             who can read the source's password, that it
+                            stays out of the dispatched payload, and that
+                            the copy transport's socket drops a caller
+                            that does not know the job name
     participants_bench.sh   how long small distributed transactions take
                             to arrive (a measurement, not a pass/fail test)
 

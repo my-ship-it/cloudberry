@@ -30,6 +30,9 @@
  */
 #include "postgres.h"
 
+#include "libpq-fe.h"
+
+#include "catalog/pg_subscription.h"
 #include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"
 #include "commands/explain.h"
@@ -426,6 +429,52 @@ queue_cold(LrSourceState *state)
  * section 9.2b).  The per-stream keys (conninfo, flush, pos, applied) are
  * indexed by SOURCE segment, not by reader.
  */
+/*
+ * The keywords of this subscription's conninfo that the CONNECT payload
+ * deliberately does not carry -- its secrets -- as a conninfo fragment, or
+ * NULL when it has none.  Read from this segment's own pg_subscription row,
+ * which CREATE SUBSCRIPTION put here and which only a superuser can read.
+ */
+static const char *
+source_secrets(Oid subid)
+{
+	Subscription *sub = GetSubscription(subid, true);
+	PQconninfoOption *opts;
+	char	   *err = NULL;
+	StringInfoData buf;
+
+	if (sub == NULL || sub->conninfo == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("subscription %u is not on this segment", subid),
+				 errdetail("Its connection secrets are taken from the local catalog rather than from the dispatched payload.")));
+
+	opts = PQconninfoParse(sub->conninfo, &err);
+	if (opts == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid connection string for subscription %u: %s",
+						subid, err ? err : "?")));
+	initStringInfo(&buf);
+	for (PQconninfoOption *o = opts; o->keyword; o++)
+	{
+		if (o->val == NULL || o->val[0] == '\0')
+			continue;
+		if (strcmp(o->keyword, "password") == 0 ||
+			strcmp(o->keyword, "sslpassword") == 0)
+			appendStringInfo(&buf, "%s%s='%s'", buf.len ? " " : "",
+							 o->keyword, o->val);
+	}
+	PQconninfoFree(opts);
+	if (buf.len == 0)
+	{
+		pfree(buf.data);
+		return NULL;
+	}
+	return buf.data;
+}
+
+
 static void
 do_connect(LrSourceState *state)
 {
@@ -436,6 +485,7 @@ do_connect(LrSourceState *state)
 	LrReport	rpt;
 	ListCell   *lc;
 	List	   *srcsegs = NIL;
+	const char *secrets = NULL;
 	List	   *repl_oids = NIL;
 	XLogRecPtr	first_flush = InvalidXLogRecPtr;
 
@@ -488,6 +538,20 @@ do_connect(LrSourceState *state)
 		}
 	}
 
+	/*
+	 * The driver leaves the source's secrets out of the payload, because a
+	 * server that logs statements logs their parameters too, and this payload
+	 * is one (work item O3).  The same conninfo is on this segment already:
+	 * CREATE SUBSCRIPTION was dispatched here, and pg_subscription.subconninfo
+	 * is readable by nobody but a superuser.
+	 */
+	{
+		const char *sec = kv_get(state->kv, "secrets");
+
+		secrets = (sec != NULL && atoi(sec) != 0) ?
+			source_secrets(state->spec.subid) : NULL;
+	}
+
 	foreach(lc, srcsegs)
 	{
 		int			srcseg = lfirst_int(lc);
@@ -530,6 +594,8 @@ do_connect(LrSourceState *state)
 			const char *sm = kv_get(state->kv, "streaming");
 			const char *tp = kv_get(state->kv, "twophase");
 
+			if (secrets != NULL)
+				conninfo = psprintf("%s %s", conninfo, secrets);
 			LrReaderConnect(st, conninfo, slot, pubs,
 							b != NULL && atoi(b) != 0,
 							sm == NULL || atoi(sm) != 0,

@@ -285,5 +285,6 @@ extern void LrRouterClose(LrRouter *r);
 extern int	gp_lr_copy_port_lo;
 extern int	gp_lr_copy_port_hi;
 extern bool gp_lr_copy_crc;
+extern char *gp_lr_copy_bind_address;
 
 #endif							/* MPP_APPLY_H */

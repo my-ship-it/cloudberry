@@ -157,6 +157,8 @@ typedef struct LrDriver
 	WalReceiverConn *src;
 	List	   *seg_conninfos;	/* char*, by source content id */
 	List	   *src_repl_relids;	/* Oid: DISTRIBUTED REPLICATED there */
+	bool		src_has_secrets;	/* the source conninfo had a password, so
+									 * the readers must add their own (O3) */
 	int			nsrcsegs;
 	int64		coord_pos;		/* last coordinator position received */
 	int64		coord_committed;	/* coordinator position of the last batch */
@@ -506,9 +508,22 @@ LrTransportQuoteRel(LrCbdbTransport *tr, const char *nspname, const char *relnam
 	return result;
 }
 
+/* keywords of a conninfo that are a secret rather than a coordinate */
+static bool
+conninfo_is_secret(const char *keyword)
+{
+	return strcmp(keyword, "password") == 0 ||
+		strcmp(keyword, "sslpassword") == 0;
+}
+
 /*
  * Source segments: content -> conninfo.  Built from the source coordinator's
- * gp_segment_configuration with the caller's conninfo minus host/port.
+ * gp_segment_configuration with the caller's conninfo minus host/port -- and
+ * minus its secrets, which do not travel in the CONNECT payload at all: that
+ * payload is a bound parameter of a statement, and a server logging
+ * statements writes its parameters out.  The readers take the secrets from
+ * their own pg_subscription row instead, which is the same value, already on
+ * the segment, and readable by nobody else (work item O3).
  */
 static void
 driver_load_source_segments(LrDriver *d)
@@ -542,6 +557,11 @@ driver_load_source_segments(LrDriver *d)
 		if (strcmp(o->keyword, "host") == 0 || strcmp(o->keyword, "hostaddr") == 0 ||
 			strcmp(o->keyword, "port") == 0)
 			continue;
+		if (conninfo_is_secret(o->keyword))
+		{
+			d->src_has_secrets = true;
+			continue;
+		}
 		appendStringInfo(&base, "%s='%s' ", o->keyword, o->val);
 	}
 	PQconninfoFree(opts);
@@ -690,6 +710,8 @@ driver_connect_readers(LrDriver *d)
 		}
 		appendStringInfoChar(&spec, '\n');
 	}
+	if (d->src_has_secrets)
+		appendStringInfoString(&spec, "secrets=1\n");
 	for (int s = 0; s < d->nsrcsegs; s++)
 	{
 		appendStringInfo(&spec, "conninfo.%d=%s\n", s,

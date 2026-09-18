@@ -114,6 +114,25 @@ static const struct config_enum_entry apply_error_action_options[] = {
  * Settings
  * ------------------------------------------------------------------------
  */
+/*
+ * The address ends up on the command line of the copy helper, which a shell
+ * runs, so nothing but a host address may get in.  Checking it here means a
+ * bad value is refused by ALTER SYSTEM rather than by a copy an hour later.
+ */
+static bool
+check_copy_bind_address(char **newval, void **extra, GucSource source)
+{
+	for (const char *c = *newval; c && *c; c++)
+		if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+			  (*c >= '0' && *c <= '9') || *c == '.' || *c == ':' ||
+			  *c == '-' || *c == '_'))
+		{
+			GUC_check_errdetail("It must be a host address: letters, digits and \".:-_\".");
+			return false;
+		}
+	return true;
+}
+
 static void
 define_gucs(void)
 {
@@ -188,6 +207,13 @@ define_gucs(void)
 							 &gp_lr_copy_crc,
 							 true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("mpp_logicalrep.copy_bind_address",
+							   "Address the initial-sync copy transport listens on.",
+							   "Empty means every interface. The socket has no authentication beyond the job name the sender opens with, so on a host with an interface the source cluster does not use, name the one it does.",
+							   &gp_lr_copy_bind_address,
+							   "",
+							   PGC_SIGHUP, 0, check_copy_bind_address, NULL, NULL);
 
 	DefineCustomEnumVariable("mpp_logicalrep.slot_loss_action",
 							 "What an apply worker does when the source's replication slots are gone.",

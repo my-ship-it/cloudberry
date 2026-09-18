@@ -115,6 +115,12 @@ The library has to be the new one before either is run: CREATE FUNCTION
 looks the C symbols up in the library the postmaster already has open, so
 the cluster is restarted first.
 
+The copy transport's wire format spans the two clusters -- the sender is
+the source cluster's cbdb_lr_copyhelper, the receiver the target's -- so
+a change to it has to be made on both.  This version added the opening
+frame that names the job (see Security), which a helper of an earlier
+version neither sends nor expects.
+
 The source cluster needs nothing from this module.
 
 
@@ -247,8 +253,10 @@ mpp_logicalrep.slot_loss_action (enum, default reinit)
 mpp_logicalrep.copy_port_lo, mpp_logicalrep.copy_port_hi (integer,
 default 42000 and 42999)
 mpp_logicalrep.copy_crc (boolean, default on)
-    The copy transport's listen range, and whether to checksum each of
-    its frames.
+mpp_logicalrep.copy_bind_address (string, default empty, SIGHUP)
+    The copy transport's listen range, whether to checksum each of its
+    frames, and which interface it listens on -- empty means all of
+    them.  See Security below.
 
 mpp_logicalrep.max_workers (integer, default 8, requires restart)
     How many subscriptions may have a worker at once; it also sizes the
@@ -259,6 +267,43 @@ mpp_logicalrep.launcher_naptime_ms (integer, default 5s)
     ALTER SUBSCRIPTION ... ENABLE wake it when they commit, so this is
     the delay only for a worker that has to be started for some other
     reason -- one that exited, say.
+
+
+Security
+--------
+
+The source's connection string, password and all, is in
+pg_subscription.subconninfo, and CREATE SUBSCRIPTION dispatches it to
+every segment: the readers connect from there, so it has to be there.
+Only a superuser can read that column, on the coordinator and on the
+segments alike, which is the server's own arrangement and this module
+does not change it.
+
+The column is where the secret stays.  The payload the driver dispatches
+to its readers on every connect carries the per-segment host and port but
+not the password; each reader takes that from its own catalog row.  The
+payload is a bound parameter of a statement, and a server with
+log_statement on writes the parameters of every statement into its log --
+which would otherwise mean the password, once per reconnect, in the
+target's log.  (A password in the CREATE SUBSCRIPTION the user typed is
+still logged, exactly as any other statement is.)
+
+The copy transport is a plain TCP port on each target segment that writes
+what it is given into the table being copied.  It has no authentication
+in the usual sense: what it has is the job name, which the sender must
+present in its opening frame and which this module generates with 128
+random bits for each copy.  A connection that opens with anything else is
+dropped.  Treat the port range as internal all the same: allow it from
+the source cluster's segment hosts and nowhere else, and on a host with an
+interface the source does not use, name the one it does in
+mpp_logicalrep.copy_bind_address.  The port and done files the transport
+leaves in $PGDATA/gp_lr are created 0600 in a 0700 directory, because
+their names are the job names.
+
+The SQL entry points (gp_lr_connect, gp_lr_drain, gp_lr_apply,
+gp_lr_copy_recv, gp_lr_copy_ports) drive gangs and open sockets on behalf
+of a subscription, and are superuser-only.  The statistics views are not:
+they expose positions and counters, nothing else.
 
 
 Monitoring

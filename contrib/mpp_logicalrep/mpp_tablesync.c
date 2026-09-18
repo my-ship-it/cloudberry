@@ -1304,6 +1304,28 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text)
  */
 
 /*
+ * The name of one copy job.  It names the helper's port file and the frames
+ * its senders open with, and the receiving socket has no other
+ * authentication -- whoever reaches it writes into the table being copied --
+ * so the name carries 128 random bits and is a secret, not a label.  The
+ * readable prefix is there for the log and for finding a leftover file.
+ */
+static char *
+sync_new_job(LrSync *s, LrSyncRel *r)
+{
+	uint8		rnd[16];
+	char		hex[sizeof(rnd) * 2 + 1];
+
+	if (!pg_strong_random(rnd, sizeof(rnd)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not generate a random copy job name")));
+	for (int i = 0; i < (int) sizeof(rnd); i++)
+		snprintf(hex + i * 2, 3, "%02x", rnd[i]);
+	return psprintf("lr%u_%u_%s", s->cfg->subid, r->relid, hex);
+}
+
+/*
  * The copy of one table in four steps, so that the incremental job can be
  * driven from the apply loop without blocking it (LrSyncAddStep).  The
  * blocking wrapper below is what the initial synchronisation uses.
@@ -1313,7 +1335,7 @@ copy_begin(LrSync *s, LrSyncRel *r)
 {
 	StringInfoData sql;
 
-	s->cur_job = psprintf("lr%u_%u_%d", s->cfg->subid, r->relid, MyProcPid);
+	s->cur_job = sync_new_job(s, r);
 	s->cur_targets = NULL;
 	s->cur_src_rows = -1;
 	sync_set_rel_state(s, r->relid, 'd', s->cur_job);
