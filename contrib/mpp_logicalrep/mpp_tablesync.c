@@ -220,8 +220,9 @@ LrInitialSync(LrWorkerConfig *cfg)
 			else if (have != 0 && have != s->nsrcsegs + 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_IN_USE),
-						 errmsg("slot \"%s\" exists on %d of %d source nodes",
+						 errmsg("slot \"%s\" is usable on only %d of %d source nodes",
 								cfg->seg_slot, have, s->nsrcsegs + 1),
+						 errdetail("The rest are missing, or were invalidated by the publisher because the WAL they asked for is gone."),
 						 errhint("Drop it everywhere with gp_drop_replication_slot() and retry, or let the subscription resynchronise.")));
 		}
 
@@ -1083,8 +1084,24 @@ sync_count_slots(LrSync *s)
 	int			have;
 
 	sync_connect_source(s);
+
+	/*
+	 * A slot that is still listed but can no longer be streamed from counts
+	 * as gone, because that is what it is: the publisher invalidates a slot
+	 * when the WAL it asked for has been recycled (or, on a standby, when it
+	 * conflicts with recovery), clears its restart_lsn and refuses every
+	 * START_REPLICATION afterwards.  Counting the row would let the caller
+	 * walk into that refusal instead of deciding what to do about it, and the
+	 * refusal happens outside this function -- in the reader gang and in the
+	 * driver's own connection, where nothing grades it and the worker simply
+	 * exits to be started again.
+	 */
 	res = sync_exec(s, s->src, "source",
-					"SELECT count(*) FROM gp_replication_slots WHERE slot_name = $1",
+					"SELECT count(*) FROM gp_replication_slots\n"
+					" WHERE slot_name = $1\n"
+					"   AND restart_lsn IS NOT NULL\n"
+					"   AND wal_status IS DISTINCT FROM 'lost'\n"
+					"   AND NOT coalesce(conflicting, false)",
 					1, params);
 	have = atoi(PQgetvalue(res, 0, 0));
 	PQclear(res);
@@ -1092,13 +1109,19 @@ sync_count_slots(LrSync *s)
 }
 
 /*
- * The streaming phase is about to start but the slots are gone from the
- * source -- a segment failover takes them with it, since a logical slot is
- * local to its primary and PG16 has no slot synchronisation (design 13.2).
- * Everything between the lost position and now is unrecoverable, so the only
- * consistent answers are "redo the subscription from scratch" or "stop and
- * tell someone".  Returns true when the caller should redo the initial
- * synchronisation.
+ * The streaming phase is about to start but the source's slots are no longer
+ * usable.  Two ways that happens, and they need the same answer:
+ *
+ *   gone         a segment failover takes its slots with it, since a logical
+ *                slot is local to its primary and PG16 has no slot
+ *                synchronisation (design 13.2)
+ *   invalidated  the publisher recycled the WAL the slot asked for, cleared
+ *                its restart_lsn and will refuse to stream from it
+ *
+ * Either way everything between that position and now is unrecoverable, so
+ * the only consistent answers are "redo the subscription from scratch" or
+ * "stop and tell someone".  Returns true when the caller should redo the
+ * initial synchronisation.
  */
 static bool
 sync_handle_slot_loss(LrSync *s)
@@ -1108,7 +1131,7 @@ sync_handle_slot_loss(LrSync *s)
 		{
 			char	   *sql = psprintf("UPDATE pg_catalog.gp_mpp_subscription "
 									   "SET enabled = false, disable_reason = "
-									   "'the source replication slots are gone' "
+									   "'the source replication slots are gone or invalidated' "
 									   "WHERE subid = %u", s->cfg->subid);
 
 			PQclear(sync_exec(s, s->tgt2, "target", sql, 0, NULL));
@@ -1116,15 +1139,16 @@ sync_handle_slot_loss(LrSync *s)
 		}
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("replication slot \"%s\" no longer exists on the source; subscription %u disabled",
+				 errmsg("replication slot \"%s\" can no longer be streamed from; subscription %u disabled",
 						s->cfg->seg_slot, s->cfg->subid),
-				 errhint("The slots are local to the source primaries and are lost on failover. Re-enable it (ALTER SUBSCRIPTION ... ENABLE) to resynchronise from scratch, or set mpp_logicalrep.slot_loss_action=reinit.")));
+				 errdetail("The slots are either gone -- they are local to the source primaries and are lost on failover -- or invalidated, which the publisher does when the WAL they asked for has been recycled."),
+				 errhint("Re-enable it (ALTER SUBSCRIPTION ... ENABLE) to resynchronise from scratch, or set mpp_logicalrep.slot_loss_action=reinit. To stop it happening again, keep the subscription running, or cap the publisher's retention with max_slot_wal_keep_size and watch pg_replication_slots.wal_status.")));
 	}
 
 	ereport(WARNING,
-			(errmsg("replication slot \"%s\" no longer exists on the source; redoing the initial synchronisation of subscription %u",
+			(errmsg("replication slot \"%s\" can no longer be streamed from; redoing the initial synchronisation of subscription %u",
 					s->cfg->seg_slot, s->cfg->subid),
-			 errdetail("A logical slot is local to its primary and is lost when the segment fails over; the changes since the slot was lost cannot be recovered from it.")));
+			 errdetail("The slot is gone -- a logical slot is local to its primary and is lost when the segment fails over -- or invalidated because the WAL it asked for has been recycled. Either way the changes since then cannot be recovered from it.")));
 
 	/* forget every trace of the old run; the sync below rebuilds it */
 	{
@@ -1160,8 +1184,9 @@ sync_ensure_slots(LrSync *s)
 	if (have != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("initial sync: slot \"%s\" exists on %d of %d source nodes",
+				 errmsg("initial sync: slot \"%s\" is usable on only %d of %d source nodes",
 						s->cfg->seg_slot, have, s->nsrcsegs + 1),
+				 errdetail("The rest are missing, or were invalidated by the publisher because the WAL they asked for is gone."),
 				 errhint("Drop it everywhere with gp_drop_replication_slot() and retry.")));
 
 	elog(LOG, "mpp apply worker: subscription %u: creating cluster-wide slot \"%s\" on the source",

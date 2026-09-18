@@ -179,8 +179,44 @@ module then leaves entirely alone.
 DROP SUBSCRIPTION does not touch the publisher: the slots were not the
 module's to create and are not its to drop, which is also what lets the
 statement run in a transaction block.  Drop them on the publisher with
-gp_drop_replication_slot('sub_s') once nothing needs them -- a forgotten
-set of slots holds down the WAL of every primary segment there.
+gp_drop_replication_slot('sub_s') once nothing needs them -- see below for
+what a forgotten set costs.
+
+
+The slots and the publisher's WAL
+---------------------------------
+
+A slot is a promise written to the publisher's disk: it holds the WAL its
+subscriber has not read yet, whether or not that subscriber is connected.
+That is what makes a subscription survivable -- it can be disabled, its
+target can go down for an afternoon, and it resumes where it left off --
+and it is also the standing bill.  The publisher keeps that WAL until the
+subscription reads it or somebody drops the slot.  N + 1 slots per
+subscription, one per primary segment and one on the coordinator, so a
+forgotten set holds WAL down on every node of the publisher.
+
+    -- how much each one is holding, and how close it is to being thrown away
+    SELECT gp_segment_id, slot_name, wal_status,
+           pg_size_pretty(safe_wal_size) AS margin
+      FROM gp_replication_slots ORDER BY 1;
+
+wal_status walks reserved -> extended -> unreserved -> lost.  The last one
+is not a warning but a verdict: when a slot falls further behind than
+max_slot_wal_keep_size, the publisher clears its restart point and refuses
+to stream from it ever again.  The subscription then has no way to resume
+and has to be resynchronised from scratch, which is what
+mpp_logicalrep.slot_loss_action decides -- it treats an invalidated slot
+exactly as it treats one that a failover took away.
+
+max_slot_wal_keep_size is -1 by default, meaning the publisher would
+rather grow its WAL than throw a subscriber away.  Cap it if the opposite
+is true for you, and watch safe_wal_size either way.
+
+(On a Cloudberry publisher this used to work on the segments and not on
+the coordinator, where WAL retention followed the connected walsenders
+rather than the slots -- so the coordinator slot of any subscription that
+was not running at that moment was quietly invalidated.  A server new
+enough to carry this module honours logical slots on the coordinator too.)
 
 
 Requirements on the tables

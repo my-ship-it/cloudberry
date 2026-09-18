@@ -52,6 +52,9 @@ typedef struct MockAsm
 	int			n_shutdown;
 	int			n_handle_error;
 	bool		give_up;		/* what handle_error answers */
+	int			fail_startups;	/* startups that throw before one succeeds */
+	int			fail_restarts;	/* restarts that throw before one succeeds */
+	bool		connected;		/* a startup or restart has succeeded */
 
 	/* storage for the unit handed out */
 	AssembledTxn txns[8];
@@ -65,6 +68,14 @@ masm_startup(LogicalRepAssembly *self, const SinkCaps *caps, const ProgressPos *
 
 	st->caps = *caps;
 	st->n_startup++;
+	if (st->fail_startups > 0)
+	{
+		st->fail_startups--;
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("mock assembly cannot come up yet")));
+	}
+	st->connected = true;
 }
 
 static void
@@ -76,7 +87,15 @@ masm_shutdown(LogicalRepAssembly *self)
 static bool
 masm_poll(LogicalRepAssembly *self, int timeout_ms)
 {
-	((MockAsm *) self->private_data)->n_poll++;
+	MockAsm    *st = (MockAsm *) self->private_data;
+
+	st->n_poll++;
+	/*
+	 * A real assembly reads the source here.  Polling one that a failed
+	 * restart left torn down is what used to crash the worker, so the mock
+	 * insists on being connected.
+	 */
+	assert_true(st->connected);
 	return true;
 }
 
@@ -151,13 +170,26 @@ masm_housekeeping(LogicalRepAssembly *self)
 static void
 masm_reset(LogicalRepAssembly *self)
 {
-	((MockAsm *) self->private_data)->n_reset++;
+	MockAsm    *st = (MockAsm *) self->private_data;
+
+	st->n_reset++;
+	st->connected = false;		/* what it drops, restart has to rebuild */
 }
 
 static void
 masm_restart(LogicalRepAssembly *self, const ProgressPos *from)
 {
-	((MockAsm *) self->private_data)->n_restart++;
+	MockAsm    *st = (MockAsm *) self->private_data;
+
+	st->n_restart++;
+	if (st->fail_restarts > 0)
+	{
+		st->fail_restarts--;
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("mock assembly cannot reach the source yet")));
+	}
+	st->connected = true;
 }
 
 static bool
@@ -455,6 +487,64 @@ test_permanent_error_ends_the_run(void **state)
 
 /* an error it says can pass is replayed from the checkpoint */
 static void
+test_a_failed_startup_is_graded_not_escaped(void **state)
+{
+	MockAsm		as = {.nunits = 2,.txns_per = 1,.changes_per = 1,.next_gxid = 1};
+	MockSink	ss = {{0}};
+	LogicalRepAssembly assembly;
+	LogicalRepSink sink;
+
+	as.give_up = false;			/* "try again" */
+	ss.caps.commits_units = true;
+	as.fail_startups = 2;		/* the first two attempts cannot come up */
+
+	assembly = make_masm(&as);
+	sink = make_msink(&ss);
+
+	lr_apply_driver_run(&assembly, &sink, NULL);
+
+	/*
+	 * Coming up is part of the loop, so failing at it is an error the loop
+	 * grades and retries -- not something that escapes the run and leaves the
+	 * worker to be started again by someone else, which is how it used to be
+	 * and why a subscription whose slot had been invalidated span for ever.
+	 */
+	assert_int_equal(as.n_startup, 3);
+	assert_int_equal(as.n_handle_error, 2);
+	assert_int_equal(ss.n_commit, 2);	/* and then it did its work */
+	assert_int_equal(as.n_shutdown, 1);
+}
+
+static void
+test_a_failed_restart_is_retried_not_polled_through(void **state)
+{
+	MockAsm		as = {.nunits = 3,.txns_per = 1,.changes_per = 1,.next_gxid = 1};
+	MockSink	ss = {{0}};
+	LogicalRepAssembly assembly;
+	LogicalRepSink sink;
+
+	as.give_up = false;
+	ss.caps.commits_units = true;
+	ss.fail_units = 1;			/* one error, to send it into recovery */
+	as.fail_restarts = 2;		/* and the first two restarts fail too */
+
+	assembly = make_masm(&as);
+	sink = make_msink(&ss);
+
+	lr_apply_driver_run(&assembly, &sink, NULL);
+
+	/*
+	 * Three restarts: two that threw and the one that worked.  The run has to
+	 * come out of it having applied everything -- and masm_poll asserts it was
+	 * never called on a torn-down assembly, which is the crash this guards.
+	 */
+	assert_int_equal(as.n_restart, 3);
+	assert_int_equal(as.n_handle_error, 3);
+	assert_int_equal(ss.n_commit, 2);	/* the unit that failed is gone, the rest applied */
+	assert_int_equal(as.n_shutdown, 1);
+}
+
+static void
 test_transient_error_is_retried(void **state)
 {
 	MockAsm		as = {.nunits = 3,.txns_per = 1,.changes_per = 1,.next_gxid = 1};
@@ -491,6 +581,8 @@ main(int argc, char *argv[])
 		unit_test(test_commit_retry_does_not_advance),
 		unit_test(test_permanent_error_ends_the_run),
 		unit_test(test_transient_error_is_retried),
+		unit_test(test_a_failed_restart_is_retried_not_polled_through),
+		unit_test(test_a_failed_startup_is_graded_not_escaped),
 		unit_test(test_empty_stream)
 	};
 

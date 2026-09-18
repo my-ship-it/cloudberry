@@ -53,22 +53,55 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 	ProgressPos pos;
 	MemoryContext cxt = CurrentMemoryContext;
 	bool		give_up = false;
+	bool		needs_startup = true;
+	bool		needs_restart = false;
 
 	sink->startup(sink, sink_cfg);
 	caps = sink->capabilities(sink);	/* once; it decides the whole shape */
 	pos = sink->get_checkpoint(sink);
-	assembly->startup(assembly, &caps, &pos);
 
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		if (give_up || assembly->should_stop(assembly))
+		/*
+		 * Whether to stop is the assembly's to say, but only once it is up:
+		 * the run has always come up before anything else, and shutdown is
+		 * paired with startup.  A stop asked for while it cannot come up is
+		 * honoured as soon as it does, or when the error grading below gives
+		 * up on it; a signal is handled by CHECK_FOR_INTERRUPTS above either
+		 * way.
+		 */
+		if (give_up || (!needs_startup && assembly->should_stop(assembly)))
 			break;
 
 		PG_TRY();
 		{
 			LogicalRepUnit unit;
+
+			/*
+			 * Starting and resuming are both done here, at the top of a pass,
+			 * rather than before the loop or at the end of the recovery that
+			 * called for them.  That way an assembly that fails to come up --
+			 * the source is down, a slot it needs cannot be streamed from --
+			 * is an error of this loop like any other, and is graded like any
+			 * other; before, it escaped the loop entirely and the worker
+			 * merely exited, to be started again with the same result for as
+			 * long as anyone was watching.  It also keeps a failed resume
+			 * from leaving the assembly half torn down for the next poll to
+			 * read a source from that is no longer connected.
+			 */
+			if (needs_startup)
+			{
+				assembly->startup(assembly, &caps, &pos);
+				needs_startup = false;
+			}
+			else if (needs_restart)
+			{
+				pos = sink->get_checkpoint(sink);
+				assembly->restart(assembly, &pos);
+				needs_restart = false;
+			}
 
 			/* the sources */
 			if (!assembly->poll(assembly, LR_DRIVER_POLL_MS))
@@ -138,27 +171,10 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 				give_up = true;
 			else
 			{
-				pg_usleep(LR_DRIVER_RECOVER_MS * 1000L);
-
-				PG_TRY();
-				{
-					pos = sink->get_checkpoint(sink);
-					assembly->restart(assembly, &pos);
-				}
-				PG_CATCH();
-				{
-					ErrorData  *e2;
-
-					MemoryContextSwitchTo(cxt);
-					e2 = CopyErrorData();
-					FlushErrorState();
-					elog(LOG, "logical replication apply: recovery failed, retrying: %s",
-						 e2->message);
-					FreeErrorData(e2);
-					assembly->reset(assembly);
-					pg_usleep(LR_DRIVER_RETRY_MS * 1000L);
-				}
-				PG_END_TRY();
+				pg_usleep((needs_startup || needs_restart ? LR_DRIVER_RETRY_MS
+						   : LR_DRIVER_RECOVER_MS) * 1000L);
+				if (!needs_startup)
+					needs_restart = true;
 			}
 		}
 		PG_END_TRY();
