@@ -21,6 +21,7 @@
 #ifndef MPP_APPLY_WORKER_H
 #define MPP_APPLY_WORKER_H
 
+#include "datatype/timestamp.h"
 #include "nodes/pg_list.h"
 
 /*
@@ -128,6 +129,66 @@ typedef struct LrWorkerStats
 } LrWorkerStats;
 
 extern void LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats);
+
+/* ------------------------------------------------------------------------
+ * What a running worker publishes about itself (work item O2)
+ *
+ * The state tables say where the subscription got to, because they are
+ * written in the same transaction as the batch they describe.  They cannot
+ * say what the worker is doing right now: how far ahead the source has run,
+ * what the readers are holding, how many times the run has recovered.  That
+ * lives in the worker's memory and is copied into its shared-memory slot as
+ * it goes, which is what gp_stat_mpp_subscription reads.
+ *
+ * Everything here is "since this worker started": a restart resets it, and
+ * nothing is persisted.
+ * ------------------------------------------------------------------------
+ */
+
+/* per-source-segment detail is published up to this many segments */
+#define LR_STAT_MAX_SEGS	128
+
+typedef enum LrWorkerPhase
+{
+	LR_PHASE_STARTING = 0,		/* connecting, reading the subscription */
+	LR_PHASE_INITIAL_SYNC,		/* mpp_tablesync.c, before any streaming */
+	LR_PHASE_STREAMING,			/* the apply loop */
+	LR_PHASE_TABLE_SYNC,		/* copying tables added to a running one */
+	LR_PHASE_STOPPING
+} LrWorkerPhase;
+
+typedef struct LrWorkerReport
+{
+	LrWorkerPhase phase;
+	TimestampTz start_time;
+
+	/* the source coordinator's stream */
+	int64		received_lsn;	/* its end of WAL, as it last said */
+	int64		applied_lsn;	/* position of the last committed batch */
+	TimestampTz last_msg_time;	/* when anything last arrived from it */
+	TimestampTz last_commit_time;
+
+	/* per source segment, from the readers' own status reports */
+	int			nsrcsegs;		/* how many entries below are filled */
+	int64		seg_pos[LR_STAT_MAX_SEGS];	/* read to here */
+	int64		seg_flush[LR_STAT_MAX_SEGS];	/* replay may start here */
+	int64		seg_buffered_txns[LR_STAT_MAX_SEGS];
+	int64		seg_buffered_bytes[LR_STAT_MAX_SEGS];	/* memory + spill */
+
+	/* what the driver itself is holding */
+	int64		awaited_txns;	/* seen on the coordinator, not yet complete */
+	int64		deferred_txns;	/* held back for a table being copied */
+	int64		batch_txns;		/* in the batch being filled */
+	int64		batch_bytes;
+	int64		stuck_errors;	/* errors in a row that committed nothing */
+
+	LrWorkerStats stats;
+} LrWorkerReport;
+
+/* mpp_logicalrep.c: publish into this worker's shared-memory slot */
+extern void LrStatSetPhase(LrWorkerPhase phase);
+extern void LrStatPublish(const LrWorkerReport *rep);
+extern const char *LrWorkerPhaseName(LrWorkerPhase phase);
 
 /* mpp_tablesync.c */
 extern bool LrInitialSync(LrWorkerConfig *cfg);

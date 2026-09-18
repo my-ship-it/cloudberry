@@ -162,3 +162,116 @@ $$
     DELETE FROM pg_catalog.gp_subscription_applied a
      WHERE a.subid = $1 AND a.seg_lsn < $4[a.seg + 1];
 $$ LANGUAGE sql VOLATILE;
+
+--
+-- What the apply workers are doing right now (work item O2).
+--
+-- The state tables say where each subscription got to, because they are
+-- written in the same transaction as the batch they describe.  They cannot
+-- say how far ahead the source has run, what the readers are holding, or how
+-- many times the run has recovered: that is in the worker's memory, and it
+-- publishes it into its shared-memory slot as it goes.  Everything from
+-- there is "since this worker started" -- a restart resets it.
+--
+
+-- One row per running worker of this database.
+CREATE FUNCTION gp_stat_get_mpp_subscription(
+    OUT subid oid, OUT pid int4, OUT phase text,
+    OUT worker_start timestamptz, OUT source_segments int4,
+    OUT received_lsn pg_lsn, OUT applied_lsn pg_lsn,
+    OUT last_msg_time timestamptz, OUT last_commit_time timestamptz,
+    OUT awaited_txns int8, OUT deferred_txns int8,
+    OUT batch_txns int8, OUT batch_bytes int8,
+    OUT buffered_txns int8, OUT buffered_bytes int8,
+    OUT stuck_errors int8,
+    OUT events int8, OUT batches int8, OUT txns_applied int8,
+    OUT local_txns_applied int8, OUT rows_applied int8, OUT recoveries int8)
+RETURNS SETOF record
+AS '$libdir/mpp_logicalrep', 'gp_stat_get_mpp_subscription'
+LANGUAGE C VOLATILE PARALLEL UNSAFE ROWS 8 EXECUTE ON COORDINATOR;
+
+-- One row per source segment of each running worker.
+CREATE FUNCTION gp_stat_get_mpp_subscription_segs(
+    OUT subid oid, OUT source_segment int4,
+    OUT pos pg_lsn, OUT flush pg_lsn,
+    OUT buffered_txns int8, OUT buffered_bytes int8)
+RETURNS SETOF record
+AS '$libdir/mpp_logicalrep', 'gp_stat_get_mpp_subscription_segs'
+LANGUAGE C VOLATILE PARALLEL UNSAFE ROWS 24 EXECUTE ON COORDINATOR;
+
+-- Every subscription this module owns, running or not: a subscription that
+-- has stopped is exactly the one an operator comes here to look at, so the
+-- registry drives the view and the live columns are simply null.
+CREATE VIEW gp_stat_mpp_subscription AS
+    SELECT s.subid,
+           s.subname,
+           s.enabled,
+           s.disable_reason,
+           s.unsupported_tables,
+           w.pid,
+           coalesce(w.phase, 'not running')                 AS phase,
+           w.worker_start,
+           w.source_segments,
+           w.received_lsn,
+           coalesce(w.applied_lsn, p.coordinator_lsn)       AS applied_lsn,
+           w.received_lsn - coalesce(w.applied_lsn, p.coordinator_lsn)
+                                                            AS apply_lag_bytes,
+           w.last_msg_time,
+           w.last_commit_time,
+           p.updated                                        AS progress_updated,
+           r.tables,
+           r.tables_ready,
+           r.tables_syncing,
+           r.tables_snapshot,
+           w.awaited_txns,
+           w.deferred_txns,
+           w.batch_txns,
+           w.batch_bytes,
+           w.buffered_txns,
+           w.buffered_bytes,
+           a.applied_txns,
+           w.stuck_errors,
+           w.events,
+           w.batches,
+           w.txns_applied,
+           w.local_txns_applied,
+           w.rows_applied,
+           w.recoveries
+      FROM pg_catalog.gp_mpp_subscription s
+      LEFT JOIN pg_catalog.gp_stat_get_mpp_subscription() w ON w.subid = s.subid
+      LEFT JOIN pg_catalog.gp_subscription_progress p ON p.subid = s.subid
+      LEFT JOIN LATERAL (
+            SELECT count(*)                              AS tables,
+                   count(*) FILTER (WHERE state = 'r')   AS tables_ready,
+                   count(*) FILTER (WHERE state = 's')   AS tables_snapshot,
+                   count(*) FILTER (WHERE state NOT IN ('r', 's'))
+                                                         AS tables_syncing
+              FROM pg_catalog.gp_subscription_rel
+             WHERE subid = s.subid AND relid <> 0) r ON true
+      LEFT JOIN LATERAL (
+            SELECT count(*) AS applied_txns
+              FROM pg_catalog.gp_subscription_applied
+             WHERE subid = s.subid) a ON true;
+
+-- Per source segment: where its reader got to and what it is still holding.
+-- The positions come from the state table when no worker is running, which
+-- is where the last committed batch left them.
+CREATE VIEW gp_stat_mpp_subscription_segments AS
+    SELECT v.subid,
+           v.subname,
+           i                                                     AS source_segment,
+           coalesce(g.pos,
+                    '0/0'::pg_lsn + nullif(p.seg_pos[i + 1], 0)::numeric)   AS pos,
+           coalesce(g.flush,
+                    '0/0'::pg_lsn + nullif(p.seg_flush[i + 1], 0)::numeric) AS flush,
+           g.buffered_txns,
+           g.buffered_bytes,
+           (SELECT count(*) FROM pg_catalog.gp_subscription_applied a
+             WHERE a.subid = v.subid AND a.seg = i)              AS applied_txns
+      FROM pg_catalog.gp_stat_mpp_subscription v
+      LEFT JOIN pg_catalog.gp_subscription_progress p ON p.subid = v.subid
+      CROSS JOIN LATERAL generate_series(0, coalesce(v.source_segments,
+                                                    array_length(p.seg_pos, 1),
+                                                    0) - 1) i
+      LEFT JOIN pg_catalog.gp_stat_get_mpp_subscription_segs() g
+             ON g.subid = v.subid AND g.source_segment = i;

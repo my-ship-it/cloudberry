@@ -59,6 +59,7 @@
 #include "executor/spi.h"
 #include "executor/tstoreReceiver.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
@@ -79,6 +80,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 #include "replication/walreceiver.h"
 #include "miscadmin.h"
@@ -234,16 +236,19 @@ typedef struct LrWorkerSlot
 	Oid			dbid;
 	int			pid;			/* 0: no worker running */
 	bool		not_ours;		/* the worker found no registry row */
+	LrWorkerReport rep;			/* what the worker last published (O2) */
 } LrWorkerSlot;
 
 typedef struct LrSharedState
 {
 	LWLock	   *lock;
 	int			nslots;
+	int			launcher_pid;	/* 0: no launcher; woken by SIGUSR1 */
 	LrWorkerSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } LrSharedState;
 
 static LrSharedState *lr_shared = NULL;
+static LrWorkerSlot *my_slot = NULL; /* this worker's own, once attached */
 static int	max_workers = 8;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -328,11 +333,62 @@ lr_worker_attach(Oid subid, Oid dbid)
 	{
 		slot->dbid = dbid;
 		slot->pid = MyProcPid;
+		memset(&slot->rep, 0, sizeof(slot->rep));
+		slot->rep.start_time = GetCurrentTimestamp();
 		ok = true;
+		my_slot = slot;
 	}
 	LWLockRelease(lr_shared->lock);
 
 	return ok;
+}
+
+/*
+ * The worker's own view of itself, for gp_stat_mpp_subscription (O2).  Both
+ * are no-ops when there is no slot, which is how the apply machinery stays
+ * runnable outside a background worker.
+ */
+void
+LrStatSetPhase(LrWorkerPhase phase)
+{
+	if (my_slot == NULL)
+		return;
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	my_slot->rep.phase = phase;
+	LWLockRelease(lr_shared->lock);
+}
+
+void
+LrStatPublish(const LrWorkerReport *rep)
+{
+	TimestampTz start;
+
+	if (my_slot == NULL)
+		return;
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	start = my_slot->rep.start_time;	/* set once, at attach */
+	memcpy(&my_slot->rep, rep, sizeof(LrWorkerReport));
+	my_slot->rep.start_time = start;
+	LWLockRelease(lr_shared->lock);
+}
+
+const char *
+LrWorkerPhaseName(LrWorkerPhase phase)
+{
+	switch (phase)
+	{
+		case LR_PHASE_STARTING:
+			return "starting";
+		case LR_PHASE_INITIAL_SYNC:
+			return "initial sync";
+		case LR_PHASE_STREAMING:
+			return "streaming";
+		case LR_PHASE_TABLE_SYNC:
+			return "table sync";
+		case LR_PHASE_STOPPING:
+			return "stopping";
+	}
+	return "unknown";
 }
 
 static void
@@ -348,6 +404,56 @@ lr_worker_detach(int code, Datum arg)
 	if (slot != NULL && slot->pid == MyProcPid)
 		slot->pid = 0;
 	LWLockRelease(lr_shared->lock);
+	my_slot = NULL;
+}
+
+/*
+ * Wake the launcher rather than let it sleep out its nap: a subscription
+ * that has just been created or enabled should not wait up to
+ * mpp_logicalrep.launcher_naptime_ms for a worker.  SIGUSR1 reaches its
+ * latch through the background worker's own handler, as the server's own
+ * launcher is woken.
+ *
+ * It has to wait for commit, though.  The launcher decides from
+ * pg_subscription and from the registry, and neither says anything until
+ * this transaction is committed -- a launcher woken any earlier would scan,
+ * find nothing, and go back to sleep for the whole nap, which is the very
+ * thing this avoids.
+ */
+static bool launcher_wakeup_pending = false;
+
+static void
+lr_launcher_wakeup_now(void)
+{
+	int			pid;
+
+	if (lr_shared == NULL)
+		return;
+	LWLockAcquire(lr_shared->lock, LW_SHARED);
+	pid = lr_shared->launcher_pid;
+	LWLockRelease(lr_shared->lock);
+	if (pid != 0)
+		kill(pid, SIGUSR1);
+}
+
+static void
+lr_launcher_xact_cb(XactEvent event, void *arg)
+{
+	if (!launcher_wakeup_pending)
+		return;
+	if (event == XACT_EVENT_COMMIT)
+	{
+		launcher_wakeup_pending = false;
+		lr_launcher_wakeup_now();
+	}
+	else if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		launcher_wakeup_pending = false;
+}
+
+static void
+lr_launcher_wakeup(void)
+{
+	launcher_wakeup_pending = true;
 }
 
 /* the worker's verdict on a subscription it could not find in the registry */
@@ -883,10 +989,13 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 
 						values[0] = ObjectIdGetDatum(subid);
 						if (enable)
+						{
 							registry_exec("UPDATE pg_catalog.gp_mpp_subscription"
 										  " SET enabled = true, disable_reason = NULL"
 										  " WHERE subid = $1",
 										  1, argtypes, values);
+							lr_launcher_wakeup();
+						}
 						else
 						{
 							registry_exec("UPDATE pg_catalog.gp_mpp_subscription"
@@ -1054,10 +1163,13 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 			LrSyncMarkNoCopy(subid);
 
 		if (created_enabled)
+		{
+			lr_launcher_wakeup();
 			ereport(NOTICE,
 					(errmsg("subscription \"%s\" will be applied by mpp_logicalrep",
 							created),
 					 errdetail("Its pg_subscription row stays disabled so that the server's own apply worker never starts; pg_catalog.gp_mpp_subscription is what enables it.")));
+		}
 		else
 			ereport(NOTICE,
 					(errmsg("subscription \"%s\" will be applied by mpp_logicalrep, and is not enabled",
@@ -1078,10 +1190,186 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 }
 
 /* ------------------------------------------------------------------------
+ * What the workers are doing (work item O2)
+ *
+ * Two set-returning functions over the shared-memory slots, which
+ * gp_stat_mpp_subscription and gp_stat_mpp_subscription_segments join with
+ * the state tables.  They report only the workers of the current database,
+ * because the registry and the state tables they are read against are
+ * per-database.
+ * ------------------------------------------------------------------------
+ */
+
+#define LR_STAT_NCOLS		22
+#define LR_STAT_SEG_NCOLS	6
+
+/* the set-returning boilerplate, once */
+static Tuplestorestate *
+stat_begin(FunctionCallInfo fcinfo, TupleDesc *tupdesc)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Tuplestorestate *tupstore;
+	MemoryContext oldcxt;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		(rsinfo->allowedModes & SFRM_Materialize) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this function must be called in a context that accepts a set")));
+	if (get_call_result_type(fcinfo, NULL, tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = *tupdesc;
+	MemoryContextSwitchTo(oldcxt);
+
+	return tupstore;
+}
+
+PG_FUNCTION_INFO_V1(gp_stat_get_mpp_subscription);
+Datum
+gp_stat_get_mpp_subscription(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = stat_begin(fcinfo, &tupdesc);
+	int			i;
+
+	if (lr_shared == NULL)
+		return (Datum) 0;
+
+	LWLockAcquire(lr_shared->lock, LW_SHARED);
+	for (i = 0; i < lr_shared->nslots; i++)
+	{
+		LrWorkerSlot *slot = &lr_shared->slots[i];
+		LrWorkerReport *r = &slot->rep;
+		Datum		values[LR_STAT_NCOLS];
+		bool		nulls[LR_STAT_NCOLS];
+		int64		buffered_txns = 0;
+		int64		buffered_bytes = 0;
+		int			c = 0;
+		int			seg;
+
+		if (!OidIsValid(slot->subid) || slot->pid == 0 ||
+			slot->dbid != MyDatabaseId)
+			continue;
+
+		for (seg = 0; seg < r->nsrcsegs && seg < LR_STAT_MAX_SEGS; seg++)
+		{
+			buffered_txns += r->seg_buffered_txns[seg];
+			buffered_bytes += r->seg_buffered_bytes[seg];
+		}
+
+		memset(nulls, 0, sizeof(nulls));
+		values[c++] = ObjectIdGetDatum(slot->subid);
+		values[c++] = Int32GetDatum(slot->pid);
+		values[c++] = CStringGetTextDatum(LrWorkerPhaseName(r->phase));
+		values[c++] = TimestampTzGetDatum(r->start_time);
+		values[c++] = Int32GetDatum(r->nsrcsegs);
+		/*
+		 * A zero position is one nothing has reported yet -- no batch has
+		 * been committed, no keepalive has arrived.  Reporting it as 0/0
+		 * would make the lag against it look enormous, so say nothing.
+		 */
+		if (r->received_lsn == 0)
+			nulls[c] = true;
+		values[c++] = LSNGetDatum((XLogRecPtr) r->received_lsn);
+		if (r->applied_lsn == 0)
+			nulls[c] = true;
+		values[c++] = LSNGetDatum((XLogRecPtr) r->applied_lsn);
+		if (r->last_msg_time == 0)
+			nulls[c] = true;
+		values[c++] = TimestampTzGetDatum(r->last_msg_time);
+		if (r->last_commit_time == 0)
+			nulls[c] = true;
+		values[c++] = TimestampTzGetDatum(r->last_commit_time);
+		values[c++] = Int64GetDatum(r->awaited_txns);
+		values[c++] = Int64GetDatum(r->deferred_txns);
+		values[c++] = Int64GetDatum(r->batch_txns);
+		values[c++] = Int64GetDatum(r->batch_bytes);
+		values[c++] = Int64GetDatum(buffered_txns);
+		values[c++] = Int64GetDatum(buffered_bytes);
+		values[c++] = Int64GetDatum(r->stuck_errors);
+		values[c++] = Int64GetDatum(r->stats.events);
+		values[c++] = Int64GetDatum(r->stats.batches);
+		values[c++] = Int64GetDatum(r->stats.txns_applied);
+		values[c++] = Int64GetDatum(r->stats.local_applied);
+		values[c++] = Int64GetDatum(r->stats.rows_applied);
+		values[c++] = Int64GetDatum(r->stats.recoveries);
+		Assert(c == LR_STAT_NCOLS);
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+	LWLockRelease(lr_shared->lock);
+
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(gp_stat_get_mpp_subscription_segs);
+Datum
+gp_stat_get_mpp_subscription_segs(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = stat_begin(fcinfo, &tupdesc);
+	int			i;
+
+	if (lr_shared == NULL)
+		return (Datum) 0;
+
+	LWLockAcquire(lr_shared->lock, LW_SHARED);
+	for (i = 0; i < lr_shared->nslots; i++)
+	{
+		LrWorkerSlot *slot = &lr_shared->slots[i];
+		LrWorkerReport *r = &slot->rep;
+		int			seg;
+
+		if (!OidIsValid(slot->subid) || slot->pid == 0 ||
+			slot->dbid != MyDatabaseId)
+			continue;
+
+		for (seg = 0; seg < r->nsrcsegs && seg < LR_STAT_MAX_SEGS; seg++)
+		{
+			Datum		values[LR_STAT_SEG_NCOLS];
+			bool		nulls[LR_STAT_SEG_NCOLS];
+			int			c = 0;
+
+			memset(nulls, 0, sizeof(nulls));
+			values[c++] = ObjectIdGetDatum(slot->subid);
+			values[c++] = Int32GetDatum(seg);
+			if (r->seg_pos[seg] == 0)
+				nulls[c] = true;	/* nothing read from it yet */
+			values[c++] = LSNGetDatum((XLogRecPtr) r->seg_pos[seg]);
+			if (r->seg_flush[seg] == 0)
+				nulls[c] = true;	/* replay starts wherever the slot is */
+			values[c++] = LSNGetDatum((XLogRecPtr) r->seg_flush[seg]);
+			values[c++] = Int64GetDatum(r->seg_buffered_txns[seg]);
+			values[c++] = Int64GetDatum(r->seg_buffered_bytes[seg]);
+			Assert(c == LR_STAT_SEG_NCOLS);
+			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		}
+	}
+	LWLockRelease(lr_shared->lock);
+
+	return (Datum) 0;
+}
+
+/* ------------------------------------------------------------------------
  * The launcher
  * ------------------------------------------------------------------------
  */
 PGDLLEXPORT void MppLauncherMain(Datum main_arg);
+
+static void
+lr_launcher_detach(int code, Datum arg)
+{
+	if (lr_shared == NULL)
+		return;
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	if (lr_shared->launcher_pid == MyProcPid)
+		lr_shared->launcher_pid = 0;
+	LWLockRelease(lr_shared->lock);
+}
 
 static void
 launch_worker(Oid dbid, Oid subid, Oid userid, const char *subname)
@@ -1204,6 +1492,11 @@ MppLauncherMain(Datum main_arg)
 	/* no database: pg_subscription is a shared catalog */
 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
 
+	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
+	lr_shared->launcher_pid = MyProcPid;
+	LWLockRelease(lr_shared->lock);
+	on_shmem_exit(lr_launcher_detach, (Datum) 0);
+
 	for (;;)
 	{
 		int			rc;
@@ -1246,6 +1539,8 @@ _PG_init(void)
 
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = mpp_utility;
+
+	RegisterXactCallback(lr_launcher_xact_cb, NULL);
 
 	if (!process_shared_preload_libraries_in_progress)
 		return;

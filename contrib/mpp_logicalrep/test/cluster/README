@@ -39,6 +39,9 @@ sides being separate servers.
     unsupported_tables.sh   a published table whose changes the publisher
                             cannot decode (append-optimised): refused by
                             default, copied once and marked 's' on request
+    monitoring.sh           gp_stat_mpp_subscription and its per-segment
+                            companion, running and stopped; and that the
+                            launcher is woken rather than slept out
     participants_bench.sh   how long small distributed transactions take
                             to arrive (a measurement, not a pass/fail test)
 

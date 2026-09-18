@@ -206,6 +206,9 @@ typedef struct LrDriver
 	int64	   *unit_flush;		/* what unit_progress computed */
 
 	TimestampTz started;
+
+	/* what gp_stat_mpp_subscription reads, refreshed as the run goes (O2) */
+	LrWorkerReport rep;
 } LrDriver;
 
 static void driver_load_source_segments(LrDriver *d);
@@ -233,6 +236,7 @@ static bool name_is_deferred(LrDriver *d, const char *name);
 static bool txn_is_deferred(LrDriver *d, List *rel_names);
 static void note_relnames(LrDriver *d, const char *relids, const char *names);
 static char *relid_set(LrDriver *d, List *names);
+static void driver_publish(LrDriver *d);
 static void lr_disable_subscription(LrCbdbTransport *tr, Oid subid,
 									const char *message);
 static void run_initial_sync(LrWorkerConfig *cfg, LrCbdbTransport *tr);
@@ -280,13 +284,18 @@ LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats)
 	 * the streaming loop decides whether to replay (work item O6).
 	 */
 	if (mycfg->initial_sync)
+	{
+		LrStatSetPhase(LR_PHASE_INITIAL_SYNC);
 		run_initial_sync(mycfg, tr);
+	}
+	LrStatSetPhase(LR_PHASE_STREAMING);
 
 	sink = LrMakeCbdbSink(tr);
 	assembly = LrMakeCbdbAssembly(tr, mycfg, stats);
 
 	lr_apply_driver_run(assembly, sink, NULL);
 
+	LrStatSetPhase(LR_PHASE_STOPPING);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 }
@@ -802,6 +811,7 @@ driver_pump_source(LrDriver *d, int timeout_ms)
 			s.len = len;
 			s.maxlen = -1;
 			s.cursor = 0;
+			d->rep.last_msg_time = GetCurrentTimestamp();
 			switch (pq_getmsgbyte(&s))
 			{
 				case 'w':
@@ -1337,6 +1347,12 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 			case LR_REPORT_STATUS:
 				if (seg_lsn > d->seg_pos[seg])
 					d->seg_pos[seg] = seg_lsn;
+				/* what that reader is still holding, for O2 */
+				if (seg < LR_STAT_MAX_SEGS)
+				{
+					d->rep.seg_buffered_txns[seg] = nrows;
+					d->rep.seg_buffered_bytes[seg] = nbytes;
+				}
 				break;
 			case LR_REPORT_DEDUP:
 				{
@@ -2104,6 +2120,7 @@ assembly_poll(LogicalRepAssembly *self, int timeout_ms)
 		driver_drain(d, 0, 0, NULL, 0);
 		driver_collect_ready(d);
 	}
+	driver_publish(d);
 	return true;
 }
 
@@ -2267,6 +2284,8 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 
 		/* the readers give the buffers back on the next drain */
 		driver_drain(d, 0, 0, NULL, 0);
+		d->rep.last_commit_time = GetCurrentTimestamp();
+		driver_publish(d);
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextReset(d->batchcxt);
 		return;
@@ -2322,6 +2341,8 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 	d->batch_gxids = NIL;
 	d->batch_locals = NIL;
 	d->batch_bytes = 0;
+	d->rep.last_commit_time = GetCurrentTimestamp();
+	driver_publish(d);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(d->batchcxt);
@@ -2343,6 +2364,38 @@ assembly_housekeeping(LogicalRepAssembly *self)
 		driver_send_feedback(d);
 
 	return more;
+}
+
+/*
+ * Copy what an operator may want to see into the shared-memory slot (work
+ * item O2).  Called once per pass of the loop and after every commit, so an
+ * idle subscription still shows its positions moving and a busy one shows
+ * its batches; the per-segment buffering comes from the readers' own status
+ * reports as they arrive.
+ */
+static void
+driver_publish(LrDriver *d)
+{
+	LrWorkerReport *r = &d->rep;
+	int			n = Min(d->nsrcsegs, LR_STAT_MAX_SEGS);
+	int			i;
+
+	r->phase = (d->sync != NULL) ? LR_PHASE_TABLE_SYNC : LR_PHASE_STREAMING;
+	r->received_lsn = d->coord_pos;
+	r->applied_lsn = d->coord_committed;
+	r->nsrcsegs = n;
+	for (i = 0; i < n; i++)
+	{
+		r->seg_pos[i] = d->seg_pos[i];
+		r->seg_flush[i] = d->seg_flush[i];
+	}
+	r->awaited_txns = d->gxids ? hash_get_num_entries(d->gxids) : 0;
+	r->deferred_txns = list_length(d->deferred_txns);
+	r->batch_txns = list_length(d->batch_gxids) + list_length(d->batch_locals);
+	r->batch_bytes = d->batch_bytes;
+	r->stuck_errors = d->stuck_errors;
+	r->stats = *d->stats;
+	LrStatPublish(r);
 }
 
 /*
@@ -2575,6 +2628,13 @@ mpp_worker_should_stop(void *arg)
 static void
 mpp_worker_subscription_cb(Datum arg, int cacheid, uint32 hashvalue)
 {
+	/*
+	 * Any subscription DDL invalidates pg_subscription, and a worker that
+	 * stopped for someone else's would be restarted for nothing (the server's
+	 * own worker.c does exactly that).  hashvalue 0 means "all of them".
+	 */
+	if (hashvalue != 0 && hashvalue != DatumGetUInt32(arg))
+		return;
 	mpp_worker_stop = true;
 	SetLatch(MyLatch);
 }
@@ -2620,10 +2680,6 @@ MppApplyWorkerMain(Datum main_arg)
 	 */
 	LrWorkerClaim(subid, arg.dbid);
 
-	/* stop cleanly when the subscription is altered or dropped */
-	CacheRegisterSyscacheCallback(SUBSCRIPTIONOID, mpp_worker_subscription_cb,
-								  (Datum) 0);
-
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.subid = subid;
 	cfg.token = (int64) MyProcPid;
@@ -2653,6 +2709,16 @@ MppApplyWorkerMain(Datum main_arg)
 		username = GetUserNameFromId(arg.userid, false);
 		cfg.target_conninfo = psprintf("port=%d dbname=%s user=%s",
 									   PostPortNumber, dbname, username);
+
+		/*
+		 * Stop cleanly when this subscription is altered or dropped -- and
+		 * only this one.  The callback gets the syscache hash value of our
+		 * own row, which computing here, inside a transaction, is safe: it
+		 * may have to open pg_subscription the first time.
+		 */
+		CacheRegisterSyscacheCallback(SUBSCRIPTIONOID, mpp_worker_subscription_cb,
+									  UInt32GetDatum(GetSysCacheHashValue1(SUBSCRIPTIONOID,
+																		   ObjectIdGetDatum(subid))));
 		MemoryContextSwitchTo(oldctx);
 	}
 	CommitTransactionCommand();

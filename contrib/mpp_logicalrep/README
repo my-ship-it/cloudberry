@@ -91,17 +91,29 @@ reads would not find them.  An existing cluster therefore needs the
 objects installed by hand, or a new initdb.
 
 The same applies to a cluster whose objects were installed by an earlier
-version of this module: the script only creates what is missing, so a
-column added since then has to be added by hand, in every database that
-has the objects and in template1.  As of this version that is
+version of this module.  The script creates, it does not upgrade, so
+anything added since has to be added by hand -- in every database that
+has the objects, and in template1 so that new databases get it.  As of
+this version that is the subscription option column
 
     SET allow_system_table_mods = on;
     ALTER TABLE pg_catalog.gp_mpp_subscription
         ADD COLUMN IF NOT EXISTS unsupported_tables text
         NOT NULL DEFAULT 'error';
 
-Without it the apply worker cannot read the subscription's settings and
-disables the subscription saying which column is missing.
+-- without which the apply worker cannot read the subscription's settings
+and disables the subscription saying which column is missing -- and the
+two statistics functions and the two views that read them, which are the
+last section of the script and can be run on their own:
+
+    SET allow_system_table_mods = on;
+    SET search_path = pg_catalog;
+    \i .../cdb_init.d/mpp_logicalrep_cdbinit.sql   -- from CREATE FUNCTION
+                                                   -- gp_stat_get_mpp_subscription
+
+The library has to be the new one before either is run: CREATE FUNCTION
+looks the C symbols up in the library the postmaster already has open, so
+the cluster is restarted first.
 
 The source cluster needs nothing from this module.
 
@@ -239,7 +251,59 @@ mpp_logicalrep.copy_crc (boolean, default on)
     its frames.
 
 mpp_logicalrep.max_workers (integer, default 8, requires restart)
+    How many subscriptions may have a worker at once; it also sizes the
+    shared-memory slots the workers publish their statistics in.
+
 mpp_logicalrep.launcher_naptime_ms (integer, default 5s)
+    How long the launcher sleeps between scans.  CREATE SUBSCRIPTION and
+    ALTER SUBSCRIPTION ... ENABLE wake it when they commit, so this is
+    the delay only for a worker that has to be started for some other
+    reason -- one that exited, say.
+
+
+Monitoring
+----------
+
+gp_stat_mpp_subscription has a row per subscription this module owns,
+running or not: a subscription that stopped is the one an operator comes
+looking for, so the registry drives the view and the live columns are
+simply null.
+
+    phase             starting, initial sync, streaming, table sync,
+                      stopping, or "not running"
+    received_lsn      how far the source coordinator's WAL has got, as
+                      it last said
+    applied_lsn       the position of the last committed batch
+    apply_lag_bytes   the difference.  It does not fall to zero on an
+                      idle subscription: the source coordinator writes
+                      WAL of its own that this target has no batch to
+                      commit against.
+    tables, tables_ready, tables_syncing, tables_snapshot
+                      the state rows of gp_subscription_rel
+    awaited_txns      seen on the coordinator stream, not yet complete
+                      on every segment it wrote on
+    deferred_txns     held back because they touched a table still
+                      being copied
+    batch_txns, batch_bytes
+                      the batch being filled right now
+    buffered_txns, buffered_bytes
+                      what the readers are still holding, memory and
+                      spill together, summed over the source segments
+    applied_txns      deduplication triples still above the flush point
+    events, batches, txns_applied, local_txns_applied, rows_applied,
+    recoveries, stuck_errors
+                      counters since this worker started; a restart
+                      resets them and nothing is persisted
+
+gp_stat_mpp_subscription_segments breaks the per-segment part out, one
+row per source segment: where its reader has read to, where a replay
+would start, and what it is holding.  The positions come from the state
+table when no worker is running, which is where the last committed batch
+left them, so the view says something useful about a subscription that
+has stopped.
+
+Both read one shared-memory slot per worker, so they cost nothing and
+can be polled.
 
 
 Files
