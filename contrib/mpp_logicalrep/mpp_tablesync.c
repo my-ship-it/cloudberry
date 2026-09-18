@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mpp_tablesync.c
- *	  Initial synchronisation of an MPP-apply subscription (design §10).
+ *	  Initial synchronisation of an MPP-apply subscription.
  *
  * Run by the apply driver (mpp_apply_worker.c) before it starts streaming.
  * The whole publication is synchronised as one unit under one cut point
@@ -12,19 +12,19 @@
  *   S2  barrier     DS_pre := distributed snapshot; wait until the current
  *                   snapshot's xmin >= DS_pre.xmax, so every distributed
  *                   transaction in flight when the slots were created has
- *                   completed on all segments (§10.3, why S2 is needed)
+ *                   completed on all segments
  *   S3  cut point   BEGIN REPEATABLE READ on the source; in one statement
  *                   read L_t = pg_current_wal_lsn() and
  *                   DS_t = gp_current_distributed_snapshot()
  *   S4  copy        per table, inside that transaction: the target runs
  *                   INSERT INTO t SELECT * FROM gp_lr_copy_recv(...) and the
  *                   source runs COPY (SELECT ...) TO PROGRAM
- *                   'cbdb_lr_copyhelper send ...' ON SEGMENT (§10.4); data
+ *                   'cbdb_lr_copyhelper send ...' ON SEGMENT; data
  *                   goes segment to segment, the target's Motion redistributes
  *   S5  catch-up    the driver streams from the slots and drops every gxid
  *                   visible under DS_t (already in the COPY); self-limiting
  *
- * State lives in the target's gp_subscription_rel (design §10.5):
+ * State lives in the target's gp_subscription_rel:
  *   relid = 0 is the subscription-level marker: 'd' while a sync is in
  *   progress, 'r' when the streaming phase may run (sync_snapshot holds
  *   DS_t for restarts).  copy_data=false at CREATE SUBSCRIPTION writes the
@@ -32,11 +32,11 @@
  *   relid > 0 rows track each table: i -> d -> f -> r.  A table the source
  *   cannot decode (anything but heap) ends at 's' instead of 'r' when the
  *   subscription asked for unsupported_tables = 'snapshot': copied once, and
- *   never looked at again (work item A1).
+ *   never looked at again.
  *
  * Failure anywhere before the final commit leaves the marker at 'd'; the
  * next start truncates the listed tables and redoes the sync from S1 under
- * a fresh cut point (§10.6).  The slots are reused if they exist.
+ * a fresh cut point.  The slots are reused if they exist.
  *
  * Portions Copyright (c) 2026, Apache Cloudberry
  *
@@ -87,10 +87,10 @@ typedef struct LrSyncRel
 	bool		replicated;		/* the SOURCE table is DISTRIBUTED REPLICATED:
 								 * every segment holds every row, so the
 								 * segment-to-segment transport would send each
-								 * row once per segment (section 10.4) */
+								 * row once per segment */
 	bool		tracked;		/* false: the source table's changes are never
 								 * decoded, so the copy is all there will ever
-								 * be -- state 's' (work item A1) */
+								 * be -- state 's' */
 } LrSyncRel;
 
 /* where an incremental job stands between two calls of LrSyncAddStep() */
@@ -478,7 +478,7 @@ sync_fill_columns(LrSync *s, LrSyncRel *r)
 
 /*
  * The two shapes that cannot be applied, reported while there is still time
- * to change them (design section 9.2).  Neither is fatal: they only bite the
+ * to change them.  Neither is fatal: they only bite the
  * UPDATEs described below, and a table that is only inserted into or deleted
  * from is fine either way, so this warns instead of refusing.
  */
@@ -612,9 +612,9 @@ sync_check_keys(LrSync *s, LrSyncRel *r)
 }
 
 /*
- * What this subscription wants done about a table the source cannot decode
- * (work item A1).  Read from the module's own registry rather than carried
- * in the worker's config, so that ALTER SUBSCRIPTION ... SET is in force for
+ * What this subscription wants done about a table the source cannot decode.
+ * Read from the module's own registry rather than carried in the worker's
+ * config, so that ALTER SUBSCRIPTION ... SET is in force for
  * the next table list, added tables included.
  */
 static void
@@ -754,7 +754,7 @@ LrUnsupportedTablesName(LrUnsupportedTables mode)
 }
 
 /*
- * The copy of a replicated table (section 10.4): every segment holds every
+ * The copy of a replicated table: every segment holds every
  * row, so the rows are read once on the source coordinator and written once
  * on the target coordinator, which broadcasts them again.  Both directions
  * of a replicated table are small by construction, so the coordinators are
@@ -1114,7 +1114,7 @@ sync_count_slots(LrSync *s)
  *
  *   gone         a segment failover takes its slots with it, since a logical
  *                slot is local to its primary and PG16 has no slot
- *                synchronisation (design 13.2)
+ *                synchronisation
  *   invalidated  the publisher recycled the WAL the slot asked for, cleared
  *                its restart_lsn and will refuse to stream from it
  *
@@ -1324,7 +1324,7 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text)
 }
 
 /* ------------------------------------------------------------------------
- * S4: one table over the segment-to-segment transport (§10.4)
+ * S4: one table over the segment-to-segment transport
  * ------------------------------------------------------------------------
  */
 
@@ -1576,9 +1576,9 @@ sync_copy_table(LrSync *s, LrSyncRel *r)
 
 
 /* ------------------------------------------------------------------------
- * Incremental synchronisation of tables added to a running subscription
- * (design section 10.5): started and stepped by the apply driver so that the
- * stream of the other tables keeps flowing while the new table is copied.
+ * Incremental synchronisation of tables added to a running subscription:
+ * started and stepped by the apply driver so that the stream of the other
+ * tables keeps flowing while the new table is copied.
  *
  *   LrSyncPendingNames()  which tables are not ready (the driver defers them)
  *   LrSyncAddStart()      cut point of its own, first table's COPY started
@@ -1938,7 +1938,7 @@ LrSyncMarkNoCopy(Oid subid)
  * state 'i' ('r' with copy_data = false), tables that left the publication
  * lose theirs.  The running apply worker picks the new rows up within a
  * couple of seconds: it defers their changes, copies them and catches them
- * up (design section 10.5).  Nothing here connects anywhere, so it is
+ * up.  Nothing here connects anywhere, so it is
  * transactional like the rest of the statement.
  */
 void

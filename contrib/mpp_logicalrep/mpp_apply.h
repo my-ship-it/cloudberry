@@ -4,8 +4,7 @@
  *	  MPP logical replication apply: plan shape, operators and reports.
  *
  * The receiving side of MPP logical replication drives the reader and
- * writer gangs of a normal QD session with one hand-built plan shape
- * (design sections 8 and 9):
+ * writer gangs of a normal QD session with one hand-built plan shape:
  *
  *   slice 0 (QD)           Gather Motion                  one report row per QE
  *   slice 1 (writer gang)  LogicalApply(mode, spec)
@@ -73,7 +72,7 @@ typedef struct LrPlanSpec
 #define LR_SRC_ATT_PAYLOAD		4
 #define LR_SRC_ATT_SEQ			5
 
-/* op codes of data rows (§9.1) */
+/* op codes of data rows */
 #define LR_OP_INSERT		'I'
 #define LR_OP_UPDATE		'U'
 #define LR_OP_DELETE		'D'
@@ -164,7 +163,7 @@ typedef struct LrPlanSpec
  *            each reader takes the entries of its own segment.
  *            defer=<remote relid,...>    tables whose initial copy is still
  *            running: their changes are not emitted and their transactions
- *            stay buffered until a catch-up plan takes them (design 10.5).
+ *            stay buffered until a catch-up plan takes them.
  *            catchup=<remote relid,...>  the reverse: emit only these tables,
  *            which is how a table that just finished its copy is caught up.
  *
@@ -177,7 +176,7 @@ typedef struct LrPlanSpec
 #define LR_INJECT_PREFIX	"inject:"
 
 /*
- * Report row (§8.1): (seg int4, kind "char", gxid int8, seg_lsn int8,
+ * Report row: (seg int4, kind "char", gxid int8, seg_lsn int8,
  * remote_relids oid[], rel_names text[], lockmode int2, nrows int8,
  * nbytes int8).
  */
@@ -255,7 +254,7 @@ extern void LrRelmapTrackClose(struct LogicalRepRelMapEntry *entry);
 
 /*
  * Router (mpp_route.c): decides the target segment of a change from the
- * target table's distribution policy (design §9.2).  A change routes to
+ * target table's distribution policy.  A change routes to
  * one segment, to every segment (target -1: the caller emits it once per
  * segment), or, for an UPDATE that moves a row, becomes a DELETE plus an
  * INSERT.

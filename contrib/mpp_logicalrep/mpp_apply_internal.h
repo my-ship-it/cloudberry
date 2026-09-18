@@ -3,11 +3,11 @@
  * mpp_apply_internal.h
  *	  What the Cloudberry assembly and the Cloudberry sink share.
  *
- * They are the two halves of one pairing (design section 4.5) and they
+ * They are the two halves of one pairing and they
  * share exactly one thing: the target coordinator session.  They have to.
  * The reader gang that buffers the source streams and the writer gang that
  * applies them are slices of the same dispatched plan, so both gangs live
- * in one session (design section 4.3); the assembly drives gp_lr_connect
+ * in one session; the assembly drives gp_lr_connect
  * and gp_lr_drain on it, the sink drives gp_lr_apply and gp_lr_progress.
  *
  * Nothing else crosses: the sink knows nothing of the registry, the source

@@ -16,11 +16,9 @@
  *
  * The driver (lr_apply_driver_run) depends on these two interfaces and on
  * nothing else, so a new target is a new sink and a new stream source is a
- * new assembly; neither one rewrites the loop.  See the design document,
- * section 1 (principles), section 4.5 (the contract) and section 8.3 (the
- * loop).
+ * new assembly; neither one rewrites the loop.
  *
- * Contract v2 (work item R11).  v1 described one assembled transaction as
+ * Contract v2.  v1 described one assembled transaction as
  * one target transaction with its rows handed to the sink row by row.  The
  * production Cloudberry sink does neither: it commits a whole unit of
  * transactions in one distributed commit, and its rows never pass through
@@ -135,8 +133,7 @@ typedef struct LogicalRepUnit
 /*
  * Apply progress, persisted by the sink and read back at startup.  Each
  * source segment advances on its own, so a position is a vector, not a
- * value; the applied triples deduplicate a replay that starts before them
- * (design section 13.1).
+ * value; the applied triples deduplicate a replay that starts before them.
  *
  * nsegs == 0 means this unit moves no position and the sink persists
  * nothing for it -- a replay of transactions that were already accounted
@@ -311,7 +308,7 @@ extern void lr_apply_driver_run(LogicalRepAssembly *assembly,
  * Implementations declare their own constructors, which take whatever that
  * implementation needs: the Cloudberry pair, for one, shares a target
  * session, because its reader gang and its writer gang have to live in one
- * session for the plans to dispatch (design section 4.3).  See
+ * session for the plans to dispatch.  See
  * mpp_apply_internal.h.
  */
 

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mpp_apply_worker.h
- *	  The apply driver of MPP logical replication (design §7.2, §8.3).
+ *	  The apply driver of MPP logical replication.
  *
  * The driver is the only process that reads the source coordinator's
  * logical stream.  Every "cbdb.dcommit" event names a committed
@@ -27,7 +27,7 @@
 /*
  * What to do when the subscription's replication slots are gone from the
  * source (a segment failover loses them: logical slots are local to the
- * primary and PG16 has no slot sync).  Design section 13.2.
+ * primary and PG16 has no slot sync).
  */
 typedef enum LrSlotLossAction
 {
@@ -89,7 +89,7 @@ typedef struct LrWorkerConfig
 	List	   *publications;	/* String list */
 
 	/*
-	 * Initial-sync deduplication (design section 10): a distributed snapshot
+	 * Initial-sync deduplication: a distributed snapshot
 	 * cut point.  When sync_ds_xmax != 0, a ready gxid G that is visible under
 	 * this snapshot (G < sync_ds_xmax and G not in sync_ds_inprogress) was
 	 * already captured by the table COPY taken at the cut point, so it is
@@ -131,7 +131,7 @@ typedef struct LrWorkerStats
 extern void LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats);
 
 /* ------------------------------------------------------------------------
- * What a running worker publishes about itself (work item O2)
+ * What a running worker publishes about itself
  *
  * The state tables say where the subscription got to, because they are
  * written in the same transaction as the batch they describe.  They cannot
@@ -199,9 +199,9 @@ extern bool LrUnsupportedTablesParse(const char *value, LrUnsupportedTables *mod
 extern const char *LrUnsupportedTablesName(LrUnsupportedTables mode);
 
 /*
- * Incremental synchronisation of tables added to a running subscription
- * (design section 10.5).  The driver defers the changes of every pending
- * table, copies them under a cut point of their own while the other tables
+ * Incremental synchronisation of tables added to a running subscription.
+ * The driver defers the changes of every pending table, copies them under a
+ * cut point of their own while the other tables
  * keep streaming, catches them up from its buffers and only then publishes
  * them.  struct LrSync is private to mpp_tablesync.c.
  */

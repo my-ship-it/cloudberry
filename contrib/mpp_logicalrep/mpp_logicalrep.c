@@ -720,7 +720,7 @@ fetch_pub_relids(Subscription *sub)
 	/*
 	 * The access method comes along so that a table whose changes the
 	 * publisher cannot decode is caught by the statement that adds it,
-	 * rather than by the apply worker minutes later (work item A1).
+	 * rather than by the apply worker minutes later.
 	 */
 	initStringInfo(&cmd);
 	appendStringInfoString(&cmd,
@@ -1216,7 +1216,7 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 }
 
 /* ------------------------------------------------------------------------
- * What the workers are doing (work item O2)
+ * What the workers are doing
  *
  * Two set-returning functions over the shared-memory slots, which
  * gp_stat_mpp_subscription and gp_stat_mpp_subscription_segments join with

@@ -2,7 +2,7 @@
  *
  * cbdb_lr_copyhelper.c
  *	  Segment-to-segment bulk transfer helper for MPP logical replication
- *	  initial synchronisation (design section 10.4).
+ *	  initial synchronisation.
  *
  * It only moves bytes; it knows nothing about tables, hashing or routing.
  * The target-side INSERT ... SELECT (gp_lr_copy_recv) does the redistribution

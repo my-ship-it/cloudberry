@@ -3,7 +3,7 @@
  * mpp_apply_worker.c
  *	  The apply driver of MPP logical replication (see mpp_apply_worker.h).
  *
- * Main loop (design §8.3):
+ * Main loop:
  *
  *   load progress            gp_subscription_progress / _applied of the target
  *   connect readers          gp_lr_connect(spec built from progress)
@@ -113,7 +113,7 @@ typedef struct LrGxidTxn
 
 /*
  * A transaction whose changes to a table that is still being copied were
- * held back (design section 10.5).  Kept in commit order until the copy of
+ * held back.  Kept in commit order until the copy of
  * that table finishes and the driver catches it up; the reader keeps the
  * buffer because the driver does not release the transaction.
  */
@@ -279,11 +279,11 @@ LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats)
 	tr->stats = stats;
 
 	/*
-	 * Initial synchronisation (design section 10) runs first, over its own
+	 * Initial synchronisation runs first, over its own
 	 * connections; only when gp_subscription_rel marks the subscription as
 	 * ready does the streaming phase below begin.  Errors here end the run;
 	 * whether the launcher then restarts the worker is decided the same way
-	 * the streaming loop decides whether to replay (work item O6).
+	 * the streaming loop decides whether to replay.
 	 */
 	if (mycfg->initial_sync)
 	{
@@ -365,7 +365,7 @@ sync_error_is_permanent(int sqlerrcode)
 
 /*
  * The initial synchronisation, with a verdict on its errors like the one the
- * streaming loop passes on its own (work item O6).  Retrying is the
+ * streaming loop passes on its own.  Retrying is the
  * launcher's job here -- the worker exits and is started again -- and that is
  * right for a lost connection or a reset gang.  It is not right for something
  * the two sides do not agree on: a published table whose changes are not
@@ -417,7 +417,7 @@ run_initial_sync(LrWorkerConfig *cfg, LrCbdbTransport *tr)
  * the Cloudberry pairing use: the assembly runs gp_lr_connect and
  * gp_lr_drain on it, the sink runs gp_lr_apply and gp_lr_progress.  It has
  * to be one session -- the reader gang and the writer gang are slices of
- * the same dispatched plan (design section 4.3).
+ * the same dispatched plan.
  * ------------------------------------------------------------------------
  */
 
@@ -523,7 +523,7 @@ conninfo_is_secret(const char *keyword)
  * payload is a bound parameter of a statement, and a server logging
  * statements writes its parameters out.  The readers take the secrets from
  * their own pg_subscription row instead, which is the same value, already on
- * the segment, and readable by nobody else (work item O3).
+ * the segment, and readable by nobody else.
  */
 static void
 driver_load_source_segments(LrDriver *d)
@@ -695,7 +695,7 @@ driver_connect_readers(LrDriver *d)
 	 * reader s % N_dst, so the streams are spread evenly however the two
 	 * segment counts compare: one each when they match, none for the readers
 	 * beyond the source when the source is smaller, several per reader when
-	 * it is larger (design section 9.2b).  Everything per stream --
+	 * it is larger.  Everything per stream --
 	 * conninfo, flush, pos, applied -- is keyed by SOURCE segment.
 	 */
 	for (int i = 0; i < d->tr->nsegs; i++)
@@ -1031,7 +1031,7 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs, const int16 *
  */
 /*
  * Initial-sync filter: is gxid already in the COPY taken at the cut point?
- * visible(G, DS_t) = G < xmax AND G not in in_progress (design 10.2).
+ * visible(G, DS_t) = G < xmax AND G not in in_progress.
  */
 static bool
 gxid_covered_by_sync(LrDriver *d, int64 gxid)
@@ -1519,7 +1519,7 @@ unit_add_rel(LrDriver *d, const char *qualified, int lockmode)
 	u->nrels++;
 }
 /* ------------------------------------------------------------------------
- * Tables added to a running subscription (design section 10.5)
+ * Tables added to a running subscription
  *
  * ALTER SUBSCRIPTION ... REFRESH PUBLICATION writes a gp_subscription_rel
  * row in state 'i' for every new table.  From the moment the driver sees
@@ -1785,7 +1785,7 @@ driver_sync_progress(LrDriver *d)
 }
 
 /* ------------------------------------------------------------------------
- * The Cloudberry assembly: a LogicalRepAssembly (design section 4.5)
+ * The Cloudberry assembly: a LogicalRepAssembly
  *
  * Everything above builds it; this is the face it turns to the driver.
  * The driver asks it to read the sources, hands the units it produces to
@@ -1864,7 +1864,7 @@ unit_build_from_batch(LrDriver *d)
 	/*
 	 * A utility write has no distributed identity: it is one segment's
 	 * transaction and its position in that segment's stream is all there is
-	 * of it, so it always carries its one participant (design section 8.4).
+	 * of it, so it always carries its one participant.
 	 */
 	foreach(lc, d->batch_locals)
 	{
@@ -2067,7 +2067,7 @@ assembly_startup(LogicalRepAssembly *self, const SinkCaps *caps,
 	/*
 	 * How many source segments there are decides the size of every
 	 * per-stream array, so it has to be known before the checkpoint is read
-	 * into them (design section 9.2b).
+	 * into them.
 	 */
 	driver_load_source_segments(d);
 	assembly_take_progress(d, from);
@@ -2157,7 +2157,7 @@ assembly_poll(LogicalRepAssembly *self, int timeout_ms)
 /*
  * While the held transactions of a finished copy are being replayed, they
  * are the only units handed out: nothing else may run between them, or the
- * set could grow while it is drained (design section 10.5).
+ * set could grow while it is drained.
  */
 static bool
 assembly_next_unit(LogicalRepAssembly *self, LogicalRepUnit *out)
@@ -2451,7 +2451,7 @@ error_is_transient(int sqlerrcode)
 }
 
 /*
- * Decide what to do about an error the loop caught (work item O6).
+ * Decide what to do about an error the loop caught.
  *
  * Retrying is the right answer for anything that can pass; for anything else
  * it only hides the reason in a log that repeats every second or so, and --

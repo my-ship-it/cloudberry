@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mpp_apply_sql.c
- *	  SQL entry points of MPP logical replication apply (design §7.2, §8.3).
+ *	  SQL entry points of MPP logical replication apply.
  *
  * The apply worker drives a normal coordinator session through these
  * functions; each one builds the two-slice plan of mpp_apply_plan.c for one
@@ -145,8 +145,7 @@ gp_lr_drain(PG_FUNCTION_ARGS)
  *
  * txns entries are "<seg>:<gxid>" or "<seg>:L<lsn>", in apply order.  defer
  * and catchup are remote relids: the tables whose initial copy is still
- * running are skipped, or, in a catch-up plan, the only ones emitted
- * (design section 10.5).
+ * running are skipped, or, in a catch-up plan, the only ones emitted.
  */
 PG_FUNCTION_INFO_V1(gp_lr_apply);
 Datum
@@ -315,7 +314,7 @@ append_text_list(StringInfo buf, const char *key, ArrayType *arr)
 
 
 /* ------------------------------------------------------------------------
- * Initial-sync bulk transport (design section 10.4)
+ * Initial-sync bulk transport
  *
  * gp_lr_copy_recv() and gp_lr_copy_ports() are the receive-side SQL surface
  * of the segment-to-segment COPY transport.  The C helper cbdb_lr_copyhelper

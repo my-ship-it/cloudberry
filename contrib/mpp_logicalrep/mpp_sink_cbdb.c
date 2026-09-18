@@ -4,7 +4,7 @@
  *	  The Cloudberry sink: a unit of assembled transactions becomes one
  *	  distributed transaction of the target.
  *
- * This is the LogicalRepSink implementation #1 (design section 4.5).  It is
+ * This is the LogicalRepSink implementation #1.  It is
  * the out-of-band kind: the rows it applies never pass through this
  * process.  The reader gang holds them, the plan gp_lr_apply dispatches
  * moves them to the writer gang over the interconnect, and all the sink
@@ -20,7 +20,7 @@
  *
  * The locks come first and in OID order because the coordinator takes them
  * before the writers do, which is what keeps two apply units and ordinary
- * user statements from deadlocking across segments (design section 8.3).
+ * user statements from deadlocking across segments.
  *
  * Portions Copyright (c) 2026, Apache Cloudberry
  *
@@ -275,7 +275,7 @@ cbdb_sink_begin_unit(LogicalRepSink *self, const LogicalRepUnit *unit)
  * Within one segment the transactions are replayed in the order of that
  * segment's stream, not in commit order -- two one-phase transactions of the
  * same segment can reach the coordinator in the other order, and the stream
- * is the one that tells the truth (design section 8.4).
+ * is the one that tells the truth.
  */
 static void
 cbdb_sink_apply_unit(LogicalRepSink *self, const LogicalRepUnit *unit)
@@ -390,8 +390,8 @@ cbdb_sink_commit_unit(LogicalRepSink *self, const LogicalRepUnit *unit,
 
 	/*
 	 * A unit that moves no position records nothing: a catch-up replay of
-	 * transactions that were already counted when they were first applied
-	 * (design section 10.5).  It still commits, alone.
+	 * transactions that were already counted when they were first applied.
+	 * It still commits, alone.
 	 */
 	if (pos->nsegs == 0)
 	{
@@ -418,7 +418,7 @@ cbdb_sink_commit_unit(LogicalRepSink *self, const LogicalRepUnit *unit,
 	appendStringInfoChar(&spos, '}');
 	appendStringInfoChar(&sflush, '}');
 
-	/* the deduplication triples (design 13.1) */
+	/* the deduplication triples */
 	initStringInfo(&aseg);
 	initStringInfo(&agx);
 	initStringInfo(&alsn);

@@ -5,10 +5,10 @@
  *	  pgoutput stream, buffered by transaction until the coordinator asks
  *	  for it.
  *
- * A reader QE (design §7.3) keeps one LrReaderState per (subscription,
+ * A reader QE keeps one LrReaderState per (subscription,
  * source segment) in process-private memory -- more than one when the
  * source has more segments than the target, and one with no stream at all
- * when it has fewer (design §9.2b).  The state owns the walreceiver
+ * when it has fewer.  The state owns the walreceiver
  * connection to the source segment and buffers every transaction by xid
  * until the LogicalSource operator (mpp_source.c) reports it ready
  * (DRAIN), emits its changes (APPLY) and finally releases it.
@@ -20,7 +20,7 @@
  *               without the cbdb.gxid patch)
  * A two-phase transaction is ready at PREPARE, a one-phase or local one at
  * COMMIT.  Replay after a restart is deduplicated with the start point the
- * coordinator hands over (design §13.1).
+ * coordinator hands over.
  *
  * Portions Copyright (c) 2026, Apache Cloudberry
  *
@@ -73,7 +73,7 @@ typedef struct LrTxn
 	XLogRecPtr	first_lsn;		/* WAL end of the first message seen */
 	XLogRecPtr	commit_lsn;		/* position of the COMMIT / PREPARE record;
 								 * identity of a local transaction and the
-								 * replay boundary (§13.1) */
+								 * replay boundary */
 	XLogRecPtr	end_lsn;		/* end of that record */
 	int64		nchanges;		/* I/U/D/T records */
 	int64		nbytes;			/* bytes of all records */
@@ -91,7 +91,7 @@ typedef struct LrTxn
 typedef struct LrReaderState LrReaderState;
 
 /*
- * Where to (re)start the stream and what to drop on replay (§13.1).
+ * Where to (re)start the stream and what to drop on replay.
  */
 typedef struct LrReaderStartPoint
 {

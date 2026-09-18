@@ -36,7 +36,7 @@ CREATE TABLE gp_mpp_subscription (
 DELETE FROM gp_distribution_policy WHERE localoid = 'gp_mpp_subscription'::regclass;
 CREATE UNIQUE INDEX gp_mpp_subscription_subid_index ON gp_mpp_subscription (subid);
 
--- Coordinator-side apply state per subscription (design section 13.1).
+-- Coordinator-side apply state per subscription.
 CREATE TABLE gp_subscription_progress (
     subid           oid NOT NULL,
     coordinator_lsn pg_lsn,                -- source coordinator stream position
@@ -59,7 +59,7 @@ DELETE FROM gp_distribution_policy WHERE localoid = 'gp_subscription_applied'::r
 CREATE UNIQUE INDEX gp_subscription_applied_index
     ON gp_subscription_applied (subid, seg, gxid);
 
--- initial synchronisation state per relation (design section 10.6)
+-- initial synchronisation state per relation
 CREATE TABLE gp_subscription_rel (
     subid         oid NOT NULL,
     relid         oid NOT NULL,
@@ -164,7 +164,7 @@ $$
 $$ LANGUAGE sql VOLATILE;
 
 --
--- What the apply workers are doing right now (work item O2).
+-- What the apply workers are doing right now.
 --
 -- The state tables say where each subscription got to, because they are
 -- written in the same transaction as the batch they describe.  They cannot

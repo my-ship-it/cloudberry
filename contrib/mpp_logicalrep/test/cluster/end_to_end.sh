@@ -128,7 +128,7 @@ ddl "CREATE TABLE r12_repl (id int PRIMARY KEY, v text) DISTRIBUTED REPLICATED"
 # r12_ao is heap on the source and AO on the target: that is the supported
 # combination (the writer applies into AO/AOCO, R6/V7).  A source AO table
 # cannot be replicated at all -- appendonly_decode() is an empty stub, so only
-# its initial COPY ever arrives (design section 15).
+# its initial COPY ever arrives.
 $S -c "CREATE TABLE r12_ao (id int, v text) DISTRIBUTED BY (id)" >/dev/null
 $T -c "CREATE TABLE r12_ao (id int, v text) WITH (appendonly=true) DISTRIBUTED BY (id)" >/dev/null
 ddl "CREATE TABLE r12_late (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"

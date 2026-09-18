@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * logicalrep_apply_driver_test.c
- *	  Unit tests for the apply loop (contract v2, work item R11).
+ *	  Unit tests for the apply loop.
  *
  * A mock assembly and a mock sink drive lr_apply_driver_run end to end, so
  * that the loop is exercised without a cluster on either side.  What is
@@ -457,7 +457,7 @@ test_empty_stream(void **state)
 
 /*
  * An error the assembly says will come back ends the run instead of being
- * replayed for ever (work item O6).
+ * replayed for ever.
  */
 static void
 test_permanent_error_ends_the_run(void **state)

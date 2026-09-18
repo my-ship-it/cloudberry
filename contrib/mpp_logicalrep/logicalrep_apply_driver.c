@@ -7,11 +7,11 @@
  * not on Cloudberry, not on the shape of the source stream.  Everything
  * specific to a target is behind the sink, everything specific to a stream
  * is behind the assembly, and the capability bits the sink reports decide
- * how much work either side does (design section 4.5).
+ * how much work either side does.
  *
- * The loop is the one work item R8 built for Cloudberry, generalised: poll
- * the sources, apply whatever units came due, do the periodic work, and on
- * any error roll back and rebuild both sides from the progress the target
+ * The loop is the one Cloudberry's own apply was built around, generalised:
+ * poll the sources, apply whatever units came due, do the periodic work, and
+ * on any error roll back and rebuild both sides from the progress the target
  * has committed.
  *
  * Portions Copyright (c) 2026, Apache Cloudberry
@@ -116,7 +116,7 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 			 * assembly decides what a unit contains and when one is
 			 * complete; it hands out the next only after the previous one
 			 * is committed, so a sequence it needs to be atomic stays free
-			 * of anything that arrives meanwhile (design 10.5).
+			 * of anything that arrives meanwhile.
 			 */
 			for (;;)
 			{

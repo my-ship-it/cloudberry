@@ -8,7 +8,7 @@
  * the coordinator, driven by the source coordinator's commit events, asks
  * for them.  Reading the socket happens only inside LrReaderReceive(), so
  * when nobody asks the TCP window fills up and the source walsender blocks:
- * that is the backpressure of the design (§8.7).
+ * that is the backpressure of the design.
  *
  * Message handling follows the stock apply worker's dispatch (worker.c),
  * with two differences: nothing is applied, and the streaming protocol's
@@ -125,7 +125,7 @@ struct LrReaderState
 	HTAB	   *rels;			/* relid -> LrRel */
 	HTAB	   *applied;		/* replay dedup, gxid -> LrAppliedEntry */
 	XLogRecPtr	start_lsn;		/* where to resume the stream: the driver's
-								 * persisted seg_flush (section 13.1).  The
+								 * persisted seg_flush.  The
 								 * slot's confirmed_flush only advances with
 								 * our feedback and can be far behind what has
 								 * already been applied, so resuming there
@@ -146,9 +146,9 @@ struct LrReaderState
 
 	/*
 	 * The source segment this reader streams from, or -1 when the source has
-	 * fewer segments than the target and this reader has no source at all
-	 * (design section 9.5).  Reader index (= target segment) and source
-	 * content id are two different coordinate systems; everything that talks
+	 * fewer segments than the target and this reader has no source at all.
+	 * Reader index (= target segment) and source content id are two
+	 * different coordinate systems; everything that talks
 	 * to the coordinator uses the reader index, everything that talks about
 	 * the stream uses this.
 	 */
@@ -268,8 +268,8 @@ LrReaderCreate(Oid subid, int srcseg, int64 token, const LrReaderStartPoint *sta
  * The state of one stream: a subscription and the source segment it reads.
  *
  * One reader QE holds as many of these as the driver gave it source segments
- * -- more than one when the source has more segments than the target (design
- * section 9.2b).  A reader with no source at all holds one with srcseg = -1,
+ * -- more than one when the source has more segments than the target.  A
+ * reader with no source at all holds one with srcseg = -1,
  * so that the plans still find it warm.
  */
 LrReaderState *
@@ -389,7 +389,7 @@ LrReaderConnect(LrReaderState *st, const char *conninfo, const char *slotname,
 	opts.logical = true;
 	opts.slotname = st->slotname;
 	/*
-	 * Resume exactly where the coordinator's progress says (section 13.1);
+	 * Resume exactly where the coordinator's progress says;
 	 * only a reader that has no progress at all falls back to the slot's
 	 * confirmed_flush.
 	 */
@@ -1116,7 +1116,7 @@ txn_finish(LrReaderState *st, LrTxn *txn, LrTxnState state,
 	if (txn->kind == LR_TXN_KIND_UNKNOWN)
 		txn->kind = LR_TXN_LOCAL;
 
-	/* replay dedup (§13.1) */
+	/* replay dedup */
 	if (txn->gxid != 0)
 	{
 		if (hash_search(st->applied, &txn->gxid, HASH_FIND, NULL) != NULL)

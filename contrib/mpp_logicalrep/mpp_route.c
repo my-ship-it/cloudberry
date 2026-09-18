@@ -5,7 +5,7 @@
  *
  * The reader QE decides, for every change it emits on the Explicit Motion
  * channel, which target segment must apply it.  The decision follows the
- * target table's distribution policy (design §9.2):
+ * target table's distribution policy:
  *
  *   hash(keys)   INSERT      cdbhash(new keys)
  *                DELETE      cdbhash(old keys)

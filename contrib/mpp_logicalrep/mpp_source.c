@@ -19,7 +19,7 @@
  *
  * A reader with no state for the subscription, a different session token or
  * a lost connection reports 'X' (cold) and does nothing else; the
- * coordinator then rolls back and reconnects (design §7.3, §13).
+ * coordinator then rolls back and reconnects.
  *
  * Portions Copyright (c) 2026, Apache Cloudberry
  *
@@ -93,7 +93,7 @@ typedef struct LrSourceState
 								 * stale when lappend() grows the list */
 
 	/*
-	 * APPLY filter (design section 10.5).  filter_relids are remote relids of
+	 * APPLY filter.  filter_relids are remote relids of
 	 * tables that are not ready to receive changes: normally they are skipped
 	 * (their transactions stay buffered until the driver catches them up),
 	 * and in a catch-up plan (catchup=) they are the only ones emitted.
@@ -425,8 +425,8 @@ queue_cold(LrSourceState *state)
  *
  * The driver spreads the source segments over the readers with
  * "srcsegs.<reader>=a,b,..." -- one each when the counts match, several when
- * the source has more segments, none at all when it has fewer (design
- * section 9.2b).  The per-stream keys (conninfo, flush, pos, applied) are
+ * the source has more segments, none at all when it has fewer.  The
+ * per-stream keys (conninfo, flush, pos, applied) are
  * indexed by SOURCE segment, not by reader.
  */
 /*
@@ -541,7 +541,7 @@ do_connect(LrSourceState *state)
 	/*
 	 * The driver leaves the source's secrets out of the payload, because a
 	 * server that logs statements logs their parameters too, and this payload
-	 * is one (work item O3).  The same conninfo is on this segment already:
+	 * is one.  The same conninfo is on this segment already:
 	 * CREATE SUBSCRIPTION was dispatched here, and pg_subscription.subconninfo
 	 * is readable by nobody but a superuser.
 	 */
