@@ -90,36 +90,8 @@ distributed, its rows would live on the segments, and the driver's own
 reads would not find them.  An existing cluster therefore needs the
 objects installed by hand, or a new initdb.
 
-The same applies to a cluster whose objects were installed by an earlier
-version of this module.  The script creates, it does not upgrade, so
-anything added since has to be added by hand -- in every database that
-has the objects, and in template1 so that new databases get it.  As of
-this version that is the subscription option column
-
-    SET allow_system_table_mods = on;
-    ALTER TABLE pg_catalog.gp_mpp_subscription
-        ADD COLUMN IF NOT EXISTS unsupported_tables text
-        NOT NULL DEFAULT 'error';
-
--- without which the apply worker cannot read the subscription's settings
-and disables the subscription saying which column is missing -- and the
-two statistics functions and the two views that read them, which are the
-last section of the script and can be run on their own:
-
-    SET allow_system_table_mods = on;
-    SET search_path = pg_catalog;
-    \i .../cdb_init.d/mpp_logicalrep_cdbinit.sql   -- from CREATE FUNCTION
-                                                   -- gp_stat_get_mpp_subscription
-
-The library has to be the new one before either is run: CREATE FUNCTION
-looks the C symbols up in the library the postmaster already has open, so
-the cluster is restarted first.
-
-The copy transport's wire format spans the two clusters -- the sender is
-the source cluster's cbdb_lr_copyhelper, the receiver the target's -- so
-a change to it has to be made on both.  This version added the opening
-frame that names the job (see Security), which a helper of an earlier
-version neither sends nor expects.
+A cluster whose objects were installed by an earlier version of this
+module needs them brought up to date by hand; see Upgrading below.
 
 The source cluster needs nothing from this module.
 
@@ -305,6 +277,116 @@ mpp_logicalrep.launcher_naptime_ms (integer, default 5s)
     reason -- one that exited, say.
 
 
+Limitations
+-----------
+
+What this does not do, in one place.  Some are decisions, some are the
+shape of the problem, and the ones that are neither say so.
+
+Schema is yours.  No DDL is replicated, in either direction, and neither
+are sequences or large objects -- the same as the server's own logical
+replication.  A table has to exist on the target before it can be
+synchronised, and a column added on the source has to be added on the
+target before the first change that mentions it arrives.
+
+Only heap tables can be published.  Append-optimised and PAX tables have
+no logical decoding on the publisher: nothing they do reaches the stream.
+They are refused by name and by access method unless the subscription
+asks for unsupported_tables = 'snapshot', which copies such a table once
+and records it in state 's'.  As target tables they are fully supported;
+it is decoding on the publisher they have no part in.
+
+The two distribution-key conditions above are warnings, not refusals, and
+what they cost is described there.  A table with no primary key and
+REPLICA IDENTITY FULL, written concurrently on several source segments
+under the same key, has no defined order between those segments.
+
+No utility-mode writes on the source while a table is being synchronised.
+The initial copy deduplicates by distributed snapshot, and a utility
+write has no distributed transaction to be in, so one made between the
+slots being created and the cut point being taken would be applied twice.
+While streaming they are replicated normally, on the idle poll.
+
+Partitioned tables are not supported as target tables.
+
+gpexpand renumbers segments on either side, and the subscription has to
+be resynchronised afterwards.
+
+Throughput is one writer gang and one distributed commit per batch;
+parallel apply is not implemented.
+
+A subscription dumped by pg_dump cannot be restored as it stands,
+because pg_dump writes connect = false and this module refuses that
+option.  Dump with --no-subscriptions, or take the line out.
+
+
+Upgrading
+---------
+
+Three separate things can be out of date, and they fail differently.
+
+1. The server.  This module needs a server that writes the participating
+   segments into a distributed commit record, marks one-phase commits,
+   lets an output plugin see a distributed commit, and honours a logical
+   slot on the coordinator.  The record formats are additive -- the
+   segment list rides on a new xinfo flag, the one-phase marker is a new
+   rmgr info code -- so a newer server reads an older server's WAL, and
+   an older server skips what it does not know.  Two things are not
+   additive:
+
+     - LogicalDecodeDistributedCommitCB was appended to the output plugin
+       callback struct.  Every output plugin .so has to be rebuilt against
+       the new header, pgoutput included.
+     - CMDTAG_DTX_PREPARE now reports a row count, which is how a segment
+       tells the coordinator it wrote something during PREPARE.  That is
+       the coordinator-to-segment protocol, so the whole cluster runs one
+       version of it; a mixed cluster mis-parses the PREPARE reply.
+
+   Coordinator WAL retention changes too: a logical slot there now holds
+   WAL down the way a segment's slot always has.  Nothing else does, so a
+   server with no logical slots behaves exactly as before -- but a
+   publisher that is upgraded and then left with a stopped subscription
+   will grow its WAL where it used to quietly throw the slot away.  See
+   the slots section above.
+
+   The publisher needs all of this.  The subscriber needs the parts this
+   module calls into.  Neither needs the other to be upgraded first: the
+   publisher's stream is what carries the new information, and a
+   subscriber that is not running loses nothing.
+
+2. This module's catalog objects.  They are installed by initdb, from
+   cdb_init.d, so an existing cluster never gets what a later version
+   adds.  Restart with the new library first -- CREATE FUNCTION looks C
+   symbols up in the library the postmaster already has open -- then, in
+   every database that has the objects and in template1 so new databases
+   inherit them:
+
+       SET allow_system_table_mods = on;
+       SET search_path = pg_catalog;
+
+       -- the subscription option column; without it a worker cannot read
+       -- its own settings and disables the subscription saying which
+       -- column is missing
+       ALTER TABLE pg_catalog.gp_mpp_subscription
+           ADD COLUMN IF NOT EXISTS unsupported_tables text
+           NOT NULL DEFAULT 'error';
+
+       -- the statistics functions and the views over them: the last
+       -- section of the install script, which can be run on its own
+       \i .../cdb_init.d/mpp_logicalrep_cdbinit.sql
+
+   A missing catalog object is loud, not silent: the worker stops the
+   subscription and records what it could not find.
+
+3. The copy transport, cbdb_lr_copyhelper.  Its wire format spans the two
+   clusters -- the sender is the publisher's binary, the receiver the
+   subscriber's -- so both sides run the same version.  This version
+   added an opening frame naming the job, which an older helper neither
+   sends nor expects, so a copy between mismatched versions stalls until
+   the receiver's accept timeout.  Nothing else in the module spans the
+   two clusters this way.
+
+
 Security
 --------
 
@@ -414,9 +496,3 @@ Cloudberry-specific is behind logicalrep_sink.h.  That is what lets the
 loop be tested without a cluster, and what a different target would
 implement.
 
-
-Limitations
------------
-
-Append-optimized and PAX tables work as targets but not as sources: on
-Cloudberry they produce no logical decoding output at all.
