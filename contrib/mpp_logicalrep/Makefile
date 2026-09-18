@@ -27,7 +27,7 @@ PGFILEDESC = "mpp_logicalrep - logical replication apply into an MPP target"
 # ordinary build never goes looking for a server.
 REGRESS = subscription_options security
 
-ifneq (,$(filter installcheck,$(MAKECMDGOALS)))
+ifneq (,$(filter installcheck installcheck-isolation2,$(MAKECMDGOALS)))
 ifeq (,$(shell psql -X -At -d postgres -c "SHOW shared_preload_libraries" \
                 2>/dev/null | grep mpp_logicalrep))
 REGRESS =

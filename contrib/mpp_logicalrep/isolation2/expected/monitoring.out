@@ -1,0 +1,190 @@
+-- gp_stat_mpp_subscription and gp_stat_mpp_subscription_segments: what a
+-- running worker publishes about itself, and what is left to see once it has
+-- stopped.
+--
+--   1  no worker: the subscription is in the view with its registry columns
+--      and null live ones
+--   2  ENABLE wakes the launcher rather than waiting out its nap; a running
+--      worker reports its phase, its source segments and its table states
+--   3  under load the counters move and the per-segment view agrees with
+--      gp_subscription_progress
+--   4  the worker stops: the live columns go null, the positions stay
+--
+-- Only derived facts are printed.  Positions, counters and pids differ on
+-- every run, so what is compared is the relation between two readings.
+
+CREATE DATABASE mpp_lr_mon;
+CREATE
+
+CREATE TABLE mon_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+INSERT INTO mon_t SELECT g, 'seed' FROM generate_series(1, 20000) g;
+INSERT 20000
+CREATE PUBLICATION mon_pub FOR TABLE mon_t;
+CREATE
+SELECT count(*) > 0 AS slots FROM gp_create_logical_replication_slot('mon_slot', 'pgoutput', false, true);
+ slots 
+-------
+ t     
+(1 row)
+CREATE PROCEDURE mon_churn() AS $$ BEGIN FOR b IN 101 .. 160 LOOP INSERT INTO mon_t SELECT g, 'w' || b FROM generate_series(b * 1000, b * 1000 + 49) g; UPDATE mon_t SET v = 'u' || b WHERE id = b * 7; DELETE FROM mon_t WHERE id = b * 13; COMMIT; PERFORM pg_sleep(0.1); END LOOP; END $$ LANGUAGE plpgsql;
+CREATE
+
+1:@db_name mpp_lr_mon: CREATE TABLE mon_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+1:@db_name mpp_lr_mon: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+
+-- ------------------------------------------------------------------
+-- 1. created, not enabled
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_mon: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION mon_sub CONNECTION %L PUBLICATION mon_pub WITH (slot_name = ''mon_slot'', enabled = false)', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_mon: SELECT phase, pid IS NULL AS no_pid, enabled, tables, tables_ready FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub';
+ phase       | no_pid | enabled | tables | tables_ready 
+-------------+--------+---------+--------+--------------
+ not running | t      | f       | 0      | 0            
+(1 row)
+1:@db_name mpp_lr_mon: SELECT count(*) AS segment_rows FROM gp_stat_mpp_subscription_segments WHERE subname = 'mon_sub';
+ segment_rows 
+--------------
+ 0            
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 2. enabled: the launcher is woken, not slept out
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_mon: CREATE TEMP TABLE mon_t0 AS SELECT clock_timestamp() AS t0, cast(setting as int) AS naptime_ms FROM pg_settings WHERE name = 'mpp_logicalrep.launcher_naptime_ms';
+CREATE 1
+1:@db_name mpp_lr_mon: ALTER SUBSCRIPTION mon_sub ENABLE;
+ALTER
+1:@db_name mpp_lr_mon: SELECT lr_wait($$SELECT count(*) > 0 FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database()$$) AS worker_started;
+ worker_started 
+----------------
+ t              
+(1 row)
+-- the launcher was signalled at commit, so this is well inside one nap
+1:@db_name mpp_lr_mon: SELECT extract(epoch FROM clock_timestamp() - t0) * 1000 < naptime_ms AS quicker_than_a_nap FROM mon_t0;
+ quicker_than_a_nap 
+--------------------
+ t                  
+(1 row)
+
+-- wait on the phase, not on the table: the rows of the copy are committed
+-- before the subscription leaves 'initial sync', and a poll of the table
+-- being copied would block the copy itself
+-- the phase flips a moment before the worker publishes its per-segment
+-- statistics, so wait for all of it and then read it back
+1:@db_name mpp_lr_mon: SELECT lr_wait($$SELECT phase = 'streaming' AND tables_ready = 1 AND source_segments = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) AND (SELECT count(*) FROM gp_stat_mpp_subscription_segments WHERE subname = 'mon_sub') = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub'$$) AS streaming;
+ streaming 
+-----------
+ t         
+(1 row)
+1:@db_name mpp_lr_mon: SELECT count(*) AS copied FROM mon_t;
+ copied 
+--------
+ 20000  
+(1 row)
+1:@db_name mpp_lr_mon: SELECT phase, pid IS NOT NULL AS has_pid, tables, tables_ready FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub';
+ phase     | has_pid | tables | tables_ready 
+-----------+---------+--------+--------------
+ streaming | t       | 1      | 1            
+(1 row)
+1:@db_name mpp_lr_mon: SELECT source_segments = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) AS one_per_source_segment FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub';
+ one_per_source_segment 
+------------------------
+ t                      
+(1 row)
+1:@db_name mpp_lr_mon: SELECT count(*) = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) AS segment_row_per_segment FROM gp_stat_mpp_subscription_segments WHERE subname = 'mon_sub';
+ segment_row_per_segment 
+-------------------------
+ t                       
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 3. under load
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_mon: CREATE TEMP TABLE mon_before AS SELECT batches, rows_applied, recoveries FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub';
+CREATE 1
+2&: CALL mon_churn();  <waiting ...>
+1:@db_name mpp_lr_mon: SELECT received_lsn IS NOT NULL AS receiving, apply_lag_bytes IS NOT NULL AS lag_is_a_number FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub';
+ receiving | lag_is_a_number 
+-----------+-----------------
+ t         | t               
+(1 row)
+2<:  <... completed>
+CALL
+-- 20000 seeded + 3000 inserted - 60 deleted
+1:@db_name mpp_lr_mon: SELECT lr_wait('SELECT count(*) = 22940 FROM mon_t') AS caught_up;
+ caught_up 
+-----------
+ t         
+(1 row)
+1:@db_name mpp_lr_mon: SELECT n.batches > b.batches AS batches_moved, n.rows_applied > b.rows_applied AS rows_moved, n.recoveries = b.recoveries AS no_recoveries FROM mon_before b, gp_stat_mpp_subscription n WHERE n.subname = 'mon_sub';
+ batches_moved | rows_moved | no_recoveries 
+---------------+------------+---------------
+ t             | t          | t             
+(1 row)
+1:@db_name mpp_lr_mon: SELECT count(*) AS stuck FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub' AND stuck_errors <> 0;
+ stuck 
+-------
+ 0     
+(1 row)
+
+-- the live positions and the ones the last committed batch persisted are one
+-- reading taken from two places
+1:@db_name mpp_lr_mon: SELECT lr_wait($$SELECT (SELECT array_agg(cast(pos as text) ORDER BY source_segment) FROM gp_stat_mpp_subscription_segments WHERE subname = 'mon_sub') = (SELECT array_agg(cast(cast('0/0' as pg_lsn) + u.p as text) ORDER BY u.i) FROM gp_mpp_subscription s JOIN gp_subscription_progress g ON g.subid = s.subid, LATERAL unnest(g.seg_pos) WITH ORDINALITY AS u(p, i) WHERE s.subname = 'mon_sub')$$) AS view_agrees_with_progress;
+ view_agrees_with_progress 
+---------------------------
+ t                         
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 4. stopped: the live columns go, the positions stay
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_mon: CREATE FUNCTION mon_snapshot() RETURNS void AS $$ BEGIN CREATE TEMP TABLE mon_pos AS SELECT source_segment, pos FROM gp_stat_mpp_subscription_segments WHERE subname = 'mon_sub'; END $$ LANGUAGE plpgsql;
+CREATE
+1:@db_name mpp_lr_mon: SELECT mon_snapshot();
+ mon_snapshot 
+--------------
+              
+(1 row)
+1:@db_name mpp_lr_mon: ALTER SUBSCRIPTION mon_sub DISABLE;
+ALTER
+1:@db_name mpp_lr_mon: SELECT lr_wait($$SELECT count(*) = 0 FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database()$$) AS worker_gone;
+ worker_gone 
+-------------
+ t           
+(1 row)
+1:@db_name mpp_lr_mon: SELECT phase, pid IS NULL AS no_pid, applied_lsn IS NOT NULL AS position_survives FROM gp_stat_mpp_subscription WHERE subname = 'mon_sub';
+ phase       | no_pid | position_survives 
+-------------+--------+-------------------
+ not running | t      | t                 
+(1 row)
+1:@db_name mpp_lr_mon: SELECT count(*) = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) AS segments_still_listed, count(*) FILTER (WHERE buffered_txns IS NULL) = count(*) AS nothing_buffered FROM gp_stat_mpp_subscription_segments WHERE subname = 'mon_sub';
+ segments_still_listed | nothing_buffered 
+-----------------------+------------------
+ t                     | t                
+(1 row)
+1:@db_name mpp_lr_mon: SELECT count(*) AS positions_changed FROM gp_stat_mpp_subscription_segments v JOIN mon_pos p ON p.source_segment = v.source_segment WHERE v.subname = 'mon_sub' AND v.pos IS DISTINCT FROM p.pos;
+ positions_changed 
+-------------------
+ 0                 
+(1 row)
+
+1:@db_name mpp_lr_mon: DROP SUBSCRIPTION mon_sub;
+DROP
+1q: ... <quitting>
+SELECT gp_drop_replication_slot('mon_slot');
+ gp_drop_replication_slot 
+--------------------------
+                          
+(1 row)
+DROP PUBLICATION mon_pub;
+DROP
+DROP TABLE mon_t;
+DROP
+DROP PROCEDURE mon_churn();
+DROP
+DROP DATABASE mpp_lr_mon;
+DROP

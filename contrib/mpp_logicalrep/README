@@ -108,9 +108,11 @@ replicates for real between two databases of that one cluster and waits on
 conditions rather than sleeping.  Against a cluster without the library it
 says so and tests nothing, rather than passing for the wrong reason --
 which is what lets it sit in installcheck-world without holding anyone
-else's run hostage.  The tests under test/cluster/ are the ones that need
-two clusters, which nothing in the tree can build; they are not part of any
-automated run.  See test/cluster/README.
+else's run hostage.  What is left under test/cluster/ is what neither suite
+can reach: the cases that need two clusters, which nothing in the tree can
+build, the helper binary driven by hand, file modes on disk, and one
+measurement.  None of it is part of an automated run.  See
+test/cluster/README.
 
 
 Usage

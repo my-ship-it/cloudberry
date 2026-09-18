@@ -1,1 +1,8 @@
 test: replicate
+test: subscription_ddl
+test: unsupported_tables
+test: copy_transport
+test: initial_sync
+test: refresh_publication
+test: monitoring
+test: faults

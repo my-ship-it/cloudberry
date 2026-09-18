@@ -23,31 +23,39 @@ install them by hand with
 One cluster
 -----------
 
-These replicate between two databases of one cluster (postgres ->
-lrdst), which is enough for everything that does not depend on the two
-sides being separate servers.
+Everything that replicates between two databases of one cluster now runs
+under the tree's own test frameworks, against whatever cluster
+"make installcheck" is pointed at:
 
-    subscription_ddl.sh     the DDL, the catalogs, and which launcher may
-                            start a worker
-    initial_sync.sh         the initial synchronisation, including an
-                            interrupted one
-    refresh_publication.sh  a table added to a running subscription
-    faults.sh               a reader QE, the driven session and the worker
-                            killed under load
-    copy_transport.sh       the segment-to-segment copy transport alone,
-                            without any subscription
-    unsupported_tables.sh   a published table whose changes the publisher
-                            cannot decode (append-optimised): refused by
-                            default, copied once and marked 's' on request
-    monitoring.sh           gp_stat_mpp_subscription and its per-segment
-                            companion, running and stopped; and that the
-                            launcher is woken rather than slept out
-    security.sh             who can read the source's password, that it
-                            stays out of the dispatched payload, and that
-                            the copy transport's socket drops a caller
-                            that does not know the job name
+    ../../sql/                 pg_regress: the subscription DDL contract
+                               and who may read what
+    ../../isolation2/sql/      isolation2: replication end to end, the
+                               initial synchronisation, a table added to
+                               a running subscription, the statistics
+                               views, fault injection under load, and the
+                               copy transport on its own
+
+    cd contrib/mpp_logicalrep && make installcheck installcheck-isolation2
+
+What is left here needs something SQL cannot reach -- the helper binary
+driven by hand, file modes on disk, or a measurement rather than a
+verdict:
+
+    copy_transport.sh       the 2 -> N case of the transport, where a
+                            target segment expects no client at all and
+                            the sends are driven from a shell pipe.  The
+                            N -> N and 2N -> N cases are in
+                            isolation2/sql/copy_transport.sql
+    security.sh             that the source's password stays out of the
+                            dispatched payload, and that the copy
+                            transport's socket drops a caller which does
+                            not know the job name, with the port and done
+                            files owner-only.  Who may read the
+                            connection string and drive the entry points
+                            is in sql/security.sql
     participants_bench.sh   how long small distributed transactions take
-                            to arrive (a measurement, not a pass/fail test)
+                            to arrive (a measurement, not a pass/fail
+                            test)
 
     usage: <test>.sh [-s <port>]        (default 7100)
 

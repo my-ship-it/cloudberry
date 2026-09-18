@@ -21,8 +21,12 @@ SELECT count(*) > 0 AS slots_created
 -- the publisher is this same cluster, so it is reached on the same port
 1:@db_name mpp_lr_target: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION lr_sub CONNECTION %L PUBLICATION lr_pub WITH (slot_name = ''lr_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 
--- the initial copy
-1:@db_name mpp_lr_target: SELECT lr_wait('SELECT count(*) = 200 FROM lr_t') AS copied;
+-- The initial copy.  Wait on the state row rather than on the table: the
+-- copy truncates its target first, and a lock taken inside a function is held
+-- until the function returns, so polling the table being copied would block
+-- the very copy it is waiting for.
+1:@db_name mpp_lr_target: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'lr_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
+1:@db_name mpp_lr_target: SELECT count(*) AS copied FROM lr_t;
 
 -- and then the stream
 INSERT INTO lr_t SELECT g, 'more' FROM generate_series(201, 260) g;
