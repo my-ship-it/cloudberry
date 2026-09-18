@@ -6,7 +6,10 @@ test: copy_transport
 test: subtransactions
 test: prepared_statements
 test: maintenance
+test: ordering
+test: streaming
 test: initial_sync
 test: refresh_publication
 test: monitoring
 test: faults
+test: crash_recovery
