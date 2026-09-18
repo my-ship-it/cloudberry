@@ -822,6 +822,14 @@ driver_pump_source(LrDriver *d, int timeout_ms)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * Not connected: say the stream is gone rather than read from
+		 * nothing.  The loop above turns that into its ordinary recovery,
+		 * which is what reconnects.
+		 */
+		if (d->src == NULL)
+			return false;
+
 		len = walrcv_receive(d->src, &buf, &fd);
 		if (len < 0)
 			return false;
