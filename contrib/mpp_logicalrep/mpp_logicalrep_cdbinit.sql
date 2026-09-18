@@ -275,3 +275,15 @@ CREATE VIEW gp_stat_mpp_subscription_segments AS
                                                     0) - 1) i
       LEFT JOIN pg_catalog.gp_stat_get_mpp_subscription_segs() g
              ON g.subid = v.subid AND g.source_segment = i;
+
+-- Monitoring is for whoever monitors, as it is for pg_stat_subscription and
+-- gp_replication_slots.  Objects made here are not covered by the blanket
+-- grant initdb gives the catalogs it creates itself, so say it.
+--
+-- The tables underneath stay owner-only; a view is read with its owner's
+-- rights, so these two are enough.  Note that disable_reason carries the
+-- apply error that stopped a subscription, and such a message can quote a
+-- value from the data -- revoke it if that matters more than seeing why a
+-- subscription stopped.
+GRANT SELECT ON gp_stat_mpp_subscription TO PUBLIC;
+GRANT SELECT ON gp_stat_mpp_subscription_segments TO PUBLIC;

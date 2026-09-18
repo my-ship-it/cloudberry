@@ -25,7 +25,7 @@ PGFILEDESC = "mpp_logicalrep - logical replication apply into an MPP target"
 # hand out, so rather than fail everybody else's run, test nothing and say
 # why.  The probe happens only when a test run is being asked for, so an
 # ordinary build never goes looking for a server.
-REGRESS = subscription_options
+REGRESS = subscription_options security
 
 ifneq (,$(filter installcheck,$(MAKECMDGOALS)))
 ifeq (,$(shell psql -X -At -d postgres -c "SHOW shared_preload_libraries" \

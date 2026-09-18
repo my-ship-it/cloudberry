@@ -386,8 +386,9 @@ Three separate things can be out of date, and they fail differently.
            ADD COLUMN IF NOT EXISTS unsupported_tables text
            NOT NULL DEFAULT 'error';
 
-       -- the statistics functions and the views over them: the last
-       -- section of the install script, which can be run on its own
+       -- the statistics functions, the views over them and their grants:
+       -- the last section of the install script, which can be run on its
+       -- own
        \i .../cdb_init.d/mpp_logicalrep_cdbinit.sql
 
    template0 does not accept connections, and its pg_database row is a
@@ -446,8 +447,14 @@ their names are the job names.
 
 The SQL entry points (gp_lr_connect, gp_lr_drain, gp_lr_apply,
 gp_lr_copy_recv, gp_lr_copy_ports) drive gangs and open sockets on behalf
-of a subscription, and are superuser-only.  The statistics views are not:
-they expose positions and counters, nothing else.
+of a subscription, and are superuser-only.
+
+The statistics views are readable by anyone, as pg_stat_subscription and
+gp_replication_slots are: positions, counters and table states.  The one
+thing in them that is not just a number is disable_reason, which is the
+apply error that stopped a subscription and can quote a value from the
+data that caused it.  Revoke the views if that matters more than being
+able to see why a subscription stopped.
 
 
 Monitoring
