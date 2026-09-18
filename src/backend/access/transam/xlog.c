@@ -8000,12 +8000,44 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 	 * Calculate how many segments are kept by slots first, adjusting for
 	 * max_slot_wal_keep_size.
 	 *
-	 * Greenplum: coordinator needs a different way to determine the keep
-	 * point as replication slot is not created there.
+	 * Greenplum: the coordinator's standby is fed by a bare walsender with no
+	 * replication slot behind it, so what the connected walsenders have
+	 * confirmed is the only thing that speaks for it.  That used to be the
+	 * whole answer here, because nothing created a slot on the coordinator.
+	 *
+	 * Logical replication does.  A slot is a promise written to disk, and the
+	 * subscriber it belongs to is expected to be away sometimes -- disabled,
+	 * its target down, restarting after an error -- while the walsender
+	 * bookkeeping above exists only for as long as someone is connected.
+	 * Asking it alone would recycle, and then invalidate, the slot of every
+	 * subscription that is not running at the moment.  So both are consulted
+	 * and the earlier one wins.
+	 *
+	 * Only logical slots join in: the coordinator's physical replication has
+	 * never been driven by slots, and this is not the place to change that.
+	 * ReplicationSlotsComputeLogicalRestartLSN() also leaves out slots that
+	 * have already been invalidated, so a dead one cannot pin WAL for ever.
 	 */
-	keep = IS_QUERY_DISPATCHER() ?
-		WalSndCtlGetXLogCleanUpTo() :
-		XLogGetReplicationSlotMinimumLSN();
+	if (IS_QUERY_DISPATCHER())
+	{
+		XLogRecPtr	by_walsnd = WalSndCtlGetXLogCleanUpTo();
+		XLogRecPtr	by_slot = ReplicationSlotsComputeLogicalRestartLSN();
+
+		/*
+		 * InvalidXLogRecPtr here means "nothing to say", not "keep nothing",
+		 * and it is zero -- so Min() would read an abstention as the
+		 * strictest possible answer and keep no WAL at all.  Take the
+		 * earliest of those that did answer.
+		 */
+		if (XLogRecPtrIsInvalid(by_walsnd))
+			keep = by_slot;
+		else if (XLogRecPtrIsInvalid(by_slot))
+			keep = by_walsnd;
+		else
+			keep = Min(by_walsnd, by_slot);
+	}
+	else
+		keep = XLogGetReplicationSlotMinimumLSN();
 
 #ifdef FAULT_INJECTOR
 	/*
