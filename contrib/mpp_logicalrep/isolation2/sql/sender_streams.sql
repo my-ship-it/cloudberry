@@ -16,7 +16,9 @@
 --      segment's stream alone, under a commit that carries no gxid
 --   5  a transaction whose prepare is broadcast and then abandoned ends in
 --      ROLLBACK PREPARED on the segments and is never announced
---   6  a transaction too large for logical_decoding_work_mem is streamed
+--   6  TRUNCATE is a message of its own, and a rolled-back savepoint is in
+--      no stream at all
+--   7  a transaction too large for logical_decoding_work_mem is streamed
 --
 -- This is the sender, which is kernel code and owes nothing to this module.
 -- It lives in this suite because this is the one that is run against a
@@ -143,7 +145,34 @@ SELECT count(*) FILTER (WHERE node >= 0 AND data LIKE 'ROLLBACK PREPARED%') > 0 
 SELECT count(*) AS rows_left FROM s7_t WHERE v = 'prepared then abandoned';
 
 -- ------------------------------------------------------------------
--- 4. a transaction too large to buffer is streamed
+-- 4. TRUNCATE, and a savepoint that is rolled back
+-- ------------------------------------------------------------------
+DELETE FROM s7_raw;
+BEGIN;
+INSERT INTO s7_t VALUES (900, 'kept');
+SAVEPOINT s;
+INSERT INTO s7_t VALUES (901, 'dropped by the savepoint');
+ROLLBACK TO SAVEPOINT s;
+COMMIT;
+TRUNCATE s7_t;
+
+INSERT INTO s7_raw SELECT -1, data FROM pg_logical_slot_get_changes('s7_slot', NULL, NULL, 'include-gxid', 'on', 'skip-empty-xacts', 'on');
+0U: INSERT INTO s7_raw SELECT 0, data FROM pg_logical_slot_get_changes('s7_slot', NULL, NULL, 'include-gxid', 'on', 'skip-empty-xacts', 'on');
+1U: INSERT INTO s7_raw SELECT 1, data FROM pg_logical_slot_get_changes('s7_slot', NULL, NULL, 'include-gxid', 'on', 'skip-empty-xacts', 'on');
+2U: INSERT INTO s7_raw SELECT 2, data FROM pg_logical_slot_get_changes('s7_slot', NULL, NULL, 'include-gxid', 'on', 'skip-empty-xacts', 'on');
+
+-- the truncate is a message of its own, and what the savepoint undid is not
+-- in the stream at all: a transaction reaches a subscriber as what it
+-- committed
+SELECT count(*) FILTER (WHERE data LIKE '%TRUNCATE%') > 0 AS truncate_is_in_the_stream,
+       count(*) FILTER (WHERE data LIKE '%kept%') AS the_row_that_stayed,
+       count(*) FILTER (WHERE data LIKE '%dropped by the savepoint%') AS rows_from_a_rolled_back_savepoint
+  FROM s7_raw WHERE node >= 0;
+-- both transactions announced, once each
+SELECT count(*) AS announced FROM s7_raw WHERE node = -1 AND data LIKE 'DISTRIBUTED COMMIT%';
+
+-- ------------------------------------------------------------------
+-- 5. a transaction too large to buffer is streamed
 -- ------------------------------------------------------------------
 -- DELETE, not TRUNCATE: truncating is a catalog change, which is a
 -- distributed transaction of its own and would be in the streams being read

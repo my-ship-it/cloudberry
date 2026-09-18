@@ -1,0 +1,187 @@
+-- Subtransactions on the publisher.  A transaction reaches the subscriber as
+-- what it committed, so what a rolled-back savepoint did must not be there --
+-- including a TRUNCATE, which would otherwise empty the target.
+--
+--   1  a savepoint released: its rows are part of the commit
+--   2  a savepoint rolled back: its rows are not, and what follows still is
+--   3  nested savepoints: rolling back to the outer one drops the inner too
+--   4  a TRUNCATE inside a rolled-back savepoint truncates nothing
+--   5  an error caught inside the transaction (a plpgsql subtransaction)
+
+CREATE DATABASE mpp_lr_sx;
+CREATE
+
+CREATE TABLE sx_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+INSERT INTO sx_t SELECT g, 'seed' FROM generate_series(1, 100) g;
+INSERT 100
+CREATE PUBLICATION sx_pub FOR TABLE sx_t;
+CREATE
+
+1:@db_name mpp_lr_sx: CREATE TABLE sx_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+1:@db_name mpp_lr_sx: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+1:@db_name mpp_lr_sx: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION sx_sub CONNECTION %L PUBLICATION sx_pub WITH (slot_name = ''sx_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_sx: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'sx_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
+ synced 
+--------
+ t      
+(1 row)
+1:@db_name mpp_lr_sx: SELECT count(*) AS copied FROM sx_t;
+ copied 
+--------
+ 100    
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 1. a savepoint that is released
+-- ------------------------------------------------------------------
+BEGIN;
+BEGIN
+INSERT INTO sx_t VALUES (201, 'kept');
+INSERT 1
+SAVEPOINT a;
+SAVEPOINT
+INSERT INTO sx_t VALUES (202, 'kept inside a');
+INSERT 1
+RELEASE SAVEPOINT a;
+RELEASE
+INSERT INTO sx_t VALUES (203, 'kept after a');
+INSERT 1
+COMMIT;
+COMMIT
+1:@db_name mpp_lr_sx: SELECT lr_wait('SELECT count(*) = 103 FROM sx_t') AS released_rows_arrived;
+ released_rows_arrived 
+-----------------------
+ t                     
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 2. a savepoint that is rolled back
+-- ------------------------------------------------------------------
+BEGIN;
+BEGIN
+INSERT INTO sx_t VALUES (301, 'kept');
+INSERT 1
+SAVEPOINT b;
+SAVEPOINT
+INSERT INTO sx_t VALUES (302, 'dropped');
+INSERT 1
+ROLLBACK TO SAVEPOINT b;
+ROLLBACK
+INSERT INTO sx_t VALUES (303, 'kept after rolling back to b');
+INSERT 1
+COMMIT;
+COMMIT
+1:@db_name mpp_lr_sx: SELECT lr_wait('SELECT count(*) = 105 FROM sx_t') AS the_rest_arrived;
+ the_rest_arrived 
+------------------
+ t                
+(1 row)
+1:@db_name mpp_lr_sx: SELECT count(*) AS rows_from_a_rolled_back_savepoint FROM sx_t WHERE v = 'dropped';
+ rows_from_a_rolled_back_savepoint 
+-----------------------------------
+ 0                                 
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 3. nested: rolling back to the outer savepoint drops the inner one too
+-- ------------------------------------------------------------------
+BEGIN;
+BEGIN
+INSERT INTO sx_t VALUES (401, 'kept');
+INSERT 1
+SAVEPOINT c;
+SAVEPOINT
+INSERT INTO sx_t VALUES (402, 'dropped');
+INSERT 1
+SAVEPOINT d;
+SAVEPOINT
+INSERT INTO sx_t VALUES (403, 'dropped');
+INSERT 1
+ROLLBACK TO SAVEPOINT c;
+ROLLBACK
+INSERT INTO sx_t VALUES (404, 'kept after rolling back to c');
+INSERT 1
+COMMIT;
+COMMIT
+1:@db_name mpp_lr_sx: SELECT lr_wait('SELECT count(*) = 107 FROM sx_t') AS the_rest_arrived;
+ the_rest_arrived 
+------------------
+ t                
+(1 row)
+1:@db_name mpp_lr_sx: SELECT count(*) AS rows_from_a_rolled_back_savepoint FROM sx_t WHERE v = 'dropped';
+ rows_from_a_rolled_back_savepoint 
+-----------------------------------
+ 0                                 
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 4. a TRUNCATE that is rolled back truncates nothing
+-- ------------------------------------------------------------------
+BEGIN;
+BEGIN
+SAVEPOINT e;
+SAVEPOINT
+TRUNCATE sx_t;
+TRUNCATE
+ROLLBACK TO SAVEPOINT e;
+ROLLBACK
+INSERT INTO sx_t VALUES (501, 'after an undone truncate');
+INSERT 1
+COMMIT;
+COMMIT
+1:@db_name mpp_lr_sx: SELECT lr_wait('SELECT count(*) = 108 FROM sx_t') AS nothing_was_truncated;
+ nothing_was_truncated 
+-----------------------
+ t                     
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 5. an error caught inside the transaction
+-- ------------------------------------------------------------------
+DO $$ BEGIN INSERT INTO sx_t VALUES (601, 'kept by the do block'); BEGIN INSERT INTO sx_t VALUES (601, 'a duplicate key'); EXCEPTION WHEN unique_violation THEN NULL; END; END $$;
+DO
+1:@db_name mpp_lr_sx: SELECT lr_wait('SELECT count(*) = 109 FROM sx_t') AS caught_error_did_not_stop_it;
+ caught_error_did_not_stop_it 
+------------------------------
+ t                            
+(1 row)
+1:@db_name mpp_lr_sx: SELECT count(*) AS duplicates FROM sx_t WHERE v = 'a duplicate key';
+ duplicates 
+------------
+ 0          
+(1 row)
+
+SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM sx_t;
+ rows | digest     
+------+------------
+ 109  | 3343645742 
+(1 row)
+1:@db_name mpp_lr_sx: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM sx_t;
+ rows | digest     
+------+------------
+ 109  | 3343645742 
+(1 row)
+1:@db_name mpp_lr_sx: SELECT phase, stuck_errors, recoveries FROM gp_stat_mpp_subscription WHERE subname = 'sx_sub';
+ phase     | stuck_errors | recoveries 
+-----------+--------------+------------
+ streaming | 0            | 0          
+(1 row)
+
+1:@db_name mpp_lr_sx: DROP SUBSCRIPTION sx_sub;
+DROP
+1q: ... <quitting>
+SELECT gp_drop_replication_slot('sx_slot');
+ gp_drop_replication_slot 
+--------------------------
+                          
+(1 row)
+DROP PUBLICATION sx_pub;
+DROP
+DROP TABLE sx_t;
+DROP
+DROP DATABASE mpp_lr_sx;
+DROP

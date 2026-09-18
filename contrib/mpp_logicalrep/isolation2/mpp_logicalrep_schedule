@@ -3,6 +3,9 @@ test: subscription_ddl
 test: unsupported_tables
 test: sender_streams
 test: copy_transport
+test: subtransactions
+test: prepared_statements
+test: maintenance
 test: initial_sync
 test: refresh_publication
 test: monitoring
