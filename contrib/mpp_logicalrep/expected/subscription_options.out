@@ -1,0 +1,175 @@
+--
+-- The subscription DDL this module takes over.
+--
+-- Only the statement and what it leaves in the catalogs: no slots, no
+-- publisher, nothing started.  Every subscription here is created disabled,
+-- so the launcher never has anything to do and the test is about the
+-- contract alone.
+--
+-- the module has to be loaded, or none of this means anything
+SELECT current_setting('shared_preload_libraries') LIKE '%mpp_logicalrep%'
+       AS module_is_loaded;
+ module_is_loaded 
+------------------
+ t
+(1 row)
+
+-- Every CREATE SUBSCRIPTION below leaves the server's own row unconnected
+-- and says so, once per node; the text carries host, port and pid, so it
+-- would differ on every cluster.  Errors are what this test is about.
+SET client_min_messages = error;
+-- ------------------------------------------------------------------
+-- options the module owns, and refuses
+-- ------------------------------------------------------------------
+-- connect is how the module keeps the server's own machinery out of the
+-- way, so it is not the user's to set, in either direction
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (slot_name = 'x', connect = false, enabled = false);
+ERROR:  "connect" is not accepted for a subscription applied by mpp_logicalrep
+DETAIL:  The module sets it itself: the statement must not connect to the publisher, must not create a slot, and must leave the pg_subscription row disabled so that the server's own launcher never starts a worker for it.
+HINT:  Leave it out.  A subscription dumped by pg_dump carries "connect = false" and has to have it removed, or be dumped with --no-subscriptions.
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (slot_name = 'x', connect = true, enabled = false);
+ERROR:  "connect" is not accepted for a subscription applied by mpp_logicalrep
+DETAIL:  The module sets it itself: the statement must not connect to the publisher, must not create a slot, and must leave the pg_subscription row disabled so that the server's own launcher never starts a worker for it.
+HINT:  Leave it out.  A subscription dumped by pg_dump carries "connect = false" and has to have it removed, or be dumped with --no-subscriptions.
+-- the slots are cluster-wide and only gp_create_logical_replication_slot()
+-- can make them
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (slot_name = 'x', create_slot = true, enabled = false);
+ERROR:  "create_slot = true" is not supported for a subscription applied by mpp_logicalrep
+DETAIL:  The publisher needs a slot on every primary segment and on the coordinator, under one name and with two-phase decoding enabled, which this statement cannot create.
+HINT:  Create them on the publisher first with gp_create_logical_replication_slot('<name>', 'pgoutput', false, true), then name them here with slot_name.
+-- and it needs to be told which slots to stream from
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (enabled = false);
+ERROR:  a subscription applied by mpp_logicalrep requires slot_name
+DETAIL:  It names the cluster-wide slots on the publisher, which the subscription's readers stream from.
+HINT:  Create them with gp_create_logical_replication_slot('<name>', 'pgoutput', false, true) on the publisher.
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (slot_name = NONE, enabled = false);
+ERROR:  a subscription applied by mpp_logicalrep requires slot_name
+DETAIL:  It names the cluster-wide slots on the publisher, which the subscription's readers stream from.
+HINT:  Create them with gp_create_logical_replication_slot('<name>', 'pgoutput', false, true) on the publisher.
+-- unsupported_tables takes two values and nothing else
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (slot_name = 'x', enabled = false, unsupported_tables = 'maybe');
+ERROR:  "unsupported_tables" must be "error" or "snapshot"
+DETAIL:  "error" refuses a published table whose changes the publisher cannot decode; "snapshot" copies it once and stops tracking it.
+-- and it is meaningless on a subscription the module does not apply
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (mpp = false, slot_name = NONE, connect = false,
+          unsupported_tables = 'snapshot');
+ERROR:  "unsupported_tables" is only accepted for a subscription applied by mpp_logicalrep
+HINT:  Leave out "mpp = false".
+-- ------------------------------------------------------------------
+-- what a good one leaves behind
+-- ------------------------------------------------------------------
+-- nothing connects, so this is allowed in a transaction block
+BEGIN;
+CREATE SUBSCRIPTION s1 CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (slot_name = 'slot_s1', enabled = false);
+COMMIT;
+-- the server's own row stays disabled: that is what keeps its launcher off
+-- this subscription, and the module's registry is what says it is ours
+SELECT subenabled, subslotname, subconninfo IS NOT NULL AS has_conninfo
+  FROM pg_subscription WHERE subname = 's1';
+ subenabled | subslotname | has_conninfo 
+------------+-------------+--------------
+ f          | slot_s1     | t
+(1 row)
+
+SELECT subname, enabled, unsupported_tables, disable_reason
+  FROM pg_catalog.gp_mpp_subscription WHERE subname = 's1';
+ subname | enabled | unsupported_tables | disable_reason 
+---------+---------+--------------------+----------------
+ s1      | f       | error              | 
+(1 row)
+
+-- WITH (mpp) is accepted and means nothing extra
+CREATE SUBSCRIPTION s2 CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (mpp, slot_name = 'slot_s2', enabled = false);
+SELECT subname, enabled FROM pg_catalog.gp_mpp_subscription WHERE subname = 's2';
+ subname | enabled 
+---------+---------
+ s2      | f
+(1 row)
+
+-- WITH (mpp = false) asks for one of the server's own, which the module
+-- neither rewrites nor claims
+CREATE SUBSCRIPTION s3 CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (mpp = false, slot_name = NONE, connect = false);
+SELECT subname, subenabled FROM pg_subscription WHERE subname = 's3';
+ subname | subenabled 
+---------+------------
+ s3      | f
+(1 row)
+
+SELECT count(*) AS claimed_by_the_module
+  FROM pg_catalog.gp_mpp_subscription WHERE subname = 's3';
+ claimed_by_the_module 
+-----------------------
+                     0
+(1 row)
+
+-- ------------------------------------------------------------------
+-- ALTER: the registry is what changes, not pg_subscription
+-- ------------------------------------------------------------------
+ALTER SUBSCRIPTION s1 SET (unsupported_tables = 'snapshot');
+SELECT unsupported_tables FROM pg_catalog.gp_mpp_subscription WHERE subname = 's1';
+ unsupported_tables 
+--------------------
+ snapshot
+(1 row)
+
+ALTER SUBSCRIPTION s1 SET (unsupported_tables = 'sometimes');
+ERROR:  "unsupported_tables" must be "error" or "snapshot"
+DETAIL:  "error" refuses a published table whose changes the publisher cannot decode; "snapshot" copies it once and stops tracking it.
+ALTER SUBSCRIPTION s1 DISABLE;
+SELECT enabled FROM pg_catalog.gp_mpp_subscription WHERE subname = 's1';
+ enabled 
+---------
+ f
+(1 row)
+
+SELECT subenabled AS still_false_in_pg_subscription
+  FROM pg_subscription WHERE subname = 's1';
+ still_false_in_pg_subscription 
+--------------------------------
+ f
+(1 row)
+
+-- ------------------------------------------------------------------
+-- DROP: the state rows go, the publisher's slots do not
+-- ------------------------------------------------------------------
+-- dropping says the publisher's slots are still there, which is the point
+SET client_min_messages = notice;
+DROP SUBSCRIPTION s1;
+NOTICE:  the replication slots named "slot_s1" are left on the publisher
+HINT:  Drop them there with gp_drop_replication_slot('slot_s1') once no subscription needs them; until then the publisher keeps the WAL they hold.
+SET client_min_messages = error;
+SELECT count(*) AS registry_rows
+  FROM pg_catalog.gp_mpp_subscription WHERE subname = 's1';
+ registry_rows 
+---------------
+             0
+(1 row)
+
+SELECT count(*) AS state_rows FROM pg_catalog.gp_subscription_rel
+ WHERE subid NOT IN (SELECT oid FROM pg_subscription);
+ state_rows 
+------------
+          0
+(1 row)
+
+DROP SUBSCRIPTION s2;
+ALTER SUBSCRIPTION s3 SET (slot_name = NONE);
+DROP SUBSCRIPTION s3;
+-- pg_subscription is a shared catalog, so count only this test's own
+SELECT count(*) AS subscriptions_left
+  FROM pg_subscription WHERE subname IN ('s1', 's2', 's3');
+ subscriptions_left 
+--------------------
+                  0
+(1 row)
+

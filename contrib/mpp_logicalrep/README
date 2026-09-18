@@ -95,6 +95,20 @@ module needs them brought up to date by hand; see Upgrading below.
 
 The source cluster needs nothing from this module.
 
+A cluster to run the tests against is an ordinary demo cluster with the
+two settings in it:
+
+    cd gpAux/gpdemo && \
+      EXTRA_CONFIG="shared_preload_libraries='mpp_logicalrep'" ./demo_cluster.sh
+    gpconfig -c wal_level -v logical && gpstop -ar
+
+make installcheck then runs the suite in sql/.  Against a cluster without
+the library it says so and tests nothing, rather than passing for the
+wrong reason -- which is what lets it sit in installcheck-world without
+holding anyone else's run hostage.  The tests under test/cluster/ are the
+ones that need two clusters and are not part of any automated run; see
+test/cluster/README.
+
 
 Usage
 -----
@@ -358,8 +372,9 @@ Three separate things can be out of date, and they fail differently.
    cdb_init.d, so an existing cluster never gets what a later version
    adds.  Restart with the new library first -- CREATE FUNCTION looks C
    symbols up in the library the postmaster already has open -- then, in
-   every database that has the objects and in template1 so new databases
-   inherit them:
+   every database that has the objects, and in template1 AND template0 so
+   that new databases inherit them whichever they are cloned from
+   (pg_regress, among others, uses template0):
 
        SET allow_system_table_mods = on;
        SET search_path = pg_catalog;
@@ -374,6 +389,17 @@ Three separate things can be out of date, and they fail differently.
        -- the statistics functions and the views over them: the last
        -- section of the install script, which can be run on its own
        \i .../cdb_init.d/mpp_logicalrep_cdbinit.sql
+
+   template0 does not accept connections, and its pg_database row is a
+   shared catalog that UPDATE does not dispatch, so it has to be opened on
+   every node and closed again:
+
+       -- on the coordinator and on each primary, in utility mode:
+       SET allow_system_table_mods = on;
+       UPDATE pg_database SET datallowconn = true WHERE datname = 'template0';
+       -- then the statements above, against template0, from the coordinator
+       -- and finally, on every node again:
+       UPDATE pg_database SET datallowconn = false WHERE datname = 'template0';
 
    A missing catalog object is loud, not silent: the worker stops the
    subscription and records what it could not find.

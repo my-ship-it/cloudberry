@@ -199,6 +199,9 @@ endif
 ifeq ($(with_openssl), yes)
 ICW_TARGETS += contrib/sslinfo
 endif
+# Tests itself only on a cluster it is preloaded on; says so and does nothing
+# otherwise, so it is harmless here until such a cluster is what CI builds.
+ICW_TARGETS += contrib/mpp_logicalrep
 ICW_TARGETS += gpcontrib gpMgmt/bin
 
 $(call recurse,installcheck-world,src/test src/pl src/interfaces/ecpg $(ICW_TARGETS) src/bin,installcheck)

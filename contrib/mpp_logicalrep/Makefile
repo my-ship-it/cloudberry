@@ -19,6 +19,22 @@ SHLIB_LINK_INTERNAL = $(libpq)
 
 PGFILEDESC = "mpp_logicalrep - logical replication apply into an MPP target"
 
+# These run against a cluster that has the library preloaded -- the module is
+# nothing without it, and a run against a cluster that has not got it would be
+# green for the wrong reason.  installcheck-world has no cluster of its own to
+# hand out, so rather than fail everybody else's run, test nothing and say
+# why.  The probe happens only when a test run is being asked for, so an
+# ordinary build never goes looking for a server.
+REGRESS = subscription_options
+
+ifneq (,$(filter installcheck,$(MAKECMDGOALS)))
+ifeq (,$(shell psql -X -At -d postgres -c "SHOW shared_preload_libraries" \
+                2>/dev/null | grep mpp_logicalrep))
+REGRESS =
+MPP_NOT_CONFIGURED = yes
+endif
+endif
+
 SUBDIRS = copyhelper
 
 ifdef USE_PGXS
@@ -50,3 +66,22 @@ installdirs-cdbinit:
 uninstall: uninstall-cdbinit
 uninstall-cdbinit:
 	rm -f '$(DESTDIR)$(datadir)/cdb_init.d/mpp_logicalrep_cdbinit.sql'
+
+ifdef MPP_NOT_CONFIGURED
+installcheck: say-not-run
+.PHONY: say-not-run
+say-not-run:
+	@echo "============================================================"
+	@echo "  contrib/mpp_logicalrep: NOT RUN"
+	@echo ""
+	@echo "  The cluster at PGPORT=$${PGPORT-<default>} does not preload"
+	@echo "  mpp_logicalrep, so there is nothing here to test."
+	@echo ""
+	@echo "  Build one that does:"
+	@echo "    cd gpAux/gpdemo && \\"
+	@echo "      EXTRA_CONFIG=\"shared_preload_libraries='mpp_logicalrep'\" \\"
+	@echo "      ./demo_cluster.sh"
+	@echo "  and set wal_level = logical on it."
+	@echo "  See contrib/mpp_logicalrep/README, Installation."
+	@echo "============================================================"
+endif
