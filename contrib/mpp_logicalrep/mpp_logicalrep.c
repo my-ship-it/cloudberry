@@ -208,6 +208,13 @@ define_gucs(void)
 							 true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("mpp_logicalrep.direct_copy",
+							 "Initial sync: load a table where it lands when both sides place its rows the same way.",
+							 "Off makes every table go through a redistribution, as it did before the direct path existed.",
+							 &gp_lr_direct_copy,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomStringVariable("mpp_logicalrep.copy_bind_address",
 							   "Address the initial-sync copy transport listens on.",
 							   "Empty means every interface. The socket has no authentication beyond the job name the sender opens with, so on a host with an interface the source cluster does not use, name the one it does.",

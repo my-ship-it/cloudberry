@@ -91,6 +91,11 @@ typedef struct LrSyncRel
 	bool		tracked;		/* false: the source table's changes are never
 								 * decoded, so the copy is all there will ever
 								 * be -- state 's' */
+	bool		direct;			/* the two sides place this table's rows the
+								 * same way, so a source segment's share is
+								 * already the target segment's share and the
+								 * copy can be loaded where it lands, without
+								 * the redistribution the general path does */
 } LrSyncRel;
 
 /* where an incremental job stands between two calls of LrSyncAddStep() */
@@ -115,6 +120,17 @@ typedef struct LrSync
 	int			ntgtsegs;
 	int			nsrcsegs;
 	bool		crc;
+	/*
+	 * The general path spawns the helper from gp_lr_copy_recv(), which reads
+	 * these on the segment it runs on.  The direct path spawns it from a COPY
+	 * program string, which is one literal for the whole cluster, so they are
+	 * read once from the target coordinator: a cluster that sets them per
+	 * segment has to leave the direct path alone.
+	 */
+	char	   *bindaddr;
+	int			port_lo;
+	int			port_hi;
+	bool		allow_direct;	/* mpp_logicalrep.direct_copy on the target */
 
 	List	   *rels;			/* LrSyncRel* */
 	LrUnsupportedTables unsupported;	/* what to do about a table whose
@@ -350,6 +366,51 @@ sync_connect(LrSync *s)
 	res = sync_exec(s, s->tgt2, "target", "SHOW mpp_logicalrep.copy_crc", 0, NULL);
 	s->crc = (strcmp(PQgetvalue(res, 0, 0), "on") == 0);
 	PQclear(res);
+	res = sync_exec(s, s->tgt2, "target",
+					"SELECT current_setting('mpp_logicalrep.copy_bind_address'),\n"
+					"       current_setting('mpp_logicalrep.copy_port_lo'),\n"
+					"       current_setting('mpp_logicalrep.copy_port_hi')",
+					0, NULL);
+	s->bindaddr = pstrdup(PQgetvalue(res, 0, 0));
+	s->port_lo = atoi(PQgetvalue(res, 0, 1));
+	s->port_hi = atoi(PQgetvalue(res, 0, 2));
+	PQclear(res);
+	res = sync_exec(s, s->tgt2, "target", "SHOW mpp_logicalrep.direct_copy", 0, NULL);
+	s->allow_direct = (strcmp(PQgetvalue(res, 0, 0), "on") == 0);
+	PQclear(res);
+}
+
+/*
+ * How a side places this table's rows, as one string: the policy, then the
+ * distribution key as column name and operator class in key order.  Two sides
+ * that answer the same place every row the same way -- the operator class is
+ * in it because that is what tells the legacy hash from the jump-consistent
+ * one, and a table keyed on the same column with the other hash lands its rows
+ * somewhere else entirely.  A randomly distributed table answers with an empty
+ * key, which is the honest answer: any row may live anywhere, on both sides.
+ */
+static char *
+sync_placement(LrSync *s, PGconn *conn, const char *who, const char *qualified)
+{
+	const char *params[1] = {qualified};
+	PGresult   *res;
+	char	   *sig;
+
+	res = sync_exec(s, conn, who,
+					"SELECT cast(p.policytype as text) || '|' || coalesce(\n"
+					"        (SELECT string_agg(a.attname || ':' || n.nspname || '.' || o.opcname,\n"
+					"                           ',' ORDER BY k.ord)\n"
+					"           FROM unnest(cast(p.distkey as int2[])) WITH ORDINALITY AS k(attnum, ord)\n"
+					"           JOIN pg_attribute a ON a.attrelid = p.localoid AND a.attnum = k.attnum\n"
+					"           JOIN pg_opclass o ON o.oid = p.distclass[k.ord - 1]\n"
+					"           JOIN pg_namespace n ON n.oid = o.opcnamespace), '')\n"
+					"  FROM gp_distribution_policy p\n"
+					" WHERE p.localoid = to_regclass($1)",
+					1, params);
+	sig = (PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
+		? pstrdup(PQgetvalue(res, 0, 0)) : NULL;
+	PQclear(res);
+	return sig;
 }
 
 /*
@@ -691,6 +752,27 @@ sync_fill_source_info(LrSync *s, LrSyncRel *r)
 			sync_report_unsupported(s, r, *am ? am : "none");
 	}
 	PQclear(res);
+
+	/*
+	 * May this table be loaded where it lands?  Only if both sides have the
+	 * same number of segments and place its rows the same way.  A replicated
+	 * table never can: every segment holds every row, and it has a copy path
+	 * of its own.
+	 */
+	r->direct = false;
+	if (s->allow_direct && !r->replicated && s->nsrcsegs == s->ntgtsegs)
+	{
+		char	   *src_sig = sync_placement(s, s->src, "source", r->qualified);
+		char	   *tgt_sig = sync_placement(s, s->tgt2, "target", r->qualified);
+
+		r->direct = (src_sig != NULL && tgt_sig != NULL &&
+					 strcmp(src_sig, tgt_sig) == 0);
+		if (!r->direct)
+			elog(DEBUG1, "mpp apply worker: subscription %u: %s is copied through a redistribution: source places it as %s, target as %s, over %d and %d segments",
+				 s->cfg->subid, r->qualified,
+				 src_sig ? src_sig : "?", tgt_sig ? tgt_sig : "?",
+				 s->nsrcsegs, s->ntgtsegs);
+	}
 }
 
 /* the untracked tables of this job -> 's' (they are done, not ready) */
@@ -1375,11 +1457,40 @@ copy_begin(LrSync *s, LrSyncRel *r)
 		s->tgt = sync_connect_one(s->cfg->target_conninfo, "target coordinator",
 								  " options='-c client_connection_check_interval=1000'");
 
-	/* target: the receiving INSERT runs until every source segment is done */
 	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "INSERT INTO %s (%s) SELECT * FROM pg_catalog.gp_lr_copy_recv(%u::regclass, '%s', %d) AS x(%s)",
-					 r->qualified, r->collist, r->relid, s->cur_job, s->nsrcsegs, r->coldefs);
+	if (r->direct)
+	{
+		/*
+		 * The two sides place this table's rows the same way, so segment i's
+		 * share of the source is segment i's share of the target: each target
+		 * segment takes its one sender's rows straight into the table, with
+		 * no redistribution and no plan of ours in the way.
+		 *
+		 * gp_enable_segment_copy_checking is left alone on purpose.  It is on
+		 * by default and makes every segment recompute where each row belongs
+		 * and refuse the ones that are not its own, which is exactly the
+		 * assumption above stated as a check: if it ever does not hold, this
+		 * fails loudly instead of putting rows on the wrong segment.
+		 */
+		char	   *prog = psprintf("cbdb_lr_copyhelper recv --job %s --seg <SEGID> --clients 1"
+									" --port-range %d-%d%s%s",
+									s->cur_job, s->port_lo, s->port_hi,
+									s->crc ? " --crc" : "",
+									s->bindaddr[0] ? psprintf(" --bindaddr %s", s->bindaddr) : "");
+		char	   *lit = PQescapeLiteral(s->tgt, prog, strlen(prog));
+
+		appendStringInfo(&sql, "COPY %s (%s) FROM PROGRAM %s ON SEGMENT",
+						 r->qualified, r->collist, lit);
+		PQfreemem(lit);
+		pfree(prog);
+	}
+	else
+	{
+		/* target: the receiving INSERT runs until every source segment is done */
+		appendStringInfo(&sql,
+						 "INSERT INTO %s (%s) SELECT * FROM pg_catalog.gp_lr_copy_recv(%u::regclass, '%s', %d) AS x(%s)",
+						 r->qualified, r->collist, r->relid, s->cur_job, s->nsrcsegs, r->coldefs);
+	}
 	if (!PQsendQuery(s->tgt, sql.data))
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -1553,8 +1664,9 @@ copy_poll_done(LrSync *s, LrSyncRel *r)
 						r->qualified, s->cur_src_rows, tgt_rows)));
 
 	sync_set_rel_state(s, r->relid, 'f', NULL);
-	elog(LOG, "mpp apply worker: subscription %u: copied %s: " INT64_FORMAT " rows (job %s)",
-		 s->cfg->subid, r->qualified, tgt_rows, s->cur_job);
+	elog(LOG, "mpp apply worker: subscription %u: copied %s: " INT64_FORMAT " rows, %s (job %s)",
+		 s->cfg->subid, r->qualified, tgt_rows,
+		 r->direct ? "loaded where it landed" : "redistributed", s->cur_job);
 	return true;
 }
 

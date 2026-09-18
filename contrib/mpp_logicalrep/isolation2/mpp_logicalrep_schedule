@@ -8,6 +8,7 @@ test: prepared_statements
 test: maintenance
 test: ordering
 test: streaming
+test: direct_copy
 test: initial_sync
 test: refresh_publication
 test: monitoring

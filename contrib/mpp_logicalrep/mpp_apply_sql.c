@@ -341,6 +341,7 @@ append_text_list(StringInfo buf, const char *key, ArrayType *arr)
 int			gp_lr_copy_port_lo = 42000;
 int			gp_lr_copy_port_hi = 42999;
 bool		gp_lr_copy_crc = true;
+bool		gp_lr_direct_copy = true;
 
 /*
  * Which address the copy transport listens on.  Empty means every interface,
