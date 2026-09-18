@@ -81,7 +81,7 @@ $S -c "CREATE TABLE $TBL (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)" >/dev
 $S -c "INSERT INTO $TBL SELECT g,'seed' FROM generate_series(1,2000) g" >/dev/null
 $S -c "CREATE PUBLICATION $PUB FOR TABLE $TBL" >/dev/null
 $T -c "CREATE TABLE $TBL (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)" >/dev/null
-$T -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$SRC_PORT dbname=postgres' PUBLICATION $PUB WITH (mpp=on, slot_name='$SLOT')" 2>&1 | grep -vE '^NOTICE|^WARNING|^HINT|^$' | head -2
+$T -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$SRC_PORT dbname=postgres' PUBLICATION $PUB WITH (slot_name='$SLOT')" 2>&1 | grep -vE '^NOTICE|^WARNING|^HINT|^$' | head -2
 wait_match 60 || fail "initial sync did not converge"
 $S -c "INSERT INTO $TBL SELECT g,'live' FROM generate_series(3001,3100) g" >/dev/null
 wait_match 60 || fail "streaming did not converge"

@@ -66,7 +66,7 @@ $Q -c "CREATE TABLE t4_a (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
 $Q -c "INSERT INTO t4_a SELECT g, 'seed' FROM generate_series(1,2000) g"
 $Q -c "CREATE PUBLICATION t4_pub FOR TABLE t4_a"
 $D -c "CREATE TABLE t4_a (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
-$D -c "CREATE SUBSCRIPTION t4_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t4_pub WITH (mpp=on, slot_name='t4_slot')" 2>&1 | grep -vE '^NOTICE|^WARNING|^$' | head -3
+$D -c "CREATE SUBSCRIPTION t4_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t4_pub WITH (slot_name='t4_slot')" 2>&1 | grep -vE '^NOTICE|^WARNING|^$' | head -3
 wait_match t4_a "id||'|'||v" 60 || fail "phase 1 t4_a"
 
 # ------------------------------------------------------------------ phase 2

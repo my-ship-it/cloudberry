@@ -20,8 +20,8 @@
  *	  the ones that are about the subscription rather than the mechanism
  *	  (enabled, copy_data, unsupported_tables) are taken out of the statement
  *	  and acted on here.
- *	  "WITH (mpp = false)" asks for a subscription of the server's own kind,
- *	  which this file then leaves entirely alone.
+ *	  There is no option to ask for a subscription of the server's own kind:
+ *	  where this module is loaded, every subscription is applied by it.
  *
  * 2. The launcher.  A background worker registered at postmaster start,
  *	  which polls this extension's own registry (mpp_subscription) on the
@@ -857,33 +857,25 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 		CreateSubscriptionStmt *stmt = (CreateSubscriptionStmt *) parsetree;
 		List	   *keep = NIL;
 		ListCell   *lc;
-		bool		is_mpp = true;	/* the module is loaded: this one is ours */
 		bool		has_slot = false;
 		bool		enabled = true;
 		bool		copy_data = true;
-		bool		has_unsupported = false;
 		LrUnsupportedTables unsupported = LR_UNSUPPORTED_ERROR;
 
 		/*
-		 * Options the module owns are taken out of the statement here, and
-		 * acted on below rather than by the server.  The server must not see
-		 * them: it would either not understand them (mpp), or understand them
-		 * as instructions to do the very things the module replaces.
+		 * Every subscription created where this module is loaded is applied
+		 * by it; there is no option for that and no way to ask for one of the
+		 * server's own, which on Cloudberry would write its rows on the
+		 * coordinator where no user table has any.
+		 *
+		 * The options the module owns are taken out of the statement here and
+		 * acted on below rather than by the server, which would understand
+		 * them as instructions to do the very things the module replaces.
 		 */
 		foreach(lc, stmt->options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc);
 
-			if (strcmp(def->defname, "mpp") == 0)
-			{
-				/*
-				 * Not needed any more -- a loaded module means an MPP
-				 * subscription -- but still accepted, and "mpp = false" is
-				 * how to ask for a subscription of the server's own kind.
-				 */
-				is_mpp = defGetBoolean(def);
-				continue;
-			}
 			if (strcmp(def->defname, "slot_name") == 0)
 			{
 				has_slot = (def->arg != NULL &&
@@ -911,13 +903,11 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("\"unsupported_tables\" must be \"error\" or \"snapshot\""),
 							 errdetail("\"error\" refuses a published table whose changes the publisher cannot decode; \"snapshot\" copies it once and stops tracking it.")));
-				has_unsupported = true;
 				continue;
 			}
 			keep = lappend(keep, def);
 		}
 
-		if (is_mpp)
 		{
 			ListCell   *lc2;
 
@@ -978,16 +968,6 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 			 * the worker streams at once instead of copying.
 			 */
 			created_nocopy = !copy_data;
-		}
-		else
-		{
-			/* "mpp = false": the server's own, untouched */
-			if (has_unsupported)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("\"unsupported_tables\" is only accepted for a subscription applied by mpp_logicalrep"),
-						 errhint("Leave out \"mpp = false\".")));
-			stmt->options = keep;
 		}
 	}
 	else if (dispatch && IsA(parsetree, AlterSubscriptionStmt))

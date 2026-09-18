@@ -42,10 +42,12 @@ CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
 CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
     WITH (slot_name = 'x', enabled = false, unsupported_tables = 'maybe');
 
--- and it is meaningless on a subscription the module does not apply
+-- there is no option for asking the server to apply a subscription itself:
+-- a loaded module means every subscription here is the module's
 CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
-    WITH (mpp = false, slot_name = NONE, connect = false,
-          unsupported_tables = 'snapshot');
+    WITH (mpp = false, slot_name = 'x', enabled = false);
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (mpp, slot_name = 'x', enabled = false);
 
 -- ------------------------------------------------------------------
 -- what a good one leaves behind
@@ -64,18 +66,10 @@ SELECT subenabled, subslotname, subconninfo IS NOT NULL AS has_conninfo
 SELECT subname, enabled, unsupported_tables, disable_reason
   FROM pg_catalog.gp_mpp_subscription WHERE subname = 's1';
 
--- WITH (mpp) is accepted and means nothing extra
+-- a second one, to show the registry holds one row per subscription
 CREATE SUBSCRIPTION s2 CONNECTION 'dbname=nowhere' PUBLICATION p
-    WITH (mpp, slot_name = 'slot_s2', enabled = false);
+    WITH (slot_name = 'slot_s2', enabled = false);
 SELECT subname, enabled FROM pg_catalog.gp_mpp_subscription WHERE subname = 's2';
-
--- WITH (mpp = false) asks for one of the server's own, which the module
--- neither rewrites nor claims
-CREATE SUBSCRIPTION s3 CONNECTION 'dbname=nowhere' PUBLICATION p
-    WITH (mpp = false, slot_name = NONE, connect = false);
-SELECT subname, subenabled FROM pg_subscription WHERE subname = 's3';
-SELECT count(*) AS claimed_by_the_module
-  FROM pg_catalog.gp_mpp_subscription WHERE subname = 's3';
 
 -- ------------------------------------------------------------------
 -- ALTER: the registry is what changes, not pg_subscription
@@ -104,8 +98,6 @@ SELECT count(*) AS state_rows FROM pg_catalog.gp_subscription_rel
  WHERE subid NOT IN (SELECT oid FROM pg_subscription);
 
 DROP SUBSCRIPTION s2;
-ALTER SUBSCRIPTION s3 SET (slot_name = NONE);
-DROP SUBSCRIPTION s3;
 -- pg_subscription is a shared catalog, so count only this test's own
 SELECT count(*) AS subscriptions_left
-  FROM pg_subscription WHERE subname IN ('s1', 's2', 's3');
+  FROM pg_subscription WHERE subname IN ('s1', 's2');

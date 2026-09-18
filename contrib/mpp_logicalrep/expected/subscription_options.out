@@ -56,12 +56,14 @@ CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
     WITH (slot_name = 'x', enabled = false, unsupported_tables = 'maybe');
 ERROR:  "unsupported_tables" must be "error" or "snapshot"
 DETAIL:  "error" refuses a published table whose changes the publisher cannot decode; "snapshot" copies it once and stops tracking it.
--- and it is meaningless on a subscription the module does not apply
+-- there is no option for asking the server to apply a subscription itself:
+-- a loaded module means every subscription here is the module's
 CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
-    WITH (mpp = false, slot_name = NONE, connect = false,
-          unsupported_tables = 'snapshot');
-ERROR:  "unsupported_tables" is only accepted for a subscription applied by mpp_logicalrep
-HINT:  Leave out "mpp = false".
+    WITH (mpp = false, slot_name = 'x', enabled = false);
+ERROR:  unrecognized subscription parameter: "mpp"
+CREATE SUBSCRIPTION s_bad CONNECTION 'dbname=nowhere' PUBLICATION p
+    WITH (mpp, slot_name = 'x', enabled = false);
+ERROR:  unrecognized subscription parameter: "mpp"
 -- ------------------------------------------------------------------
 -- what a good one leaves behind
 -- ------------------------------------------------------------------
@@ -86,30 +88,13 @@ SELECT subname, enabled, unsupported_tables, disable_reason
  s1      | f       | error              | 
 (1 row)
 
--- WITH (mpp) is accepted and means nothing extra
+-- a second one, to show the registry holds one row per subscription
 CREATE SUBSCRIPTION s2 CONNECTION 'dbname=nowhere' PUBLICATION p
-    WITH (mpp, slot_name = 'slot_s2', enabled = false);
+    WITH (slot_name = 'slot_s2', enabled = false);
 SELECT subname, enabled FROM pg_catalog.gp_mpp_subscription WHERE subname = 's2';
  subname | enabled 
 ---------+---------
  s2      | f
-(1 row)
-
--- WITH (mpp = false) asks for one of the server's own, which the module
--- neither rewrites nor claims
-CREATE SUBSCRIPTION s3 CONNECTION 'dbname=nowhere' PUBLICATION p
-    WITH (mpp = false, slot_name = NONE, connect = false);
-SELECT subname, subenabled FROM pg_subscription WHERE subname = 's3';
- subname | subenabled 
----------+------------
- s3      | f
-(1 row)
-
-SELECT count(*) AS claimed_by_the_module
-  FROM pg_catalog.gp_mpp_subscription WHERE subname = 's3';
- claimed_by_the_module 
------------------------
-                     0
 (1 row)
 
 -- ------------------------------------------------------------------
@@ -163,11 +148,9 @@ SELECT count(*) AS state_rows FROM pg_catalog.gp_subscription_rel
 (1 row)
 
 DROP SUBSCRIPTION s2;
-ALTER SUBSCRIPTION s3 SET (slot_name = NONE);
-DROP SUBSCRIPTION s3;
 -- pg_subscription is a shared catalog, so count only this test's own
 SELECT count(*) AS subscriptions_left
-  FROM pg_subscription WHERE subname IN ('s1', 's2', 's3');
+  FROM pg_subscription WHERE subname IN ('s1', 's2');
  subscriptions_left 
 --------------------
                   0

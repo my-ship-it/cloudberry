@@ -14,8 +14,7 @@
 #   5  the options the module owns are refused with a reason: connect (in
 #      either direction) and create_slot = true
 #   6  enabled = false creates the subscription without starting it
-#   7  mpp = false leaves the statement to the server, and the module's
-#      launcher keeps its hands off the result
+#   7  there is no mpp option: every subscription here is the module's
 #
 # Usage: subscription_ddl.sh [-s <port>]   (default 7100, target database lrdst)
 source ~/cloudberry-db-devel/cloudberry-env.sh 2>/dev/null
@@ -60,7 +59,7 @@ $Q -c "SELECT count(*) FROM pg_database WHERE datname='lrdst'" | grep -q 1 || $Q
 $D -c "DROP TABLE IF EXISTS r1_t" >/dev/null; $D -c "CREATE TABLE r1_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
 $Q -c "COPY r1_t TO STDOUT" | $D -c "COPY r1_t FROM STDIN"
 echo "source=$($Q -c 'SELECT count(*) FROM r1_t') target=$($D -c 'SELECT count(*) FROM r1_t')"
-echo "==== CREATE SUBSCRIPTION ... WITH (mpp) in a transaction block (allowed: nothing connects)"
+echo "==== CREATE SUBSCRIPTION ... in a transaction block (allowed: nothing connects)"
 for sub in r1_sub r1_off r1_stock; do
   $D -c "ALTER SUBSCRIPTION $sub SET (slot_name = NONE)" >/dev/null 2>&1
   $D -c "DROP SUBSCRIPTION IF EXISTS $sub" >/dev/null 2>&1
@@ -121,21 +120,16 @@ n=$(settled_workers) \
   || fail "workers settled at $n, expected one per enabled registry row"
 $D -c "DROP SUBSCRIPTION r1_off" >/dev/null 2>&1
 
-echo; echo "==== mpp = false is left to the server, and the module ignores it"
+echo; echo "==== there is no mpp option: a loaded module applies every subscription"
 $D -c "DROP SUBSCRIPTION IF EXISTS r1_stock" >/dev/null 2>&1
-# a slot name of its own: dropping a subscription of the server's kind goes
-# to the publisher to drop the slot, which must not be the running one's
-$D -c "CREATE SUBSCRIPTION r1_stock CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (mpp=false, connect=false, slot_name='r1_stock_slot')" 2>&1 | grep -vE '^NOTICE|^DETAIL|^HINT|^$' | head -2
-[ "$($D -c "SELECT count(*) FROM pg_catalog.gp_mpp_subscription WHERE subname='r1_stock'")" = "0" ] \
-  && ok "no registry row: the module did not claim it" || fail "the module claimed an mpp = false subscription"
-# the launcher does look at every disabled subscription that names a slot; the
-# worker it starts must find no registry row, disown it and go, leaving only
-# the running subscription's own worker behind
-n=$(settled_workers) \
-  && ok "no worker of its own was left running" \
-  || fail "workers settled at $n, expected one per enabled registry row"
-$D -c "ALTER SUBSCRIPTION r1_stock SET (slot_name = NONE)" >/dev/null 2>&1
-$D -c "DROP SUBSCRIPTION r1_stock" >/dev/null 2>&1
+msg=$($D -c "CREATE SUBSCRIPTION r1_stock CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r1_pub WITH (mpp=false, slot_name='r1_stock_slot')" 2>&1 | grep '^ERROR' | head -1)
+case "$msg" in
+  *'unrecognized subscription parameter'*mpp*) ok "\"mpp\" is not a subscription parameter" ;;
+  "")  fail "mpp = false was accepted" ;;
+  *)   fail "mpp = false gave: $msg" ;;
+esac
+[ "$($D -c "SELECT count(*) FROM pg_subscription WHERE subname='r1_stock'")" = "0" ] \
+  && ok "and nothing was created" || fail "a subscription was left behind"
 
 echo; echo "==== worker log"
 f=$(ls -t "$($Q -c 'SHOW data_directory')"/log/*.csv | head -1)

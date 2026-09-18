@@ -49,7 +49,7 @@ $Q -c "CREATE PUBLICATION r8p_pub FOR TABLE r8p"
 $D -c "CREATE TABLE r8p (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
 $Q -c "COPY r8p TO STDOUT" | $D -c "COPY r8p FROM STDIN"
 $Q -c "SELECT count(*) FROM gp_create_logical_replication_slot('r8p_slot','pgoutput',false,true)" >/dev/null
-$D -c "CREATE SUBSCRIPTION r8p_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r8p_pub WITH (mpp=on, slot_name='r8p_slot', copy_data=false)" 2>&1 | grep -E '^ERROR'
+$D -c "CREATE SUBSCRIPTION r8p_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r8p_pub WITH (slot_name='r8p_slot', copy_data=false)" 2>&1 | grep -E '^ERROR'
 sleep 3
 $Q -c "UPDATE r8p SET v='warm' WHERE id=1" >/dev/null; wait_match >/dev/null
 

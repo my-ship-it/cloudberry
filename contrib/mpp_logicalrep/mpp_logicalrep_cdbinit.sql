@@ -16,7 +16,7 @@
 
 -- Subscriptions this module owns.
 --
--- CREATE SUBSCRIPTION ... WITH (mpp) is caught by the utility hook, which
+-- CREATE SUBSCRIPTION is caught by the utility hook, which
 -- lets the statement through without the option (and without connecting, so
 -- the server's own launcher never starts a stock apply worker for it) and
 -- records the subscription here.  This table, not pg_subscription.subenabled,

@@ -161,9 +161,11 @@ reason rather than silently overridden:
     create_slot      the slots are cluster-wide and only
                      gp_create_logical_replication_slot() can make them
 
-WITH (mpp) is still accepted and means nothing extra.  WITH (mpp = false)
-is the way to ask for a subscription of the server's own kind, which the
-module then leaves entirely alone.
+There is no option for asking the server to apply a subscription itself.
+Where this module is loaded every subscription is applied by it, and where
+it is not the server behaves as it always did.  A subscription of the
+server's own kind would write its rows on the coordinator, where no user
+table has any, so there is nothing to choose between.
 
 DROP SUBSCRIPTION does not touch the publisher: the slots were not the
 module's to create and are not its to drop, which is also what lets the

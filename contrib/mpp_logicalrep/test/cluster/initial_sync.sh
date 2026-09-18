@@ -1,5 +1,5 @@
 #!/bin/bash
-# CREATE SUBSCRIPTION ... WITH (mpp) drives the initial sync
+# CREATE SUBSCRIPTION drives the initial sync
 # itself (mpp_tablesync.c): slots -> barrier -> cut point -> segment-to-segment
 # COPY (T1/T2 transport) -> streaming with the DS_t filter.
 #
@@ -87,7 +87,7 @@ done ) &
 WL=$!
 sleep 3
 echo "-- CREATE SUBSCRIPTION (enabled, copy_data default) while the workload runs"
-$D -c "CREATE SUBSCRIPTION t3_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t3_pub WITH (mpp=on, slot_name='t3_slot')" 2>&1 | grep -v '^NOTICE\|^WARNING\|^$' | head -3
+$D -c "CREATE SUBSCRIPTION t3_sub CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t3_pub WITH (slot_name='t3_slot')" 2>&1 | grep -v '^NOTICE\|^WARNING\|^$' | head -3
 wait $WL; echo "-- workload done"
 wait_match t3_a "id||'|'||v" 60 || fail "phase 1 t3_a"
 wait_match t3_b "id||'|'||v||'|'||w" 30 || fail "phase 1 t3_b"
@@ -121,7 +121,7 @@ $Q -c "CREATE PUBLICATION t3_pub2 FOR TABLE t3_c"
 $D -c "CREATE TABLE t3_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
 $Q -c "COPY t3_c TO STDOUT" | $D -c "COPY t3_c FROM STDIN"
 echo "-- pre-created slots (user's job with copy_data=false): $($Q -c "SELECT count(*) FROM gp_create_logical_replication_slot('t3_slot2','pgoutput',false,true)")"
-$D -c "CREATE SUBSCRIPTION t3_sub2 CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t3_pub2 WITH (mpp=on, slot_name='t3_slot2', copy_data=false)" 2>&1 | grep -v '^NOTICE\|^WARNING\|^$' | head -3
+$D -c "CREATE SUBSCRIPTION t3_sub2 CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t3_pub2 WITH (slot_name='t3_slot2', copy_data=false)" 2>&1 | grep -v '^NOTICE\|^WARNING\|^$' | head -3
 SUB2=$($D -c "SELECT oid FROM pg_subscription WHERE subname='t3_sub2'")
 echo "-- marker written by CREATE: $($D -c "SELECT relid||':'||state::text FROM pg_catalog.gp_subscription_rel WHERE subid=$SUB2")"
 sleep 2
@@ -144,7 +144,7 @@ $Q -c "INSERT INTO t3_big2 SELECT g, md5(g::text) FROM generate_series(1,1500000
 $Q -c "CREATE PUBLICATION t3_pub3 FOR TABLE t3_big1, t3_big2"
 $D -c "CREATE TABLE t3_big1 (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
 $D -c "CREATE TABLE t3_big2 (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
-$D -c "CREATE SUBSCRIPTION t3_sub3 CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t3_pub3 WITH (mpp=on, slot_name='t3_slot3')" 2>&1 | grep -v '^NOTICE\|^WARNING\|^$' | head -3
+$D -c "CREATE SUBSCRIPTION t3_sub3 CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION t3_pub3 WITH (slot_name='t3_slot3')" 2>&1 | grep -v '^NOTICE\|^WARNING\|^$' | head -3
 SUB3=$($D -c "SELECT oid FROM pg_subscription WHERE subname='t3_sub3'")
 # wait until the first table is being copied, then terminate the worker
 for k in $(seq 1 100); do

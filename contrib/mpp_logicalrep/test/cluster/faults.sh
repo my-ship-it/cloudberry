@@ -26,7 +26,7 @@ $Q -c "CREATE PUBLICATION r9_pub FOR TABLE r9_t"
 $Q -c "SELECT gp_segment_id FROM gp_create_logical_replication_slot('$SLOT','pgoutput',false,true)" >/dev/null
 $D -c "DROP TABLE IF EXISTS r9_t" >/dev/null; $D -c "CREATE TABLE r9_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
 $Q -c "COPY r9_t TO STDOUT" | $D -c "COPY r9_t FROM STDIN"
-$D -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r9_pub WITH (mpp, slot_name='$SLOT', copy_data=false, two_phase=on)" 2>&1 | tail -1
+$D -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION r9_pub WITH (slot_name='$SLOT', copy_data=false, two_phase=on)" 2>&1 | tail -1
 $D -c "ALTER SUBSCRIPTION $SUB ENABLE"; sleep 3
 echo "seed source=$(d postgres) target=$(d lrdst)"
 

@@ -86,9 +86,9 @@ CONN="CONNECTION 'host=localhost port=$PORT dbname=postgres' PUBLICATION $PUB"
 out=$($D -c "CREATE SUBSCRIPTION a1_nope $CONN WITH (slot_name='a1_nope', unsupported_tables='bogus')" 2>&1)
 echo "$out" | grep -q 'must be "error" or "snapshot"' \
   && ok "a bad value is refused" || fail "bad value accepted: $out"
-out=$($D -c "CREATE SUBSCRIPTION a1_nope $CONN WITH (mpp=false, slot_name='a1_nope', unsupported_tables='snapshot')" 2>&1)
-echo "$out" | grep -q 'only accepted for a subscription applied by mpp_logicalrep' \
-  && ok "refused on a subscription that is not ours" || fail "accepted with mpp=false: $out"
+out=$($D -c "CREATE SUBSCRIPTION a1_nope $CONN WITH (mpp=false, slot_name='a1_nope')" 2>&1)
+echo "$out" | grep -q 'unrecognized subscription parameter' \
+  && ok "there is no mpp option to opt out with" || fail "mpp = false was accepted: $out"
 
 # ------------------------------------------------------------------ phase 2
 echo; echo "==== 2. the default: the subscription refuses to run"

@@ -167,7 +167,7 @@ workload() {
 workload & WL=$!
 sleep 3
 echo "-- CREATE SUBSCRIPTION while the workload runs"
-$T -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$SRC_PORT dbname=$SRC_DB' PUBLICATION $PUB WITH (mpp=on, slot_name='$SLOT')" 2>&1 | grep -vE '^NOTICE|^WARNING|^$|^HINT' | head -3
+$T -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$SRC_PORT dbname=$SRC_DB' PUBLICATION $PUB WITH (slot_name='$SLOT')" 2>&1 | grep -vE '^NOTICE|^WARNING|^$|^HINT' | head -3
 
 # ------------------------------------------------------------------ faults
 echo; echo "==== 2-3. faults while the workload runs"

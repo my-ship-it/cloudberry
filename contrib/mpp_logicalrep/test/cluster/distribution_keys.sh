@@ -110,7 +110,7 @@ for t in dk_c dk_k; do
   $S -c "INSERT INTO $t SELECT g, g, 'seed' FROM generate_series(1,200) g" >/dev/null
 done
 $S -c "CREATE PUBLICATION $PUB FOR TABLE dk_c, dk_k" >/dev/null
-$T -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$SRC_PORT dbname=postgres' PUBLICATION $PUB WITH (mpp=on, slot_name='$SLOT')" 2>&1 | grep -vE '^NOTICE|^WARNING|^HINT|^$' | head -2
+$T -c "CREATE SUBSCRIPTION $SUB CONNECTION 'host=localhost port=$SRC_PORT dbname=postgres' PUBLICATION $PUB WITH (slot_name='$SLOT')" 2>&1 | grep -vE '^NOTICE|^WARNING|^HINT|^$' | head -2
 
 echo; echo "==== 1. initial sync"
 wait_match dk_c 60 || fail "dk_c initial sync"
