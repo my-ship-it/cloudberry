@@ -99,7 +99,7 @@ gp_lr_connect(PG_FUNCTION_ARGS)
 	char	   *spec = text_to_cstring(PG_GETARG_TEXT_PP(2));
 
 	check_privilege();
-	return run_plan(fcinfo, LR_PLAN_CONNECT, subid, token, spec, "gp_lr_connect");
+	return run_plan(fcinfo, LR_PLAN_CONNECT, subid, token, spec, "connect");
 }
 
 /*
@@ -137,7 +137,7 @@ gp_lr_drain(PG_FUNCTION_ARGS)
 	if (!PG_ARGISNULL(6))
 		append_text_list(&buf, "release_local", PG_GETARG_ARRAYTYPE_P(6));
 
-	return run_plan(fcinfo, LR_PLAN_DRAIN, subid, token, buf.data, "gp_lr_drain");
+	return run_plan(fcinfo, LR_PLAN_DRAIN, subid, token, buf.data, "drain");
 }
 
 /*
@@ -169,7 +169,7 @@ gp_lr_apply(PG_FUNCTION_ARGS)
 		append_oid_list(&buf, "defer", PG_GETARG_ARRAYTYPE_P(3));
 	if (!PG_ARGISNULL(4))
 		append_oid_list(&buf, "catchup", PG_GETARG_ARRAYTYPE_P(4));
-	return run_plan(fcinfo, LR_PLAN_APPLY, subid, token, buf.data, "gp_lr_apply");
+	return run_plan(fcinfo, LR_PLAN_APPLY, subid, token, buf.data, "apply");
 }
 
 /*
@@ -226,8 +226,17 @@ run_plan(FunctionCallInfo fcinfo, LrPlanMode mode, Oid subid, int64 token,
 
 	pstmt = LrBuildApplyPlan(&spec);
 
+	/*
+	 * This is what a segment reports as the query of the gang processes, and
+	 * those gangs are resident: they sit idle between drains for as long as
+	 * the subscription runs, looking like the QEs of an ordinary session that
+	 * has gone quiet.  Say whose they are, so that whoever finds them on a
+	 * segment can tell what they are before deciding what to do about them.
+	 */
 	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = LrExecuteApplyPlan(pstmt, &spec, fname,
+	rsinfo->setResult = LrExecuteApplyPlan(pstmt, &spec,
+										   psprintf("mpp_logicalrep %s, subscription %u",
+													fname, subid),
 										   rsinfo->econtext->ecxt_per_query_memory);
 	rsinfo->setDesc = tupdesc;
 	PG_RETURN_NULL();

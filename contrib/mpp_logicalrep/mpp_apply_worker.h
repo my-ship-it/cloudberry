@@ -22,6 +22,7 @@
 #define MPP_APPLY_WORKER_H
 
 #include "datatype/timestamp.h"
+#include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 
 /*
@@ -227,6 +228,8 @@ typedef struct LrWorkerArg
 	Oid			dbid;
 	Oid			subid;
 	Oid			userid;
+	NameData	subname;		/* for what ps shows; the worker reads the
+								 * catalog for everything it acts on */
 } LrWorkerArg;
 
 /* Background-worker entry point (the launcher in mpp_logicalrep.c) */

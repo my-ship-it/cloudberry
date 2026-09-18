@@ -1482,6 +1482,7 @@ launch_due_workers(void)
 		arg->dbid = subform->subdbid;
 		arg->subid = subform->oid;
 		arg->userid = subform->subowner;
+		namestrcpy(&arg->subname, NameStr(subform->subname));
 		due = lappend(due, arg);
 		MemoryContextSwitchTo(oldctx);
 	}
@@ -1494,7 +1495,7 @@ launch_due_workers(void)
 	{
 		LrWorkerArg *arg = (LrWorkerArg *) lfirst(lc);
 
-		launch_worker(arg->dbid, arg->subid, arg->userid, "mpp");
+		launch_worker(arg->dbid, arg->subid, arg->userid, NameStr(arg->subname));
 		pfree(arg);
 	}
 	list_free(due);
