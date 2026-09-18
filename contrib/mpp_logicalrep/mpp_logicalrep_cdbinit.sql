@@ -21,11 +21,17 @@
 -- the server's own launcher never starts a stock apply worker for it) and
 -- records the subscription here.  This table, not pg_subscription.subenabled,
 -- says whether a worker should be running.
+--
+-- unsupported_tables says what to do about a published table whose changes
+-- the publisher cannot decode (anything that is not a heap table): 'error'
+-- refuses the table and names it, 'snapshot' copies it once and stops
+-- tracking it, which shows up as state 's' in gp_subscription_rel.
 CREATE TABLE gp_mpp_subscription (
     subid   oid NOT NULL,
     subname name NOT NULL,
     enabled boolean NOT NULL DEFAULT true,
-    disable_reason text
+    disable_reason text,
+    unsupported_tables text NOT NULL DEFAULT 'error'
 );
 DELETE FROM gp_distribution_policy WHERE localoid = 'gp_mpp_subscription'::regclass;
 CREATE UNIQUE INDEX gp_mpp_subscription_subid_index ON gp_mpp_subscription (subid);
@@ -57,7 +63,9 @@ CREATE UNIQUE INDEX gp_subscription_applied_index
 CREATE TABLE gp_subscription_rel (
     subid         oid NOT NULL,
     relid         oid NOT NULL,
-    state         "char" NOT NULL,         -- i init, d data copy, f finished copy, c catch-up, r ready
+    state         "char" NOT NULL,         -- i init, d data copy, f finished copy, c catch-up, r ready,
+                                           -- s copied once and not tracked
+                                           -- (see gp_mpp_subscription.unsupported_tables)
     sync_lsn      pg_lsn,
     sync_snapshot text,
     copy_job      text

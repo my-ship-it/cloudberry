@@ -47,6 +47,20 @@ typedef enum LrApplyErrorAction
 	LR_APPLY_ERROR_RETRY		/* keep trying (the old behaviour) */
 } LrApplyErrorAction;
 
+/*
+ * What to do about a table of the publication whose changes the publisher
+ * cannot decode.  Only heap tables produce logical decoding output: the
+ * append-optimised access methods have no decoding routine at all
+ * (appendonly_decode() is empty), and neither has PAX.  Such a table would
+ * be copied by the initial synchronisation and then never change again,
+ * without a single error anywhere -- which is why refusing is the default.
+ */
+typedef enum LrUnsupportedTables
+{
+	LR_UNSUPPORTED_ERROR = 0,	/* refuse the subscription, name the table */
+	LR_UNSUPPORTED_SNAPSHOT		/* copy it once, mark it 's', do not track */
+} LrUnsupportedTables;
+
 /* GUCs (guc_gp.c) */
 extern int	gp_lr_slot_loss_action;
 extern int	gp_lr_apply_error_action;
@@ -120,6 +134,8 @@ extern bool LrInitialSync(LrWorkerConfig *cfg);
 extern void LrSyncMarkNoCopy(Oid subid);
 extern void LrSyncCleanup(Oid subid);
 extern void LrSyncRefresh(Oid subid, List *relids, bool copy_data);
+extern bool LrUnsupportedTablesParse(const char *value, LrUnsupportedTables *mode);
+extern const char *LrUnsupportedTablesName(LrUnsupportedTables mode);
 
 /*
  * Incremental synchronisation of tables added to a running subscription

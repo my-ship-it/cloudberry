@@ -29,7 +29,10 @@
  *   progress, 'r' when the streaming phase may run (sync_snapshot holds
  *   DS_t for restarts).  copy_data=false at CREATE SUBSCRIPTION writes the
  *   marker as 'r' at once, so no COPY ever happens.
- *   relid > 0 rows track each table: i -> d -> f -> r.
+ *   relid > 0 rows track each table: i -> d -> f -> r.  A table the source
+ *   cannot decode (anything but heap) ends at 's' instead of 'r' when the
+ *   subscription asked for unsupported_tables = 'snapshot': copied once, and
+ *   never looked at again (work item A1).
  *
  * Failure anywhere before the final commit leaves the marker at 'd'; the
  * next start truncates the listed tables and redoes the sync from S1 under
@@ -85,6 +88,9 @@ typedef struct LrSyncRel
 								 * every segment holds every row, so the
 								 * segment-to-segment transport would send each
 								 * row once per segment (section 10.4) */
+	bool		tracked;		/* false: the source table's changes are never
+								 * decoded, so the copy is all there will ever
+								 * be -- state 's' (work item A1) */
 } LrSyncRel;
 
 /* where an incremental job stands between two calls of LrSyncAddStep() */
@@ -111,6 +117,8 @@ typedef struct LrSync
 	bool		crc;
 
 	List	   *rels;			/* LrSyncRel* */
+	LrUnsupportedTables unsupported;	/* what to do about a table whose
+										 * changes the source cannot decode */
 
 	/* cut point */
 	char	   *lt;				/* L_t as text */
@@ -148,7 +156,10 @@ static void sync_fetch_pending(LrSync *s);
 static void sync_finish_rels(LrSync *s);
 static void add_start_body(LrSync *s);
 static void sync_fill_columns(LrSync *s, LrSyncRel *r);
-static void sync_fill_policy(LrSync *s, LrSyncRel *r);
+static void sync_fill_source_info(LrSync *s, LrSyncRel *r);
+static void sync_read_unsupported_mode(LrSync *s);
+static void sync_report_unsupported(LrSync *s, LrSyncRel *r, const char *am);
+static void sync_mark_untracked(LrSync *s);
 static void sync_check_keys(LrSync *s, LrSyncRel *r);
 static void copy_via_coordinators(LrSync *s, LrSyncRel *r);
 static void sync_set_rel_state(LrSync *s, Oid relid, char state, const char *job);
@@ -277,11 +288,23 @@ sync_exec(LrSync *s, PGconn *conn, const char *who, const char *sql,
 		 PQresultStatus(res) != PGRES_COMMAND_OK))
 	{
 		char	   *msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(conn));
+		const char *state = res ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : NULL;
+		int			code = ERRCODE_CONNECTION_EXCEPTION;
+
+		/*
+		 * Carry the far side's own SQLSTATE over: every statement of the
+		 * synchronisation comes back through here, and calling all of them
+		 * connection failures would tell run_initial_sync() that every one of
+		 * them can pass on its own (O6).  Only a failure with no result at
+		 * all really is one.
+		 */
+		if (state != NULL && strlen(state) == 5)
+			code = MAKE_SQLSTATE(state[0], state[1], state[2], state[3], state[4]);
 
 		if (res)
 			PQclear(res);
 		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				(errcode(code),
 				 errmsg("initial sync, %s: %s", who, msg),
 				 errcontext("statement: %.300s", sql)));
 	}
@@ -587,19 +610,146 @@ sync_check_keys(LrSync *s, LrSyncRel *r)
 				 errhint("Include those columns in the target's replica identity, or distribute both sides by the same columns. Changes that leave the source's distribution key alone are not affected.")));
 }
 
-/* is the source table DISTRIBUTED REPLICATED? */
+/*
+ * What this subscription wants done about a table the source cannot decode
+ * (work item A1).  Read from the module's own registry rather than carried
+ * in the worker's config, so that ALTER SUBSCRIPTION ... SET is in force for
+ * the next table list, added tables included.
+ */
 static void
-sync_fill_policy(LrSync *s, LrSyncRel *r)
+sync_read_unsupported_mode(LrSync *s)
+{
+	char		subid[16];
+	const char *params[1] = {subid};
+	PGresult   *res;
+
+	s->unsupported = LR_UNSUPPORTED_ERROR;
+	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
+	res = sync_exec(s, s->tgt2, "target",
+					"SELECT unsupported_tables FROM pg_catalog.gp_mpp_subscription"
+					" WHERE subid = $1",
+					1, params);
+	/* no row: not one of ours to begin with, so the strict default stands */
+	if (PQntuples(res) == 1)
+		(void) LrUnsupportedTablesParse(PQgetvalue(res, 0, 0), &s->unsupported);
+	PQclear(res);
+}
+
+/*
+ * The source table is not a heap table, so nothing it does will ever reach
+ * the stream: the publisher has no decoding routine for it.  Say so while
+ * the publication can still be changed -- the alternative is a table that
+ * looks replicated, never errors, and quietly stops being true after the
+ * initial copy.
+ */
+static void
+sync_report_unsupported(LrSync *s, LrSyncRel *r, const char *am)
+{
+	if (s->unsupported == LR_UNSUPPORTED_ERROR)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("logical replication: source relation %s uses access method \"%s\", whose changes are not decoded",
+						r->qualified, am),
+				 errdetail("Only heap tables produce logical decoding output on the publisher. This table would be copied once and then never change again, with no error to show for it."),
+				 errhint("Leave it out of the publication, or accept the one-time copy with ALTER SUBSCRIPTION %s SET (unsupported_tables = 'snapshot').",
+						 quote_identifier(s->cfg->subname ? s->cfg->subname : "?"))));
+
+	ereport(WARNING,
+			(errmsg("logical replication: source relation %s uses access method \"%s\", whose changes are not decoded",
+					r->qualified, am),
+			 errdetail("It is copied once, as of this subscription's cut point, and then left alone: changes made on the publisher afterwards never reach this target."),
+			 errhint("gp_subscription_rel records it in state 's'.")));
+	r->tracked = false;
+}
+
+/*
+ * The source side of one table: is it DISTRIBUTED REPLICATED (which decides
+ * how it is copied), and can its changes be decoded at all?
+ */
+static void
+sync_fill_source_info(LrSync *s, LrSyncRel *r)
 {
 	const char *params[1] = {r->qualified};
 	PGresult   *res;
 
 	sync_connect_source(s);		/* the pending-table path has not yet */
+	r->tracked = true;
 	res = sync_exec(s, s->src, "source",
-					"SELECT policytype FROM gp_distribution_policy WHERE localoid = $1::regclass",
+					"SELECT coalesce(p.policytype::text, ''), coalesce(am.amname, '')\n"
+					"  FROM pg_class c\n"
+					"  LEFT JOIN gp_distribution_policy p ON p.localoid = c.oid\n"
+					"  LEFT JOIN pg_am am ON am.oid = c.relam\n"
+					" WHERE c.oid = to_regclass($1)",
 					1, params);
-	r->replicated = (PQntuples(res) == 1 && PQgetvalue(res, 0, 0)[0] == 'r');
+	if (PQntuples(res) == 1)
+	{
+		char	   *am = pstrdup(PQgetvalue(res, 0, 1));
+
+		r->replicated = (PQgetvalue(res, 0, 0)[0] == 'r');
+		if (strcmp(am, "heap") != 0)
+			sync_report_unsupported(s, r, *am ? am : "none");
+	}
 	PQclear(res);
+}
+
+/* the untracked tables of this job -> 's' (they are done, not ready) */
+static void
+sync_mark_untracked(LrSync *s)
+{
+	char		subid[16];
+	StringInfoData oids;
+	const char *params[2] = {subid, NULL};
+	ListCell   *lc;
+
+	initStringInfo(&oids);
+	foreach(lc, s->rels)
+	{
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+		if (!r->tracked)
+			appendStringInfo(&oids, "%s%u", oids.len ? "," : "{", r->relid);
+	}
+	if (oids.len == 0)
+	{
+		pfree(oids.data);
+		return;
+	}
+	appendStringInfoChar(&oids, '}');
+
+	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
+	params[1] = oids.data;
+	PQclear(sync_exec(s, s->tgt2, "target",
+					  "UPDATE pg_catalog.gp_subscription_rel SET state = 's'"
+					  " WHERE subid = $1 AND relid = ANY ($2::oid[])",
+					  2, params));
+	pfree(oids.data);
+}
+
+/*
+ * The two spellings of unsupported_tables, shared with the utility hook.
+ */
+bool
+LrUnsupportedTablesParse(const char *value, LrUnsupportedTables *mode)
+{
+	if (value == NULL)
+		return false;
+	if (pg_strcasecmp(value, "error") == 0)
+	{
+		*mode = LR_UNSUPPORTED_ERROR;
+		return true;
+	}
+	if (pg_strcasecmp(value, "snapshot") == 0)
+	{
+		*mode = LR_UNSUPPORTED_SNAPSHOT;
+		return true;
+	}
+	return false;
+}
+
+const char *
+LrUnsupportedTablesName(LrUnsupportedTables mode)
+{
+	return mode == LR_UNSUPPORTED_SNAPSHOT ? "snapshot" : "error";
 }
 
 /*
@@ -722,7 +872,8 @@ copy_via_coordinators(LrSync *s, LrSyncRel *r)
 }
 
 /*
- * The tables of this subscription that are not ready yet (state <> 'r'):
+ * The tables of this subscription that are not ready yet (state 'i', 'd'
+ * or 'f'; 'r' is streaming and 's' is a copy nobody tracks):
  * added by ALTER SUBSCRIPTION ... REFRESH PUBLICATION ('i'), or left behind
  * by an interrupted incremental job ('d'/'f').  Both are (re)copied under a
  * fresh cut point, so the rows of an interrupted copy are truncated first.
@@ -735,12 +886,13 @@ sync_fetch_pending(LrSync *s)
 	PGresult   *res;
 
 	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
+	sync_read_unsupported_mode(s);
 	res = sync_exec(s, s->tgt2, "target",
 					"SELECT r.relid, quote_ident(n.nspname) || '.' || quote_ident(c.relname)\n"
 					"  FROM pg_catalog.gp_subscription_rel r\n"
 					"  JOIN pg_class c ON c.oid = r.relid\n"
 					"  JOIN pg_namespace n ON n.oid = c.relnamespace\n"
-					" WHERE r.subid = $1 AND r.relid <> 0 AND r.state <> 'r'\n"
+					" WHERE r.subid = $1 AND r.relid <> 0 AND r.state NOT IN ('r', 's')\n"
 					" ORDER BY 2",
 					1, params);
 	for (int i = 0; i < PQntuples(res); i++)
@@ -750,8 +902,9 @@ sync_fetch_pending(LrSync *s)
 		r->relid = (Oid) strtoul(PQgetvalue(res, i, 0), NULL, 10);
 		r->qualified = pstrdup(PQgetvalue(res, i, 1));
 		sync_fill_columns(s, r);
-		sync_fill_policy(s, r);
-		sync_check_keys(s, r);
+		sync_fill_source_info(s, r);
+		if (r->tracked)
+			sync_check_keys(s, r);
 		s->rels = lappend(s->rels, r);
 	}
 	PQclear(res);
@@ -770,6 +923,7 @@ sync_fetch_tables(LrSync *s)
 	PGresult   *res;
 
 	sync_connect_source(s);
+	sync_read_unsupported_mode(s);
 
 	initStringInfo(&pubs);
 	foreach(lc, s->cfg->publications)
@@ -820,8 +974,9 @@ sync_fetch_tables(LrSync *s)
 		r->collist = pstrdup(PQgetvalue(tres, 0, 1));
 		r->coldefs = pstrdup(PQgetvalue(tres, 0, 2));
 		PQclear(tres);
-		sync_fill_policy(s, r);
-		sync_check_keys(s, r);
+		sync_fill_source_info(s, r);
+		if (r->tracked)
+			sync_check_keys(s, r);
 		s->rels = lappend(s->rels, r);
 	}
 	PQclear(res);
@@ -905,10 +1060,13 @@ sync_finish(LrSync *s)
 	const char *params[3] = {subid, s->lt, s->ds_text};
 
 	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
+	PQclear(sync_exec(s, s->tgt2, "target", "BEGIN", 0, NULL));
 	PQclear(sync_exec(s, s->tgt2, "target",
 					  "UPDATE pg_catalog.gp_subscription_rel SET state = 'r', sync_lsn = $2::pg_lsn, "
 					  "sync_snapshot = $3, copy_job = NULL WHERE subid = $1",
 					  3, params));
+	sync_mark_untracked(s);
+	PQclear(sync_exec(s, s->tgt2, "target", "COMMIT", 0, NULL));
 }
 
 /* ------------------------------------------------------------------------
@@ -1401,7 +1559,7 @@ LrSyncPendingNames(PGconn *qd, Oid subid)
 					   "  FROM pg_catalog.gp_subscription_rel r"
 					   "  JOIN pg_class c ON c.oid = r.relid"
 					   "  JOIN pg_namespace n ON n.oid = c.relnamespace"
-					   " WHERE r.subid = $1 AND r.relid <> 0 AND r.state <> 'r'"
+					   " WHERE r.subid = $1 AND r.relid <> 0 AND r.state NOT IN ('r', 's')"
 					   " ORDER BY 1",
 					   1, NULL, params, NULL, NULL, 0);
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -1627,13 +1785,14 @@ LrSyncAddNames(LrSync *s)
 	return names;
 }
 
-/* every table of this job -> 'r' with the cut point */
+/* every table of this job -> 'r' with the cut point ('s' if untracked) */
 static void
 sync_finish_rels(LrSync *s)
 {
 	char		subid[16];
 	char		relid[16];
-	const char *params[4] = {subid, relid, s->lt, s->ds_text};
+	char		state[2];
+	const char *params[5] = {subid, relid, s->lt, s->ds_text, state};
 	ListCell   *lc;
 
 	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
@@ -1643,10 +1802,12 @@ sync_finish_rels(LrSync *s)
 		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
 
 		snprintf(relid, sizeof(relid), "%u", r->relid);
+		state[0] = r->tracked ? 'r' : 's';
+		state[1] = '\0';
 		PQclear(sync_exec(s, s->tgt2, "target",
-						  "UPDATE pg_catalog.gp_subscription_rel SET state = 'r', sync_lsn = $3::pg_lsn, "
+						  "UPDATE pg_catalog.gp_subscription_rel SET state = $5, sync_lsn = $3::pg_lsn, "
 						  "sync_snapshot = $4, copy_job = NULL WHERE subid = $1 AND relid = $2",
-						  4, params));
+						  5, params));
 	}
 	PQclear(sync_exec(s, s->tgt2, "target", "COMMIT", 0, NULL));
 }

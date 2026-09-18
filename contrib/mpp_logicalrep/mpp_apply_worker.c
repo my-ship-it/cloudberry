@@ -233,6 +233,9 @@ static bool name_is_deferred(LrDriver *d, const char *name);
 static bool txn_is_deferred(LrDriver *d, List *rel_names);
 static void note_relnames(LrDriver *d, const char *relids, const char *names);
 static char *relid_set(LrDriver *d, List *names);
+static void lr_disable_subscription(LrCbdbTransport *tr, Oid subid,
+									const char *message);
+static void run_initial_sync(LrWorkerConfig *cfg, LrCbdbTransport *tr);
 
 /* ------------------------------------------------------------------------
  * Entry point
@@ -263,20 +266,21 @@ LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats)
 	mycfg = palloc(sizeof(LrWorkerConfig));
 	memcpy(mycfg, cfg, sizeof(LrWorkerConfig));
 
-	/*
-	 * Initial synchronisation (design section 10) runs first, over its own
-	 * connections; only when gp_subscription_rel marks the subscription as
-	 * ready does the streaming phase below begin.  Errors here end the run
-	 * (the launcher restarts the worker, which redoes the sync).
-	 */
-	if (mycfg->initial_sync)
-		(void) LrInitialSync(mycfg);
-
 	tr = palloc0(sizeof(LrCbdbTransport));
 	tr->conninfo = mycfg->target_conninfo;
 	tr->subid = mycfg->subid;
 	tr->token = mycfg->token;
 	tr->stats = stats;
+
+	/*
+	 * Initial synchronisation (design section 10) runs first, over its own
+	 * connections; only when gp_subscription_rel marks the subscription as
+	 * ready does the streaming phase below begin.  Errors here end the run;
+	 * whether the launcher then restarts the worker is decided the same way
+	 * the streaming loop decides whether to replay (work item O6).
+	 */
+	if (mycfg->initial_sync)
+		run_initial_sync(mycfg, tr);
 
 	sink = LrMakeCbdbSink(tr);
 	assembly = LrMakeCbdbAssembly(tr, mycfg, stats);
@@ -285,6 +289,114 @@ LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats)
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
+}
+
+/*
+ * Disable the subscription in the extension's registry over the target
+ * session, so that the launcher does not start the worker again.  (Its
+ * pg_subscription row is disabled from the start -- that is what keeps the
+ * server's own launcher off it -- so ALTER SUBSCRIPTION would say nothing
+ * here.)  Failing to do so is not worth another error: the caller's message
+ * is the one that matters.
+ */
+static void
+lr_disable_subscription(LrCbdbTransport *tr, Oid subid, const char *message)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		char	   *sql;
+
+		if (tr->qd == NULL)
+			LrTransportConnect(tr);
+		sql = psprintf("UPDATE pg_catalog.gp_mpp_subscription "
+					   "SET enabled = false, disable_reason = %s "
+					   "WHERE subid = %u",
+					   quote_literal_cstr(message), subid);
+		PQclear(LrTransportExec(tr, sql));
+		pfree(sql);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		elog(LOG, "mpp apply worker: could not disable subscription %u", subid);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Errors of the initial synchronisation that no restart can get past, because
+ * they are about what the two sides are rather than about what happened.
+ *
+ * This is a list of the certain ones, not the complement of the transient
+ * ones the streaming loop uses: there the price of guessing wrong is one
+ * replay out of gp_lr_apply_max_retries, here it is a subscription disabled
+ * over what may have been a gang reset (which arrives as 58M01, in no
+ * transient class).  Anything not listed keeps the old behaviour -- the
+ * worker exits and the launcher starts it again, which redoes the sync.
+ */
+static bool
+sync_error_is_permanent(int sqlerrcode)
+{
+	switch (sqlerrcode)
+	{
+		case ERRCODE_FEATURE_NOT_SUPPORTED: /* an AM whose changes are not decoded */
+		case ERRCODE_UNDEFINED_TABLE:	/* a relation one side does not have */
+		case ERRCODE_UNDEFINED_COLUMN:
+		case ERRCODE_INVALID_PARAMETER_VALUE:
+		case ERRCODE_OBJECT_IN_USE:		/* the slots exist on some nodes only */
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The initial synchronisation, with a verdict on its errors like the one the
+ * streaming loop passes on its own (work item O6).  Retrying is the
+ * launcher's job here -- the worker exits and is started again -- and that is
+ * right for a lost connection or a reset gang.  It is not right for something
+ * the two sides do not agree on: a published table whose changes are not
+ * decoded, a relation the target does not have.  Those come back on every
+ * restart, and a worker restarted for ever is as quiet as no worker at all,
+ * so the subscription stops and says why instead.
+ */
+static void
+run_initial_sync(LrWorkerConfig *cfg, LrCbdbTransport *tr)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		(void) LrInitialSync(cfg);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		int			sqlerrcode;
+		char	   *message;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		sqlerrcode = edata->sqlerrcode;
+		message = pstrdup(edata->message ? edata->message : "");
+
+		if (!sync_error_is_permanent(sqlerrcode) ||
+			gp_lr_apply_error_action == LR_APPLY_ERROR_RETRY)
+			ReThrowError(edata);
+
+		FreeErrorData(edata);
+		lr_disable_subscription(tr, cfg->subid, message);
+		ereport(ERROR,
+				(errcode(sqlerrcode),
+				 errmsg("%s", message),
+				 errdetail("The initial synchronisation of subscription %u cannot succeed as things stand, so the subscription has been disabled rather than restarted for ever.",
+						   cfg->subid),
+				 errhint("Fix what the message names and re-enable the subscription, or set mpp_logicalrep.apply_error_action=retry to keep trying.")));
+	}
+	PG_END_TRY();
 }
 
 /* ------------------------------------------------------------------------
@@ -2288,47 +2400,17 @@ assembly_handle_error(LogicalRepAssembly *self, int sqlerrcode, const char *mess
 			ereport(WARNING,
 					(errmsg("mpp apply worker: subscription %u has failed %d times without applying anything: %s",
 							d->cfg->subid, d->stuck_errors, message),
-					 errhint("The error is not one that passes on its own. Set gp_lr_apply_error_action=disable to stop the subscription instead of retrying.")));
+					 errhint("The error is not one that passes on its own. Set mpp_logicalrep.apply_error_action=disable to stop the subscription instead of retrying.")));
 		return true;
 	}
 
-	/*
-	 * Disable the subscription in the extension's registry over the target
-	 * session, so that the launcher does not start the worker again.  (Its
-	 * pg_subscription row is disabled from the start -- that is what keeps
-	 * the server's own launcher off it -- so ALTER SUBSCRIPTION would say
-	 * nothing here.)  Failing to do so is not worth another error: the
-	 * message below is the one that matters.
-	 */
-	{
-		PG_TRY();
-		{
-			char	   *sql;
-
-			if (d->tr->qd == NULL)
-				LrTransportConnect(d->tr);
-			sql = psprintf("UPDATE pg_catalog.gp_mpp_subscription "
-						   "SET enabled = false, disable_reason = %s "
-						   "WHERE subid = %u",
-						   quote_literal_cstr(message), d->cfg->subid);
-			PQclear(LrTransportExec(d->tr, sql));
-			pfree(sql);
-		}
-		PG_CATCH();
-		{
-			MemoryContextSwitchTo(d->cxt);
-			FlushErrorState();
-			elog(LOG, "mpp apply worker: could not disable subscription %u",
-				 d->cfg->subid);
-		}
-		PG_END_TRY();
-	}
+	lr_disable_subscription(d->tr, d->cfg->subid, message);
 
 	ereport(WARNING,
 			(errmsg("mpp apply worker: subscription %u disabled after %d attempts: %s",
 					d->cfg->subid, d->stuck_errors, message),
 			 errdetail("The error came back on every replay, so nothing of the subscription was being applied."),
-			 errhint("Fix what the message names and re-enable the subscription, or set gp_lr_apply_error_action=retry to keep trying.")));
+			 errhint("Fix what the message names and re-enable the subscription, or set mpp_logicalrep.apply_error_action=retry to keep trying.")));
 	return false;
 }
 

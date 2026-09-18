@@ -18,7 +18,8 @@
  *	  any.  The options that say how to do the things the module replaces
  *	  (connect, create_slot) are therefore refused rather than obeyed, and
  *	  the ones that are about the subscription rather than the mechanism
- *	  (enabled, copy_data) are taken out of the statement and acted on here.
+ *	  (enabled, copy_data, unsupported_tables) are taken out of the statement
+ *	  and acted on here.
  *	  "WITH (mpp = false)" asks for a subscription of the server's own kind,
  *	  which this file then leaves entirely alone.
  *
@@ -525,6 +526,35 @@ registry_exec(const char *sql, int nargs, Oid *argtypes, Datum *values)
 }
 
 /*
+ * What this subscription wants done about published tables the publisher
+ * cannot decode.  The strict default also covers "no row yet".
+ */
+static LrUnsupportedTables
+registry_unsupported(Oid subid)
+{
+	LrUnsupportedTables mode = LR_UNSUPPORTED_ERROR;
+	Oid			argtypes[1] = {OIDOID};
+	Datum		values[1] = {ObjectIdGetDatum(subid)};
+	int			ret;
+
+	SPI_connect();
+	ret = SPI_execute_with_args("SELECT unsupported_tables FROM pg_catalog.gp_mpp_subscription"
+								" WHERE subid = $1",
+								1, argtypes, values, NULL, true, 1);
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+			(void) LrUnsupportedTablesParse(TextDatumGetCString(d), &mode);
+	}
+	SPI_finish();
+	return mode;
+}
+
+/*
  * The publication's table list, as relids of this database.  The stock
  * AlterSubscription_refresh() does this and then writes pg_subscription_rel;
  * here the state table is our own and the copying is the apply worker's job,
@@ -537,8 +567,9 @@ fetch_pub_relids(Subscription *sub)
 	WalRcvExecResult *res;
 	TupleTableSlot *slot;
 	StringInfoData cmd;
-	Oid			tableRow[2] = {TEXTOID, TEXTOID};
+	Oid			tableRow[3] = {TEXTOID, TEXTOID, TEXTOID};
 	List	   *relids = NIL;
+	List	   *unsupported = NIL;
 	ListCell   *lc;
 	char	   *err;
 	bool		first = true;
@@ -554,10 +585,20 @@ fetch_pub_relids(Subscription *sub)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not connect to the publisher: %s", err)));
 
+	/*
+	 * The access method comes along so that a table whose changes the
+	 * publisher cannot decode is caught by the statement that adds it,
+	 * rather than by the apply worker minutes later (work item A1).
+	 */
 	initStringInfo(&cmd);
 	appendStringInfoString(&cmd,
-						   "SELECT DISTINCT t.schemaname, t.tablename"
+						   "SELECT DISTINCT t.schemaname, t.tablename,"
+						   "       coalesce(am.amname, 'none')"
 						   "  FROM pg_catalog.pg_publication_tables t"
+						   "  JOIN pg_catalog.pg_namespace n ON n.nspname = t.schemaname"
+						   "  JOIN pg_catalog.pg_class c"
+						   "    ON c.relnamespace = n.oid AND c.relname = t.tablename"
+						   "  LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
 						   " WHERE t.pubname IN (");
 	foreach(lc, sub->publications)
 	{
@@ -569,7 +610,7 @@ fetch_pub_relids(Subscription *sub)
 
 	PG_TRY();
 	{
-		res = walrcv_exec(wrconn, cmd.data, 2, tableRow);
+		res = walrcv_exec(wrconn, cmd.data, 3, tableRow);
 		if (res->status != WALRCV_OK_TUPLES)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -582,10 +623,14 @@ fetch_pub_relids(Subscription *sub)
 			bool		isnull;
 			char	   *nspname = TextDatumGetCString(slot_getattr(slot, 1, &isnull));
 			char	   *relname = TextDatumGetCString(slot_getattr(slot, 2, &isnull));
+			char	   *amname = TextDatumGetCString(slot_getattr(slot, 3, &isnull));
 			RangeVar   *rv = makeRangeVar(nspname, relname, -1);
 
 			relids = lappend_oid(relids,
 								 RangeVarGetRelid(rv, AccessShareLock, false));
+			if (strcmp(amname, "heap") != 0)
+				unsupported = lappend(unsupported,
+									  psprintf("%s.%s (%s)", nspname, relname, amname));
 			ExecClearTuple(slot);
 		}
 		ExecDropSingleTupleTableSlot(slot);
@@ -598,6 +643,33 @@ fetch_pub_relids(Subscription *sub)
 	PG_END_TRY();
 
 	pfree(cmd.data);
+
+	if (unsupported != NIL)
+	{
+		StringInfoData names;
+		bool		sep = false;
+
+		initStringInfo(&names);
+		foreach(lc, unsupported)
+		{
+			appendStringInfo(&names, "%s%s", sep ? ", " : "", (char *) lfirst(lc));
+			sep = true;
+		}
+		if (registry_unsupported(sub->oid) == LR_UNSUPPORTED_ERROR)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the publication contains tables whose changes are not decoded: %s",
+							names.data),
+					 errdetail("Only heap tables produce logical decoding output on the publisher. Such a table would be copied once and then never change again, with no error to show for it."),
+					 errhint("Leave them out of the publication, or accept the one-time copy with ALTER SUBSCRIPTION %s SET (unsupported_tables = 'snapshot').",
+							 quote_identifier(sub->name))));
+		ereport(WARNING,
+				(errmsg("the publication contains tables whose changes are not decoded: %s",
+						names.data),
+				 errdetail("They are copied once and then left alone; gp_subscription_rel records them in state 's'.")));
+		pfree(names.data);
+	}
+
 	return relids;
 }
 
@@ -644,6 +716,7 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 	const char *created = NULL;
 	bool		created_nocopy = false;
 	bool		created_enabled = true;
+	LrUnsupportedTables created_unsupported = LR_UNSUPPORTED_ERROR;
 	Oid			dropped = InvalidOid;
 	bool		dispatch = (Gp_role == GP_ROLE_DISPATCH);
 
@@ -656,6 +729,8 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 		bool		has_slot = false;
 		bool		enabled = true;
 		bool		copy_data = true;
+		bool		has_unsupported = false;
+		LrUnsupportedTables unsupported = LR_UNSUPPORTED_ERROR;
 
 		/*
 		 * Options the module owns are taken out of the statement here, and
@@ -694,6 +769,17 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 			{
 				/* ours: the initial copy is mpp_tablesync.c's, not the server's */
 				copy_data = defGetBoolean(def);
+				continue;
+			}
+			if (strcmp(def->defname, "unsupported_tables") == 0)
+			{
+				/* ours: the server has no notion of an undecodable table */
+				if (!LrUnsupportedTablesParse(defGetString(def), &unsupported))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("\"unsupported_tables\" must be \"error\" or \"snapshot\""),
+							 errdetail("\"error\" refuses a published table whose changes the publisher cannot decode; \"snapshot\" copies it once and stops tracking it.")));
+				has_unsupported = true;
 				continue;
 			}
 			keep = lappend(keep, def);
@@ -753,6 +839,7 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 			stmt->options = keep;
 			created = stmt->subname;
 			created_enabled = enabled;
+			created_unsupported = unsupported;
 
 			/*
 			 * copy_data = false means the tables are declared in sync, so
@@ -763,6 +850,11 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 		else
 		{
 			/* "mpp = false": the server's own, untouched */
+			if (has_unsupported)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("\"unsupported_tables\" is only accepted for a subscription applied by mpp_logicalrep"),
+						 errhint("Leave out \"mpp = false\".")));
 			stmt->options = keep;
 		}
 	}
@@ -803,6 +895,50 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 							lr_worker_stop(subid);
 						}
 						return;
+					}
+
+				case ALTER_SUBSCRIPTION_OPTIONS:
+					{
+						/*
+						 * unsupported_tables is ours; anything else in the
+						 * same SET is still the server's to apply.
+						 */
+						List	   *keep = NIL;
+						ListCell   *lc2;
+						bool		seen = false;
+						LrUnsupportedTables mode = LR_UNSUPPORTED_ERROR;
+
+						foreach(lc2, stmt->options)
+						{
+							DefElem    *def = (DefElem *) lfirst(lc2);
+
+							if (strcmp(def->defname, "unsupported_tables") == 0)
+							{
+								if (!LrUnsupportedTablesParse(defGetString(def), &mode))
+									ereport(ERROR,
+											(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+											 errmsg("\"unsupported_tables\" must be \"error\" or \"snapshot\""),
+											 errdetail("\"error\" refuses a published table whose changes the publisher cannot decode; \"snapshot\" copies it once and stops tracking it.")));
+								seen = true;
+								continue;
+							}
+							keep = lappend(keep, def);
+						}
+						if (seen)
+						{
+							Oid			argtypes[2] = {TEXTOID, OIDOID};
+							Datum		values[2];
+
+							values[0] = CStringGetTextDatum(LrUnsupportedTablesName(mode));
+							values[1] = ObjectIdGetDatum(subid);
+							registry_exec("UPDATE pg_catalog.gp_mpp_subscription"
+										  " SET unsupported_tables = $1 WHERE subid = $2",
+										  2, argtypes, values);
+							if (keep == NIL)
+								return; /* nothing left for the server */
+							stmt->options = keep;
+						}
+						break;
 					}
 
 				case ALTER_SUBSCRIPTION_REFRESH:
@@ -897,19 +1033,22 @@ mpp_utility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 	if (created != NULL)
 	{
 		Oid			subid = get_subscription_oid(created, false);
-		Oid			argtypes[3] = {OIDOID, TEXTOID, BOOLOID};
-		Datum		values[3];
+		Oid			argtypes[4] = {OIDOID, TEXTOID, BOOLOID, TEXTOID};
+		Datum		values[4];
 
 		values[0] = ObjectIdGetDatum(subid);
 		values[1] = CStringGetTextDatum(created);
 		values[2] = BoolGetDatum(created_enabled);
+		values[3] = CStringGetTextDatum(LrUnsupportedTablesName(created_unsupported));
 		registry_exec("INSERT INTO pg_catalog.gp_mpp_subscription"
-					  " (subid, subname, enabled) VALUES ($1, $2, $3)"
+					  " (subid, subname, enabled, unsupported_tables)"
+					  " VALUES ($1, $2, $3, $4)"
 					  " ON CONFLICT (subid) DO UPDATE"
 					  " SET subname = EXCLUDED.subname,"
 					  "     enabled = EXCLUDED.enabled,"
+					  "     unsupported_tables = EXCLUDED.unsupported_tables,"
 					  "     disable_reason = NULL",
-					  3, argtypes, values);
+					  4, argtypes, values);
 
 		if (created_nocopy)
 			LrSyncMarkNoCopy(subid);

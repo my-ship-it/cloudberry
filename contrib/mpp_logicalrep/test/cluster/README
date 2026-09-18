@@ -36,6 +36,9 @@ sides being separate servers.
                             killed under load
     copy_transport.sh       the segment-to-segment copy transport alone,
                             without any subscription
+    unsupported_tables.sh   a published table whose changes the publisher
+                            cannot decode (append-optimised): refused by
+                            default, copied once and marked 's' on request
     participants_bench.sh   how long small distributed transactions take
                             to arrive (a measurement, not a pass/fail test)
 

@@ -90,6 +90,19 @@ distributed, its rows would live on the segments, and the driver's own
 reads would not find them.  An existing cluster therefore needs the
 objects installed by hand, or a new initdb.
 
+The same applies to a cluster whose objects were installed by an earlier
+version of this module: the script only creates what is missing, so a
+column added since then has to be added by hand, in every database that
+has the objects and in template1.  As of this version that is
+
+    SET allow_system_table_mods = on;
+    ALTER TABLE pg_catalog.gp_mpp_subscription
+        ADD COLUMN IF NOT EXISTS unsupported_tables text
+        NOT NULL DEFAULT 'error';
+
+Without it the apply worker cannot read the subscription's settings and
+disables the subscription saying which column is missing.
+
 The source cluster needs nothing from this module.
 
 
@@ -118,6 +131,9 @@ above, which the readers stream from, and nothing can guess it.
 WITH (copy_data = false) declares the tables already in sync, so the
 driver starts streaming without copying, and WITH (enabled = false)
 creates the subscription without starting it.
+WITH (unsupported_tables = 'snapshot') accepts a published table whose
+changes cannot be decoded (below); all three can also be changed later
+with ALTER SUBSCRIPTION ... SET.
 
 The statement is rewritten in ProcessUtility_hook: the subscription is
 recorded in pg_catalog.gp_mpp_subscription, and connect = false is added
@@ -165,6 +181,25 @@ The source's distribution key must be covered by the target's replica
 identity.  Otherwise two rows that lived on different source segments
 can collide on one target row, and the DELETE + INSERT pair for one of
 them lands out of order.
+
+Only heap tables can be published.  Append-optimised tables (ao_row,
+ao_column) and PAX have no logical decoding routine on the publisher, so
+nothing they do ever reaches the stream: such a table would be copied by
+the initial synchronisation and then never change again, without an
+error anywhere.  It is therefore refused, by name and by access method,
+when the subscription takes its table list -- which is when the
+subscription starts, and, for a table added later, in the ALTER
+SUBSCRIPTION ... REFRESH PUBLICATION itself:
+
+    unsupported_tables = 'error'      refuse (the default)
+    unsupported_tables = 'snapshot'   copy it once, as of the cut point,
+                                      and stop there
+
+A snapshot table is recorded in gp_subscription_rel with state 's' and
+is never looked at again; the setting is read when a table list is
+taken, so changing it afterwards does not revisit tables already taken
+on.  Append-optimised tables on the TARGET are fully supported -- it is
+decoding on the publisher that they have no part in.
 
 
 Configuration parameters
