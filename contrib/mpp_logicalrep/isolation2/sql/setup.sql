@@ -1,0 +1,3 @@
+-- The driver runs this before anything else.  Nothing here needs setting up
+-- that the tests do not set up themselves.
+SELECT 1 AS setup;

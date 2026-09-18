@@ -102,12 +102,15 @@ two settings in it:
       EXTRA_CONFIG="shared_preload_libraries='mpp_logicalrep'" ./demo_cluster.sh
     gpconfig -c wal_level -v logical && gpstop -ar
 
-make installcheck then runs the suite in sql/.  Against a cluster without
-the library it says so and tests nothing, rather than passing for the
-wrong reason -- which is what lets it sit in installcheck-world without
-holding anyone else's run hostage.  The tests under test/cluster/ are the
-ones that need two clusters and are not part of any automated run; see
-test/cluster/README.
+make installcheck then runs two suites against it: sql/, which is what a
+statement leaves behind and needs nothing running, and isolation2/, which
+replicates for real between two databases of that one cluster and waits on
+conditions rather than sleeping.  Against a cluster without the library it
+says so and tests nothing, rather than passing for the wrong reason --
+which is what lets it sit in installcheck-world without holding anyone
+else's run hostage.  The tests under test/cluster/ are the ones that need
+two clusters, which nothing in the tree can build; they are not part of any
+automated run.  See test/cluster/README.
 
 
 Usage

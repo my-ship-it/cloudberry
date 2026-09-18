@@ -9,3 +9,7 @@
 /regression.out
 /log/
 /tmp_check/
+/isolation2/sql_isolation_testcase.py
+/isolation2/results/
+/isolation2/regression.diffs
+/isolation2/regression.out
