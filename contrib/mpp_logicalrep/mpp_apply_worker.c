@@ -411,6 +411,148 @@ run_initial_sync(LrWorkerConfig *cfg, LrCbdbTransport *tr)
 }
 
 /* ------------------------------------------------------------------------
+ * Waiting for libpq without going deaf
+ * ------------------------------------------------------------------------
+ *
+ * PQexec() and PQconnectdb() sit in a blocking read until the far side
+ * answers, running no CHECK_FOR_INTERRUPTS and looking at no flag of ours.
+ * That matters here more than it does in an ordinary backend: this worker's
+ * SIGTERM handler only raises mpp_worker_stop, which is read between units
+ * of work, so a worker blocked in one of those calls -- gp_lr_drain waiting
+ * for a batch, a connection to a coordinator that never answers -- is an
+ * orphan that ignores every SIGTERM and only SIGKILL ends.  DROP
+ * SUBSCRIPTION and DROP DATABASE wait behind it.
+ *
+ * So every statement of the worker is sent asynchronously and collected
+ * here, the way the walreceiver's libpq wrapper does it
+ * (libpqrcv_PQgetResult).  Only the waiting is borrowed from that wrapper,
+ * not the wrapper itself: it connects with replication=database and nothing
+ * else, such a backend is gp_role=utility, and every statement here has to
+ * reach the segments -- gp_lr_drain(), gp_lr_apply(),
+ * gp_create_logical_replication_slot(), COPY ... ON SEGMENT.  An ordinary
+ * libpq connection is a QD and can dispatch them; a replication one answers
+ * for the coordinator alone, and does so without complaining.
+ *
+ * The check made while waiting is deliberately the cheap one -- pending
+ * interrupts and the signal flag.  Whether the subscription still wants this
+ * worker is a catalog lookup (LrSubscriptionEnabled opens a transaction of
+ * its own), which belongs between units of work, not in a loop that wakes
+ * once per packet.
+ */
+static void
+lr_pq_check_interrupts(void)
+{
+	CHECK_FOR_INTERRUPTS();
+	if (LrWorkerStopRequested())
+		ereport(ERROR,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				 errmsg("terminating the apply worker on administrator command")));
+}
+
+/* sleep until the connection is ready for io_flag, or we are interrupted */
+void
+LrPQWaitIO(PGconn *conn, int io_flag)
+{
+	int			rc;
+
+	lr_pq_check_interrupts();
+	rc = WaitLatchOrSocket(MyLatch,
+						   WL_EXIT_ON_PM_DEATH | WL_LATCH_SET | io_flag,
+						   PQsocket(conn), 0, WAIT_EVENT_LOGICAL_APPLY_MAIN);
+	if (rc & WL_LATCH_SET)
+	{
+		ResetLatch(MyLatch);
+		lr_pq_check_interrupts();
+	}
+}
+
+/*
+ * The next result of a statement sent with PQsendQuery(), or NULL when there
+ * are none left -- or when the connection broke, which the caller tells apart
+ * by there being no result at all where one was due.
+ */
+PGresult *
+LrPQGetResult(PGconn *conn)
+{
+	while (PQisBusy(conn))
+	{
+		LrPQWaitIO(conn, WL_SOCKET_READABLE);
+		if (PQconsumeInput(conn) == 0)
+			return NULL;
+	}
+	return PQgetResult(conn);
+}
+
+/* push whatever libpq has buffered, waiting for room rather than blocking */
+bool
+LrPQFlush(PGconn *conn)
+{
+	int			rc;
+
+	while ((rc = PQflush(conn)) > 0)
+		LrPQWaitIO(conn, WL_SOCKET_WRITEABLE);
+	return rc == 0;
+}
+
+/* PQputCopyData() on a connection put in non-blocking mode for the copy */
+bool
+LrPQPutCopyData(PGconn *conn, const char *buf, int n)
+{
+	for (;;)
+	{
+		int			rc = PQputCopyData(conn, buf, n);
+
+		if (rc == 1)
+			return true;
+		if (rc < 0)
+			return false;
+		/* the buffer is full: drain it towards the far side and try again */
+		if (!LrPQFlush(conn))
+			return false;
+	}
+}
+
+/*
+ * Connect, stepping the handshake by hand so that the wait for a coordinator
+ * that never answers is a wait we can be woken out of.  Returns a connection
+ * whose status the caller still has to check, or throws if interrupted.
+ */
+PGconn *
+LrPQConnect(const char *conninfo)
+{
+	PGconn	   *conn = PQconnectStart(conninfo);
+
+	if (conn == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory connecting to a coordinator")));
+
+	while (PQstatus(conn) != CONNECTION_BAD)
+	{
+		PostgresPollingStatusType poll = PQconnectPoll(conn);
+
+		if (poll == PGRES_POLLING_OK || poll == PGRES_POLLING_FAILED)
+			break;
+		if (PQsocket(conn) < 0)
+			break;				/* no socket to wait on; the status tells why */
+
+		/* the connection is ours alone until we return it */
+		PG_TRY();
+		{
+			LrPQWaitIO(conn, poll == PGRES_POLLING_READING ? WL_SOCKET_READABLE
+						   : WL_SOCKET_WRITEABLE);
+		}
+		PG_CATCH();
+		{
+			PQfinish(conn);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	return conn;
+}
+
+/* ------------------------------------------------------------------------
  * The shared target session (mpp_apply_internal.h)
  *
  * One normal coordinator session, driven over libpq, that both halves of
@@ -427,16 +569,25 @@ LrTransportConnect(LrCbdbTransport *tr)
 	StringInfoData ci;
 	PGresult   *res;
 
+	/*
+	 * connect_timeout goes first, so a subscription that names its own still
+	 * wins; application_name goes last, so it cannot be overridden.
+	 */
 	initStringInfo(&ci);
-	appendStringInfo(&ci, "%s application_name=mpp_apply_worker options='-c gp_vmem_idle_resource_timeout=0'",
-					 tr->conninfo);
-	tr->qd = PQconnectdb(ci.data);
+	appendStringInfo(&ci, "connect_timeout=%d %s application_name=mpp_apply_worker options='-c gp_vmem_idle_resource_timeout=0'",
+					 LR_CONNECT_TIMEOUT_S, tr->conninfo);
+	tr->qd = LrPQConnect(ci.data);
+	pfree(ci.data);
 	if (PQstatus(tr->qd) != CONNECTION_OK)
+	{
+		char	   *msg = pstrdup(PQerrorMessage(tr->qd));
+
+		PQfinish(tr->qd);
+		tr->qd = NULL;
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not connect to the target coordinator: %s",
-						PQerrorMessage(tr->qd))));
-	pfree(ci.data);
+				 errmsg("could not connect to the target coordinator: %s", msg)));
+	}
 
 	res = LrTransportExec(tr, "SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0");
 	tr->nsegs = atoi(PQgetvalue(res, 0, 0));
@@ -463,11 +614,24 @@ PGresult *
 LrTransportExecParams(LrCbdbTransport *tr, const char *sql, int nparams,
 					  const char *const *params)
 {
-	PGresult   *res;
+	PGresult   *res = NULL;
+	PGresult   *r;
+	bool		sent;
 
-	res = nparams > 0 ?
-		PQexecParams(tr->qd, sql, nparams, NULL, params, NULL, NULL, 0) :
-		PQexec(tr->qd, sql);
+	sent = nparams > 0 ?
+		PQsendQueryParams(tr->qd, sql, nparams, NULL, params, NULL, NULL, 0) != 0 :
+		PQsendQuery(tr->qd, sql) != 0;
+
+	/* keep the first result and drain the rest, so the session stays usable */
+	if (sent)
+		while ((r = LrPQGetResult(tr->qd)) != NULL)
+		{
+			if (res == NULL)
+				res = r;
+			else
+				PQclear(r);
+		}
+
 	if (res == NULL ||
 		(PQresultStatus(res) != PGRES_TUPLES_OK &&
 		 PQresultStatus(res) != PGRES_COMMAND_OK))
@@ -2642,6 +2806,18 @@ mpp_worker_sigterm(SIGNAL_ARGS)
 {
 	mpp_worker_stop = true;
 	SetLatch(MyLatch);
+}
+
+/*
+ * Has this worker been told to stop?  Cheap enough to ask while waiting for
+ * a socket, which is the point: it is what makes the libpq waits above give
+ * up on a SIGTERM.  Always false in the SQL test entry, which runs in an
+ * ordinary backend where CHECK_FOR_INTERRUPTS does the same job.
+ */
+bool
+LrWorkerStopRequested(void)
+{
+	return mpp_worker_stop;
 }
 
 static bool

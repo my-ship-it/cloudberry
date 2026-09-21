@@ -1,0 +1,147 @@
+-- Stopping a worker that is waiting on the far side.
+--
+-- Everything the worker does on the target goes out over libpq and is waited
+-- for.  Waiting the blocking way -- PQexec() -- runs no interrupt check and
+-- reads no flag of ours, so a worker whose statement does not come back is
+-- deaf: DISABLE and DROP SUBSCRIPTION ask it to stop and it does not, DROP
+-- DATABASE then queues behind the session it still holds, and only SIGKILL
+-- ends it.  Every statement is therefore sent asynchronously and collected
+-- in a wait on the socket and the latch together.
+--
+-- A lock makes it observable: a reader holding the target table exclusively
+-- stops the worker inside one of those statements, and the subscription is
+-- then told to stop while it is still in there.
+--
+--   1  a worker blocked applying a change stops on DISABLE
+--   2  one blocked in the initial synchronisation, which has libpq
+--      connections of its own and one of them to the source, stops on DROP
+--      SUBSCRIPTION
+--   3  and nothing is left behind afterwards
+
+CREATE DATABASE mpp_lr_sd;
+CREATE
+
+CREATE TABLE sd_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+INSERT INTO sd_t SELECT g, 'seed' FROM generate_series(1, 20) g;
+INSERT 20
+CREATE PUBLICATION sd_pub FOR TABLE sd_t;
+CREATE
+
+1:@db_name mpp_lr_sd: CREATE TABLE sd_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+1:@db_name mpp_lr_sd: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+
+-- Is one of the worker's sessions waiting for a lock?  pg_stat_activity is a
+-- snapshot taken once per transaction and this loop is one transaction, so
+-- pg_stat_clear_snapshot() is what makes each round look again.
+1:@db_name mpp_lr_sd: CREATE FUNCTION lr_stuck_on(who text, what text) RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 600 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE application_name = who AND state = 'active' AND query LIKE what; IF n > 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+
+-- Has the worker process gone?  Asked after the statement that stops it has
+-- already waited for it, so a short patience is the point: a worker that has
+-- to be waited for here is one that did not take the hint.
+1:@db_name mpp_lr_sd: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 50 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+
+-- ------------------------------------------------------------------
+-- 1. blocked applying a change
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_sd: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION sd_sub CONNECTION %L PUBLICATION sd_pub WITH (slot_name = ''sd_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_sd: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'sd_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
+ synced 
+--------
+ t      
+(1 row)
+
+2:@db_name mpp_lr_sd: BEGIN;
+BEGIN
+2:@db_name mpp_lr_sd: LOCK TABLE sd_t IN ACCESS EXCLUSIVE MODE;
+LOCK
+INSERT INTO sd_t VALUES (21, 'cannot land while the table is held');
+INSERT 1
+1:@db_name mpp_lr_sd: SELECT lr_stuck_on('mpp_apply_worker', '%LOCK TABLE%') AS the_apply_is_waiting_for_the_lock;
+ the_apply_is_waiting_for_the_lock 
+-----------------------------------
+ t                                 
+(1 row)
+
+-- told to stop while it is in there, and it stops
+1:@db_name mpp_lr_sd: ALTER SUBSCRIPTION sd_sub DISABLE;
+ALTER
+1:@db_name mpp_lr_sd: SELECT lr_worker_gone() AS stopped_while_blocked;
+ stopped_while_blocked 
+-----------------------
+ t                     
+(1 row)
+2:@db_name mpp_lr_sd: COMMIT;
+COMMIT
+
+1:@db_name mpp_lr_sd: DROP SUBSCRIPTION sd_sub;
+DROP
+SELECT gp_drop_replication_slot('sd_slot');
+ gp_drop_replication_slot 
+--------------------------
+                          
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 2. blocked in the initial synchronisation
+-- ------------------------------------------------------------------
+-- A slot cannot reach a consistent snapshot until the transactions already
+-- running on the source have finished, so an open one there holds the
+-- synchronisation in the statement that creates the slot -- on its
+-- connection to the source, the one that has to dispatch and so cannot be a
+-- replication connection with a wrapper of its own.
+3: BEGIN;
+BEGIN
+3: INSERT INTO sd_t VALUES (22, 'an open transaction on the source');
+INSERT 1
+1:@db_name mpp_lr_sd: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION sd_sub2 CONNECTION %L PUBLICATION sd_pub WITH (slot_name = ''sd_slot2'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_sd: SELECT lr_stuck_on('mpp_apply_sync', '%gp_create_logical_replication_slot%') AS the_sync_is_waiting_on_the_source;
+ the_sync_is_waiting_on_the_source 
+-----------------------------------
+ t                                 
+(1 row)
+
+1:@db_name mpp_lr_sd: DROP SUBSCRIPTION sd_sub2;
+DROP
+1:@db_name mpp_lr_sd: SELECT lr_worker_gone() AS stopped_during_the_sync;
+ stopped_during_the_sync 
+-------------------------
+ t                       
+(1 row)
+3: ROLLBACK;
+ROLLBACK
+3q: ... <quitting>
+-- The statement the worker had in flight on the source outlives it: it is
+-- waiting on the transaction above and only finds out the client has gone
+-- when it can finally answer.  Wait for it, then take the slot it may by
+-- then have got as far as creating.
+DO $$ BEGIN FOR i IN 1 .. 600 LOOP PERFORM pg_stat_clear_snapshot(); EXIT WHEN NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = 'mpp_apply_sync'); PERFORM pg_sleep(0.1); END LOOP; BEGIN PERFORM gp_drop_replication_slot('sd_slot2'); EXCEPTION WHEN others THEN NULL; END; END $$;
+DO
+SELECT count(*) AS slots_left FROM gp_replication_slots WHERE slot_name = 'sd_slot2';
+ slots_left 
+------------
+ 0          
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 3. nothing left behind
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_sd: SELECT count(*) AS workers_left FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database();
+ workers_left 
+--------------
+ 0            
+(1 row)
+2q: ... <quitting>
+1q: ... <quitting>
+DROP PUBLICATION sd_pub;
+DROP
+DROP TABLE sd_t;
+DROP
+DROP DATABASE mpp_lr_sd;
+DROP

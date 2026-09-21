@@ -184,6 +184,7 @@ static void sync_apply_snapshot(LrWorkerConfig *cfg, const char *text);
 static int	sync_count_slots(LrSync *s);
 static bool sync_handle_slot_loss(LrSync *s);
 static void sync_wait(LrSync *s, int ms);
+static void sync_check_interrupts(LrSync *s);
 
 /* ------------------------------------------------------------------------
  * Entry point
@@ -295,11 +296,24 @@ static PGresult *
 sync_exec(LrSync *s, PGconn *conn, const char *who, const char *sql,
 		  int nparams, const char *const *params)
 {
-	PGresult   *res;
+	PGresult   *res = NULL;
+	PGresult   *r;
+	bool		sent;
 
-	res = nparams > 0 ?
-		PQexecParams(conn, sql, nparams, NULL, params, NULL, NULL, 0) :
-		PQexec(conn, sql);
+	sent = nparams > 0 ?
+		PQsendQueryParams(conn, sql, nparams, NULL, params, NULL, NULL, 0) != 0 :
+		PQsendQuery(conn, sql) != 0;
+
+	/* keep the first result and drain the rest, so the connection stays usable */
+	if (sent)
+		while ((r = LrPQGetResult(conn)) != NULL)
+		{
+			if (res == NULL)
+				res = r;
+			else
+				PQclear(r);
+		}
+
 	if (res == NULL ||
 		(PQresultStatus(res) != PGRES_TUPLES_OK &&
 		 PQresultStatus(res) != PGRES_COMMAND_OK))
@@ -334,10 +348,14 @@ sync_connect_one(const char *conninfo, const char *what, const char *options)
 	StringInfoData ci;
 	PGconn	   *conn;
 
+	/*
+	 * connect_timeout goes first, so a subscription that names its own still
+	 * wins; application_name goes last, so it cannot be overridden.
+	 */
 	initStringInfo(&ci);
-	appendStringInfo(&ci, "%s application_name=mpp_apply_sync%s", conninfo,
-					 options ? options : "");
-	conn = PQconnectdb(ci.data);
+	appendStringInfo(&ci, "connect_timeout=%d %s application_name=mpp_apply_sync%s",
+					 LR_CONNECT_TIMEOUT_S, conninfo, options ? options : "");
+	conn = LrPQConnect(ci.data);
 	pfree(ci.data);
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
@@ -451,15 +469,27 @@ sync_disconnect(LrSync *s)
 	s->tgt = s->tgt2 = s->src = NULL;
 }
 
+/*
+ * Give up when the worker is stopping or the subscription changed under us.
+ * The second half is a catalog lookup, so this belongs at the poll points,
+ * not in the libpq waits of mpp_apply_worker.c, which wake once per packet.
+ */
+static void
+sync_check_interrupts(LrSync *s)
+{
+	CHECK_FOR_INTERRUPTS();
+	if (LrWorkerStopRequested() ||
+		(s != NULL && s->cfg->should_stop && s->cfg->should_stop(s->cfg->stop_arg)))
+		ereport(ERROR,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				 errmsg("initial sync interrupted: the subscription changed")));
+}
+
 /* a latch wait that honours the worker's stop request */
 static void
 sync_wait(LrSync *s, int ms)
 {
-	CHECK_FOR_INTERRUPTS();
-	if (s->cfg->should_stop && s->cfg->should_stop(s->cfg->stop_arg))
-		ereport(ERROR,
-				(errcode(ERRCODE_ADMIN_SHUTDOWN),
-				 errmsg("initial sync interrupted: the subscription changed")));
+	sync_check_interrupts(s);
 	(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					 ms, WAIT_EVENT_LOGICAL_SYNC_DATA);
 	ResetLatch(MyLatch);
@@ -977,7 +1007,7 @@ copy_via_coordinators(LrSync *s, LrSyncRel *r)
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql, "COPY (SELECT %s FROM %s) TO STDOUT", r->collist, r->qualified);
-	res = PQexec(s->src, sql.data);
+	res = PQsendQuery(s->src, sql.data) ? LrPQGetResult(s->src) : NULL;
 	if (res == NULL || PQresultStatus(res) != PGRES_COPY_OUT)
 	{
 		msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(s->src));
@@ -992,7 +1022,7 @@ copy_via_coordinators(LrSync *s, LrSyncRel *r)
 
 	resetStringInfo(&sql);
 	appendStringInfo(&sql, "COPY %s (%s) FROM STDIN", r->qualified, r->collist);
-	res = PQexec(s->tgt, sql.data);
+	res = PQsendQuery(s->tgt, sql.data) ? LrPQGetResult(s->tgt) : NULL;
 	if (res == NULL || PQresultStatus(res) != PGRES_COPY_IN)
 	{
 		msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(s->tgt));
@@ -1007,9 +1037,29 @@ copy_via_coordinators(LrSync *s, LrSyncRel *r)
 	pfree(sql.data);
 	s->tgt_busy = true;
 
-	while ((n = PQgetCopyData(s->src, &buf, 0)) > 0)
+	/*
+	 * Read and write without blocking in either direction: a source that
+	 * stops sending, or a target that stops reading, must not make this
+	 * worker deaf for as long as it lasts.
+	 */
+	(void) PQsetnonblocking(s->tgt, 1);
+	for (;;)
 	{
-		if (PQputCopyData(s->tgt, buf, n) != 1)
+		n = PQgetCopyData(s->src, &buf, 1);
+		if (n == 0)
+		{
+			/* nothing buffered yet -- wait on the socket, not on the read */
+			LrPQWaitIO(s->src, WL_SOCKET_READABLE);
+			if (PQconsumeInput(s->src) == 0)
+			{
+				n = -2;
+				break;
+			}
+			continue;
+		}
+		if (n < 0)
+			break;
+		if (!LrPQPutCopyData(s->tgt, buf, n))
 		{
 			PQfreemem(buf);
 			ereport(ERROR,
@@ -1020,14 +1070,13 @@ copy_via_coordinators(LrSync *s, LrSyncRel *r)
 		PQfreemem(buf);
 		buf = NULL;
 		nrows++;
-		CHECK_FOR_INTERRUPTS();
 	}
 	if (n == -2)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("initial sync, source COPY of replicated %s: %s",
 						r->qualified, PQerrorMessage(s->src))));
-	while ((res = PQgetResult(s->src)) != NULL)
+	while ((res = LrPQGetResult(s->src)) != NULL)
 	{
 		if (PQresultStatus(res) != PGRES_COMMAND_OK && msg == NULL)
 			msg = pstrdup(PQresultErrorMessage(res));
@@ -1038,15 +1087,28 @@ copy_via_coordinators(LrSync *s, LrSyncRel *r)
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("initial sync, source COPY of replicated %s: %s", r->qualified, msg)));
 
-	if (PQputCopyEnd(s->tgt, NULL) != 1)
+	for (;;)
+	{
+		int			rc = PQputCopyEnd(s->tgt, NULL);
+
+		if (rc == 1)
+			break;
+		if (rc < 0 || !LrPQFlush(s->tgt))
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+					 errmsg("initial sync, target COPY of replicated %s: %s",
+							r->qualified, PQerrorMessage(s->tgt))));
+	}
+	if (!LrPQFlush(s->tgt))
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("initial sync, target COPY of replicated %s: %s",
 						r->qualified, PQerrorMessage(s->tgt))));
+	(void) PQsetnonblocking(s->tgt, 0);
 	{
 		int64		tgt_rows = -1;
 
-		while ((res = PQgetResult(s->tgt)) != NULL)
+		while ((res = LrPQGetResult(s->tgt)) != NULL)
 		{
 			if (PQresultStatus(res) == PGRES_COMMAND_OK)
 				tgt_rows = strtoll(PQcmdTuples(res), NULL, 10);
@@ -1830,14 +1892,22 @@ LrSyncPendingNames(PGconn *qd, Oid subid)
 	List	   *names = NIL;
 
 	snprintf(subidbuf, sizeof(subidbuf), "%u", subid);
-	res = PQexecParams(qd,
-					   "SELECT n.nspname || '.' || c.relname"
-					   "  FROM pg_catalog.gp_subscription_rel r"
-					   "  JOIN pg_class c ON c.oid = r.relid"
-					   "  JOIN pg_namespace n ON n.oid = c.relnamespace"
-					   " WHERE r.subid = $1 AND r.relid <> 0 AND r.state NOT IN ('r', 's')"
-					   " ORDER BY 1",
-					   1, NULL, params, NULL, NULL, 0);
+	res = PQsendQueryParams(qd,
+							"SELECT n.nspname || '.' || c.relname"
+							"  FROM pg_catalog.gp_subscription_rel r"
+							"  JOIN pg_class c ON c.oid = r.relid"
+							"  JOIN pg_namespace n ON n.oid = c.relnamespace"
+							" WHERE r.subid = $1 AND r.relid <> 0 AND r.state NOT IN ('r', 's')"
+							" ORDER BY 1",
+							1, NULL, params, NULL, NULL, 0)
+		? LrPQGetResult(qd) : NULL;
+	if (res != NULL)
+	{
+		PGresult   *r;
+
+		while ((r = LrPQGetResult(qd)) != NULL)
+			PQclear(r);
+	}
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		char	   *msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(qd));

@@ -131,6 +131,20 @@ typedef struct LrWorkerStats
 
 extern void LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats);
 
+/*
+ * libpq without a blocking wait: every statement the worker sends goes out
+ * with PQsendQuery() and is collected with LrPQGetResult(), so that a far
+ * side which stops answering does not leave a worker that ignores SIGTERM.
+ * See the section of that name in mpp_apply_worker.c.
+ */
+#define LR_CONNECT_TIMEOUT_S	60
+extern bool LrWorkerStopRequested(void);
+extern struct pg_conn *LrPQConnect(const char *conninfo);
+extern struct pg_result *LrPQGetResult(struct pg_conn *conn);
+extern void LrPQWaitIO(struct pg_conn *conn, int io_flag);
+extern bool LrPQFlush(struct pg_conn *conn);
+extern bool LrPQPutCopyData(struct pg_conn *conn, const char *buf, int n);
+
 /* ------------------------------------------------------------------------
  * What a running worker publishes about itself
  *

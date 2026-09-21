@@ -19,3 +19,4 @@ test: large_batches
 test: monitoring
 test: faults
 test: crash_recovery
+test: shutdown

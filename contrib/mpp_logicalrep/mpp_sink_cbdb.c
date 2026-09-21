@@ -470,7 +470,17 @@ cbdb_sink_abort(LogicalRepSink *self)
 	LrCbdbSink *s = (LrCbdbSink *) self->private_data;
 
 	s->in_xact = false;
-	if (s->tr->qd != NULL && PQstatus(s->tr->qd) == CONNECTION_OK)
+
+	/*
+	 * This may not throw, so the ROLLBACK is the one statement of the worker
+	 * still sent the blocking way -- and only while there is reason to think
+	 * it will be answered.  A worker on its way out drops the session
+	 * instead: closing it aborts the transaction just as well, and waiting
+	 * politely on a coordinator that has stopped answering is how a worker
+	 * ends up ignoring the SIGTERM that brought it here.
+	 */
+	if (s->tr->qd != NULL && PQstatus(s->tr->qd) == CONNECTION_OK &&
+		!LrWorkerStopRequested())
 	{
 		PGresult   *res = PQexec(s->tr->qd, "ROLLBACK");
 

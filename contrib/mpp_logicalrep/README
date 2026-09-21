@@ -158,6 +158,12 @@ is applied by it:
         PUBLICATION p
         WITH (slot_name = 'sub_s');
 
+The connection string is used as given, with two additions: an
+application_name, so the sessions are recognisable on the far side, and
+connect_timeout = 60 unless it names one of its own, so that a
+coordinator which accepts the connection and then says nothing is given
+up on rather than waited for.
+
 slot_name is the one option that must be given: it names the slots made
 above, which the readers stream from, and nothing can guess it.
 WITH (copy_data = false) declares the tables already in sync, so the
