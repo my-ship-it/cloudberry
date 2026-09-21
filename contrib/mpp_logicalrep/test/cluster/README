@@ -91,9 +91,24 @@ A target cluster
 
 Any cluster will do; a demo one is made from the source tree with
 
-    cd ~/workspace/cbdb-target &&
-    COORDINATOR_DATADIR=$PWD PORT_BASE=7300 NUM_PRIMARY_MIRROR_PAIRS=3 \
-    WITH_MIRRORS=false ~/workspace/cbdb/gpAux/gpdemo/demo_cluster.sh
+    cd ~/workspace/cbdb-target
+    export PORT_BASE=7300 NUM_PRIMARY_MIRROR_PAIRS=3 WITH_MIRRORS=false
+    export COORDINATOR_DATADIR=$PWD
+    source ~/workspace/cbdb/gpAux/gpdemo/gpdemo-defaults.sh
+    ~/workspace/cbdb/gpAux/gpdemo/demo_cluster.sh
+
+    export COORDINATOR_DATA_DIRECTORY=$PWD/datadirs/qddir/demoDataDir-1
+    export MASTER_DATA_DIRECTORY=$COORDINATOR_DATA_DIRECTORY PGPORT=7300
+    gpconfig -c shared_preload_libraries -v mpp_logicalrep
+    gpconfig -c wal_level -v logical   # only if it will also publish
+    gpstop -ar
+
+Source gpdemo-defaults.sh first, as the gpdemo Makefile does: it is what
+turns PORT_BASE into the DEMO_PORT_BASE the script actually reads, and
+without it gpinitsystem stops with "COORDINATOR_PORT variable not set".
+The two settings go in with gpconfig afterwards rather than through
+EXTRA_CONFIG, which is appended to gpinitsystem's own configuration file
+where a postgresql.conf setting is simply ignored.
 
 Run it from the target's own directory: demo_cluster.sh writes
 gpdemo-env.sh into the directory it is run in, and would otherwise

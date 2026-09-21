@@ -111,11 +111,19 @@ module needs them brought up to date by hand; see Upgrading below.
 The source cluster needs nothing from this module.
 
 A cluster to run the tests against is an ordinary demo cluster with the
-two settings in it:
+two settings put in afterwards:
 
-    cd gpAux/gpdemo && \
-      EXTRA_CONFIG="shared_preload_libraries='mpp_logicalrep'" ./demo_cluster.sh
-    gpconfig -c wal_level -v logical && gpstop -ar
+    cd gpAux/gpdemo && make cluster
+    export COORDINATOR_DATA_DIRECTORY=$PWD/datadirs/qddir/demoDataDir-1
+    export PGPORT=7000                 # whatever the cluster was built on
+    gpconfig -c shared_preload_libraries -v mpp_logicalrep
+    gpconfig -c wal_level -v logical   # only a cluster that publishes needs this
+    gpstop -ar
+
+Do not expect EXTRA_CONFIG to carry them: it is appended to gpinitsystem's
+own configuration file, where a postgresql.conf setting is just an unused
+variable.  gpconfig needs PGPORT and the data directory to be set, or it
+reports that the database is down.
 
 make installcheck then runs two suites against it: sql/, which is what a
 statement leaves behind and needs nothing running, and isolation2/, which
