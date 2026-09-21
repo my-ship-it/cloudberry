@@ -1,0 +1,149 @@
+-- Schema changes on the publisher.
+--
+-- No DDL is replicated, in either direction: the target's schema is the
+-- target's business.  What matters is what happens to the stream when the two
+-- schemas stop matching, and how an operator gets out of it.
+--
+--   1  a column added on the target first and on the source after: the order
+--      the documentation asks for, and it just works
+--   2  a column added on the source alone: the stream cannot be applied, the
+--      subscription gives up after its retries and says which column
+--   3  adding it on the target and enabling again: it catches up, and the
+--      change that was held back is still there
+--   4  a column dropped on the source: the target keeps its own, and rows
+--      that arrive without it leave it null
+--
+-- Renaming a column on the source is the same case as 2 -- the old name is
+-- missing on the target -- so it is not repeated here.  Case 2 waits out
+-- mpp_logicalrep.apply_max_retries, which is SIGHUP-only and so cannot be
+-- turned down for one test.
+
+CREATE DATABASE mpp_lr_dd;
+CREATE
+
+CREATE TABLE dd_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+INSERT INTO dd_t SELECT g, 'seed' FROM generate_series(1, 20) g;
+INSERT 20
+CREATE PUBLICATION dd_pub FOR TABLE dd_t;
+CREATE
+
+1:@db_name mpp_lr_dd: CREATE TABLE dd_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
+CREATE
+1:@db_name mpp_lr_dd: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+1:@db_name mpp_lr_dd: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION dd_sub CONNECTION %L PUBLICATION dd_pub WITH (slot_name = ''dd_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_dd: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'dd_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
+ synced 
+--------
+ t      
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 1. the target first, the source after
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_dd: ALTER TABLE dd_t ADD COLUMN c1 int;
+ALTER
+ALTER TABLE dd_t ADD COLUMN c1 int;
+ALTER
+INSERT INTO dd_t VALUES (101, 'with c1', 7);
+INSERT 1
+1:@db_name mpp_lr_dd: SELECT lr_wait('SELECT count(*) = 21 FROM dd_t') AS arrived;
+ arrived 
+---------
+ t       
+(1 row)
+1:@db_name mpp_lr_dd: SELECT c1 AS the_new_column FROM dd_t WHERE id = 101;
+ the_new_column 
+----------------
+ 7              
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 2. the source alone
+-- ------------------------------------------------------------------
+ALTER TABLE dd_t ADD COLUMN c2 text;
+ALTER
+INSERT INTO dd_t VALUES (102, 'with c2', 8, 'held back');
+INSERT 1
+1:@db_name mpp_lr_dd: SELECT lr_wait($$SELECT NOT enabled FROM gp_mpp_subscription WHERE subname = 'dd_sub'$$) AS gave_up;
+ gave_up 
+---------
+ t       
+(1 row)
+1:@db_name mpp_lr_dd: SELECT disable_reason LIKE '%missing replicated column%' AS says_what_is_wrong, disable_reason LIKE '%c2%' AS names_the_column FROM gp_mpp_subscription WHERE subname = 'dd_sub';
+ says_what_is_wrong | names_the_column 
+--------------------+------------------
+ t                  | t                
+(1 row)
+-- and it stopped rather than applying half of it
+1:@db_name mpp_lr_dd: SELECT count(*) AS nothing_applied_meanwhile FROM dd_t;
+ nothing_applied_meanwhile 
+---------------------------
+ 21                        
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 3. put the column there and let it go on
+-- ------------------------------------------------------------------
+1:@db_name mpp_lr_dd: ALTER TABLE dd_t ADD COLUMN c2 text;
+ALTER
+1:@db_name mpp_lr_dd: ALTER SUBSCRIPTION dd_sub ENABLE;
+ALTER
+1:@db_name mpp_lr_dd: SELECT lr_wait('SELECT count(*) = 22 FROM dd_t') AS caught_up;
+ caught_up 
+-----------
+ t         
+(1 row)
+1:@db_name mpp_lr_dd: SELECT c2 AS the_change_that_was_held_back FROM dd_t WHERE id = 102;
+ the_change_that_was_held_back 
+-------------------------------
+ held back                     
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 4. a column dropped on the source
+-- ------------------------------------------------------------------
+ALTER TABLE dd_t DROP COLUMN c1;
+ALTER
+INSERT INTO dd_t VALUES (103, 'after the drop', 'still here');
+INSERT 1
+1:@db_name mpp_lr_dd: SELECT lr_wait('SELECT count(*) = 23 FROM dd_t') AS still_streaming;
+ still_streaming 
+-----------------
+ t               
+(1 row)
+-- the columns that remain line up by name; the one the source no longer sends
+-- is left to the target's own default
+1:@db_name mpp_lr_dd: SELECT c1 IS NULL AS dropped_column_left_null, c2 AS the_rest_lines_up FROM dd_t WHERE id = 103;
+ dropped_column_left_null | the_rest_lines_up 
+--------------------------+-------------------
+ t                        | still here        
+(1 row)
+-- and the target still has the column the source dropped: no DDL is replicated
+1:@db_name mpp_lr_dd: SELECT count(*) = 1 AS target_keeps_its_own_column FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'dd_t' AND a.attname = 'c1' AND NOT a.attisdropped;
+ target_keeps_its_own_column 
+-----------------------------
+ t                           
+(1 row)
+1:@db_name mpp_lr_dd: SELECT phase, enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'dd_sub';
+ phase     | enabled | stuck_errors 
+-----------+---------+--------------
+ streaming | t       | 0            
+(1 row)
+
+1:@db_name mpp_lr_dd: DROP SUBSCRIPTION dd_sub;
+DROP
+1q: ... <quitting>
+SELECT gp_drop_replication_slot('dd_slot');
+ gp_drop_replication_slot 
+--------------------------
+                          
+(1 row)
+DROP PUBLICATION dd_pub;
+DROP
+DROP TABLE dd_t;
+DROP
+DROP DATABASE mpp_lr_dd;
+DROP

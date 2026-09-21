@@ -6,11 +6,15 @@ test: copy_transport
 test: subtransactions
 test: prepared_statements
 test: maintenance
+test: truncate_locks
+test: publisher_ddl
+test: onephase
 test: ordering
 test: streaming
 test: direct_copy
 test: initial_sync
 test: refresh_publication
+test: large_batches
 test: monitoring
 test: faults
 test: crash_recovery
