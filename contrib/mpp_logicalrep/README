@@ -61,6 +61,21 @@ segment (copyhelper/, driven by COPY ... ON SEGMENT), and the
 redistribution to the right target segment is done by the Motion of the
 enclosing INSERT ... SELECT.
 
+A table whose rows both sides place the same way skips that
+redistribution: source segment i's share is already target segment i's
+share, so the helper's output is loaded straight into the table with
+COPY ... FROM PROGRAM ... ON SEGMENT.  It applies when the two sides have
+the same number of segments and the table's distribution key and the
+key's operator class match -- the operator class because it is what
+tells the legacy hash from the jump-consistent one, and the same column
+hashed the other way lands elsewhere.  A randomly distributed table on
+both sides qualifies as well; a replicated one has its own copy path and
+never does.  The decision is per table, not per cluster, and
+gp_enable_segment_copy_checking -- on by default -- is what keeps it
+honest: each segment recomputes where every row belongs and refuses one
+that is not its own, so a wrong decision fails the copy instead of
+misplacing rows.  mpp_logicalrep.direct_copy turns it off.
+
 The copy is taken under a cut point: a target LSN and a distributed
 snapshot of the source.  A decoded transaction whose gxid is visible
 under that snapshot is already in the copy and is dropped rather than
@@ -287,6 +302,12 @@ mpp_logicalrep.copy_bind_address (string, default empty, SIGHUP)
     frames, and which interface it listens on -- empty means all of
     them.  See Security below.
 
+mpp_logicalrep.direct_copy (boolean, default on)
+    Load a table's initial copy where it lands when both sides place its
+    rows the same way, instead of sending it through a redistribution.
+    Off makes every table take the general path, as it did before this
+    existed.  See Initial synchronisation above.
+
 mpp_logicalrep.max_workers (integer, default 8, requires restart)
     How many subscriptions may have a worker at once; it also sizes the
     shared-memory slots the workers publish their statistics in.
@@ -335,6 +356,19 @@ be resynchronised afterwards.
 
 Throughput is one writer gang and one distributed commit per batch;
 parallel apply is not implemented.
+
+An enabled subscription keeps gpstop from finishing in its default
+smart mode.  The worker drives its gangs from an ordinary session of its
+own, and smart shutdown is defined as waiting for every client session to
+end, so from the server's point of view a client is always connected.
+This is what smart mode means rather than a fault -- an idle psql does
+the same -- but a subscription does not look like a user connection, so
+it is worth knowing where the wait comes from.  gpstop reports it: after
+its timeout it lists the sessions it is waiting for, where this one
+appears with application_name = mpp_apply_worker, and offers fast or
+immediate mode.  Answer fast, or run gpstop -M fast, or disable the
+subscriptions first.  A non-interactive gpstop (-q, or no terminal to
+answer on) has nobody to ask and waits indefinitely.
 
 A subscription dumped by pg_dump cannot be restored as it stands,
 because pg_dump writes connect = false and this module refuses that
