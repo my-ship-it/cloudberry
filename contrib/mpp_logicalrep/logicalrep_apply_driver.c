@@ -55,6 +55,7 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 	bool		give_up = false;
 	bool		needs_startup = true;
 	bool		needs_restart = false;
+	bool		tried_startup = false;
 
 	sink->startup(sink, sink_cfg);
 	caps = sink->capabilities(sink);	/* once; it decides the whole shape */
@@ -65,14 +66,19 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * Whether to stop is the assembly's to say, but only once it is up:
-		 * the run has always come up before anything else, and shutdown is
-		 * paired with startup.  A stop asked for while it cannot come up is
-		 * honoured as soon as it does, or when the error grading below gives
-		 * up on it; a signal is handled by CHECK_FOR_INTERRUPTS above either
-		 * way.
+		 * Whether to stop is the assembly's to say, and it is asked from the
+		 * second pass on -- including the passes of a run that cannot come up
+		 * at all, which is the point.  Such a run used to retry here for ever
+		 * without ever asking, so a worker whose source had gone spun until
+		 * something killed it: CHECK_FOR_INTERRUPTS above does not catch a
+		 * stop that is a flag raised by a signal handler, with no pending
+		 * interrupt to find.
+		 *
+		 * The first pass is exempt so that the run is always offered its one
+		 * chance to come up, whatever the assembly would answer before it has
+		 * seen anything.
 		 */
-		if (give_up || (!needs_startup && assembly->should_stop(assembly)))
+		if (give_up || (tried_startup && assembly->should_stop(assembly)))
 			break;
 
 		PG_TRY();
@@ -93,6 +99,7 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 			 */
 			if (needs_startup)
 			{
+				tried_startup = true;
 				assembly->startup(assembly, &caps, &pos);
 				needs_startup = false;
 			}
@@ -171,8 +178,15 @@ lr_apply_driver_run(LogicalRepAssembly *assembly, LogicalRepSink *sink,
 				give_up = true;
 			else
 			{
-				pg_usleep((needs_startup || needs_restart ? LR_DRIVER_RETRY_MS
-						   : LR_DRIVER_RECOVER_MS) * 1000L);
+				/*
+				 * Back off, in whatever wait this run can be woken out of --
+				 * pg_usleep() could not be, and a run that cannot come up
+				 * spends nearly all its time in here, which is how a dropped
+				 * subscription used to leave a worker that nothing short of
+				 * SIGKILL would end.
+				 */
+				assembly->wait(assembly, needs_startup || needs_restart
+							   ? LR_DRIVER_RETRY_MS : LR_DRIVER_RECOVER_MS);
 				if (!needs_startup)
 					needs_restart = true;
 			}

@@ -294,6 +294,17 @@ struct LogicalRepAssembly
 	/* the loop should end (the subscription was disabled, a limit was hit) */
 	bool		(*should_stop) (LogicalRepAssembly *self);
 
+	/*
+	 * Wait roughly this many milliseconds before the run is tried again.
+	 * Called only from the recovery path, where there is nothing to do but
+	 * back off.  It belongs to the assembly rather than the loop because how
+	 * a wait is woken out of is a property of where the run lives: a worker
+	 * has a latch its signal handler sets, and something that drives this
+	 * loop outside a backend may have neither.  An implementation that
+	 * cannot be woken should still return in about the time asked for.
+	 */
+	void		(*wait) (LogicalRepAssembly *self, int ms);
+
 	void	   *private_data;
 };
 

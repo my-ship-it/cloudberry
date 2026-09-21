@@ -2707,6 +2707,18 @@ assembly_reset(LogicalRepAssembly *self)
 	driver_disconnect_source(d);
 }
 
+/*
+ * The worker's wait: its SIGTERM handler sets the latch, so a stop asked for
+ * while the run is backing off ends the wait rather than waiting it out.
+ */
+static void
+assembly_wait(LogicalRepAssembly *self, int ms)
+{
+	(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					 ms, WAIT_EVENT_LOGICAL_APPLY_MAIN);
+	ResetLatch(MyLatch);
+}
+
 static bool
 assembly_should_stop(LogicalRepAssembly *self)
 {
@@ -2778,6 +2790,7 @@ LrMakeCbdbAssembly(LrCbdbTransport *tr, LrWorkerConfig *cfg, LrWorkerStats *stat
 	assembly->reset = assembly_reset;
 	assembly->restart = assembly_restart;
 	assembly->should_stop = assembly_should_stop;
+	assembly->wait = assembly_wait;
 	assembly->private_data = d;
 
 	return assembly;

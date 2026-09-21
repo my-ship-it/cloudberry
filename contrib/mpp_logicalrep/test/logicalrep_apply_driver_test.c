@@ -51,8 +51,11 @@ typedef struct MockAsm
 	int			n_restart;
 	int			n_shutdown;
 	int			n_handle_error;
+	int			n_wait;
 	bool		give_up;		/* what handle_error answers */
 	int			fail_startups;	/* startups that throw before one succeeds */
+	int			stop_after_startups;	/* 0 = never; else stop once this many
+										 * startups have been attempted */
 	int			fail_restarts;	/* restarts that throw before one succeeds */
 	bool		connected;		/* a startup or restart has succeeded */
 
@@ -201,10 +204,21 @@ masm_handle_error(LogicalRepAssembly *self, int sqlerrcode, const char *message)
 	return !st->give_up;
 }
 
+/* nothing to be woken out of here, and nothing to be gained by sleeping */
+static void
+masm_wait(LogicalRepAssembly *self, int ms)
+{
+	((MockAsm *) self->private_data)->n_wait++;
+}
+
 static bool
 masm_should_stop(LogicalRepAssembly *self)
 {
-	return ((MockAsm *) self->private_data)->nunits <= 0;
+	MockAsm    *st = (MockAsm *) self->private_data;
+
+	if (st->stop_after_startups > 0 && st->n_startup >= st->stop_after_startups)
+		return true;
+	return st->nunits <= 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -316,6 +330,7 @@ make_masm(MockAsm *st)
 		.reset = masm_reset,
 		.restart = masm_restart,
 		.should_stop = masm_should_stop,
+		.wait = masm_wait,
 		.private_data = st
 	};
 
@@ -515,6 +530,39 @@ test_a_failed_startup_is_graded_not_escaped(void **state)
 	assert_int_equal(as.n_shutdown, 1);
 }
 
+/* and a stop asked for while it still cannot come up is a stop */
+static void
+test_a_stop_while_it_cannot_come_up_is_honoured(void **state)
+{
+	MockAsm		as = {.nunits = 2,.txns_per = 1,.changes_per = 1,.next_gxid = 1};
+	MockSink	ss = {{0}};
+	LogicalRepAssembly assembly;
+	LogicalRepSink sink;
+
+	as.give_up = false;			/* "try again" */
+	ss.caps.commits_units = true;
+	as.fail_startups = 5;		/* it would keep failing */
+	as.stop_after_startups = 2; /* but is told to stop after two attempts */
+
+	assembly = make_masm(&as);
+	sink = make_msink(&ss);
+
+	lr_apply_driver_run(&assembly, &sink, NULL);
+
+	/*
+	 * Coming up is retried in a loop of its own, and the loop used to ask
+	 * whether to stop only once the run was up -- so a run that could not
+	 * come up never asked, and a worker whose source had gone retried there
+	 * for as long as the process lived, deaf to the stop that had been asked
+	 * for.  It is asked first now, before coming up is attempted again.
+	 */
+	assert_int_equal(as.n_startup, 2);
+	assert_int_equal(as.n_handle_error, 2);
+	assert_int_equal(as.n_wait, 2);		/* it backed off between attempts */
+	assert_int_equal(ss.n_commit, 0);	/* it never got to do any work */
+	assert_int_equal(as.n_shutdown, 1); /* and was still shut down once */
+}
+
 static void
 test_a_failed_restart_is_retried_not_polled_through(void **state)
 {
@@ -583,6 +631,7 @@ main(int argc, char *argv[])
 		unit_test(test_transient_error_is_retried),
 		unit_test(test_a_failed_restart_is_retried_not_polled_through),
 		unit_test(test_a_failed_startup_is_graded_not_escaped),
+		unit_test(test_a_stop_while_it_cannot_come_up_is_honoured),
 		unit_test(test_empty_stream)
 	};
 
