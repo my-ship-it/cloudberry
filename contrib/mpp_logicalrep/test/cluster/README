@@ -32,8 +32,10 @@ under the tree's own test frameworks, against whatever cluster
     ../../isolation2/sql/      isolation2: replication end to end, the
                                initial synchronisation, a table added to
                                a running subscription, the statistics
-                               views, fault injection under load, and the
-                               copy transport on its own
+                               views, fault injection under load, the
+                               copy transport on its own, and which
+                               distribution keys and replica identities a
+                               table may have on the two sides
 
     cd contrib/mpp_logicalrep && make installcheck installcheck-isolation2
 
@@ -74,11 +76,6 @@ distributed transactions and their own failures.
                             subscription, and a comparison per table and
                             per segment at the end.  The one to run
                             first, and the one to run after a change.
-    distribution_keys.sh    the target is distributed on something other
-                            than the source's key: which shapes work,
-                            which are refused, which are only warned
-                            about, and that an error which cannot pass
-                            disables the subscription
     slot_loss.sh            the source's slots disappear under a running
                             subscription, as a segment failover does
 

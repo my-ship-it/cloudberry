@@ -6,7 +6,7 @@
 # Target  = a second cluster with the module preloaded (default :7300);
 #           see README for how to make one with gpAux/gpdemo.
 #
-#   1  initial sync of a mixed schema (hash PK / random FULL / replicated / AO)
+#   1  initial sync of a mixed schema (hash PK / hash FULL / replicated / AO)
 #      while a workload runs, then streaming
 #   2  mixed workload: multi-row 2PC INSERT, one-phase single-row INSERT,
 #      keyed UPDATE/DELETE, no-match UPDATE, savepoint rollback, big
@@ -103,8 +103,8 @@ cleanup() {
   done
   drop_slots
   $S -c "DROP PUBLICATION IF EXISTS $PUB" >/dev/null 2>&1
-  $S -c "DROP TABLE IF EXISTS r12_hash, r12_rand, r12_repl, r12_ao, r12_late CASCADE" >/dev/null 2>&1
-  $T -c "DROP TABLE IF EXISTS r12_hash, r12_rand, r12_repl, r12_ao, r12_late CASCADE" >/dev/null 2>&1
+  $S -c "DROP TABLE IF EXISTS r12_hash, r12_full, r12_repl, r12_ao, r12_late CASCADE" >/dev/null 2>&1
+  $T -c "DROP TABLE IF EXISTS r12_hash, r12_full, r12_repl, r12_ao, r12_late CASCADE" >/dev/null 2>&1
 }
 
 ddl() { # run the same DDL on both clusters
@@ -123,7 +123,7 @@ echo "==== cleanup"; cleanup
 # ------------------------------------------------------------------ schema
 echo; echo "==== 1. schema + seed + subscription (initial sync under load)"
 ddl "CREATE TABLE r12_hash (id int PRIMARY KEY, v text, n int) DISTRIBUTED BY (id)"
-ddl "CREATE TABLE r12_rand (id int, v text) DISTRIBUTED RANDOMLY"
+ddl "CREATE TABLE r12_full (id int, v text) DISTRIBUTED BY (id)"
 ddl "CREATE TABLE r12_repl (id int PRIMARY KEY, v text) DISTRIBUTED REPLICATED"
 # r12_ao is heap on the source and AO on the target: that is the supported
 # combination (the writer applies into AO/AOCO, R6/V7).  A source AO table
@@ -132,16 +132,16 @@ ddl "CREATE TABLE r12_repl (id int PRIMARY KEY, v text) DISTRIBUTED REPLICATED"
 $S -c "CREATE TABLE r12_ao (id int, v text) DISTRIBUTED BY (id)" >/dev/null
 $T -c "CREATE TABLE r12_ao (id int, v text) WITH (appendonly=true) DISTRIBUTED BY (id)" >/dev/null
 ddl "CREATE TABLE r12_late (id int PRIMARY KEY, v text) DISTRIBUTED BY (id)"
-$S -c "ALTER TABLE r12_rand REPLICA IDENTITY FULL" >/dev/null
-$T -c "ALTER TABLE r12_rand REPLICA IDENTITY FULL" >/dev/null
+$S -c "ALTER TABLE r12_full REPLICA IDENTITY FULL" >/dev/null
+$T -c "ALTER TABLE r12_full REPLICA IDENTITY FULL" >/dev/null
 $S -c "ALTER TABLE r12_ao REPLICA IDENTITY FULL" >/dev/null
 $T -c "ALTER TABLE r12_ao REPLICA IDENTITY FULL" >/dev/null
 $S -c "INSERT INTO r12_hash SELECT g, 'seed', g%7 FROM generate_series(1,20000) g" >/dev/null
-$S -c "INSERT INTO r12_rand SELECT g, 'seed' FROM generate_series(1,3000) g" >/dev/null
+$S -c "INSERT INTO r12_full SELECT g, 'seed' FROM generate_series(1,3000) g" >/dev/null
 $S -c "INSERT INTO r12_repl SELECT g, 'seed' FROM generate_series(1,500) g" >/dev/null
 $S -c "INSERT INTO r12_ao SELECT g, 'seed' FROM generate_series(1,5000) g" >/dev/null
 $S -c "INSERT INTO r12_late SELECT g, 'seed' FROM generate_series(1,4000) g" >/dev/null
-$S -c "CREATE PUBLICATION $PUB FOR TABLE r12_hash, r12_rand, r12_repl, r12_ao" >/dev/null
+$S -c "CREATE PUBLICATION $PUB FOR TABLE r12_hash, r12_full, r12_repl, r12_ao" >/dev/null
 
 # a workload that spans the whole run
 workload() {
@@ -154,8 +154,8 @@ workload() {
     $S -c "DELETE FROM r12_hash WHERE id=$((base+5))" >/dev/null 2>&1
     $S -c "UPDATE r12_hash SET v='nomatch' WHERE id=$((base+90000))" >/dev/null 2>&1
     $S -c "BEGIN; INSERT INTO r12_hash VALUES ($((base+60)),'sp',$b); SAVEPOINT s; INSERT INTO r12_hash VALUES ($((base+61)),'gone',$b); ROLLBACK TO s; UPDATE r12_hash SET v='multi' WHERE id=$((base+7)); COMMIT" >/dev/null 2>&1
-    $S -c "INSERT INTO r12_rand VALUES ($base,'r$b')" >/dev/null 2>&1
-    $S -c "UPDATE r12_rand SET v='ru$b' WHERE id=$((b*3))" >/dev/null 2>&1
+    $S -c "INSERT INTO r12_full VALUES ($base,'r$b')" >/dev/null 2>&1
+    $S -c "UPDATE r12_full SET v='ru$b' WHERE id=$((b*3))" >/dev/null 2>&1
     $S -c "INSERT INTO r12_repl VALUES ($base,'p$b')" >/dev/null 2>&1
     $S -c "INSERT INTO r12_ao SELECT g,'a$b' FROM generate_series($base,$((base+4))) g" >/dev/null 2>&1
     $S -c "INSERT INTO r12_late VALUES ($base,'l$b')" >/dev/null 2>&1
@@ -198,7 +198,7 @@ wait $WL; echo "-- workload finished"
 
 # ------------------------------------------------------------------ verify
 echo; echo "==== 5. verification"
-for t in r12_hash r12_rand r12_repl r12_ao r12_late; do
+for t in r12_hash r12_full r12_repl r12_ao r12_late; do
   wait_match $t 120 || fail "$t did not converge"
 done
 

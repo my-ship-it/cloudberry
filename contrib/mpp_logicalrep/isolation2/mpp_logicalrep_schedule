@@ -7,6 +7,7 @@ test: subtransactions
 test: prepared_statements
 test: maintenance
 test: truncate_locks
+test: distribution_keys
 test: publisher_ddl
 test: onephase
 test: ordering

@@ -549,6 +549,10 @@ typedef struct LrRelKeys
 	char		replident;		/* pg_class.relreplident */
 	List	   *distkey;		/* char*: distribution key columns */
 	List	   *identity;		/* char*: replica identity columns */
+	List	   *uniques;		/* char*: one comma-joined column list per
+								 * unique index that could identify a row on
+								 * its own -- valid, immediate, whole-table,
+								 * over plain NOT NULL columns */
 } LrRelKeys;
 
 static List *
@@ -563,6 +567,23 @@ name_list(const char *csv)
 		return NIL;
 	copy = pstrdup(csv);
 	for (tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
+		result = lappend(result, pstrdup(tok));
+	return result;
+}
+
+/* the same, for the ';'-separated list of column lists */
+static List *
+semi_list(const char *s)
+{
+	List	   *result = NIL;
+	char	   *copy;
+	char	   *save = NULL;
+	char	   *tok;
+
+	if (s == NULL || *s == '\0')
+		return NIL;
+	copy = pstrdup(s);
+	for (tok = strtok_r(copy, ";", &save); tok; tok = strtok_r(NULL, ";", &save))
 		result = lappend(result, pstrdup(tok));
 	return result;
 }
@@ -617,7 +638,24 @@ sync_fetch_keys(LrSync *s, PGconn *conn, const char *who, const char *qualified,
 					"          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey::int2[])\n"
 					"         WHERE i.indrelid = c.oid\n"
 					"           AND ((c.relreplident = 'd' AND i.indisprimary)\n"
-					"             OR (c.relreplident = 'i' AND i.indisreplident)))\n"
+					"             OR (c.relreplident = 'i' AND i.indisreplident))),\n"
+					"       (SELECT coalesce(string_agg(cols, ';'), '')\n"
+					"          FROM (SELECT (SELECT string_agg(a.attname, ',' ORDER BY a.attname)\n"
+					"                          FROM pg_attribute a\n"
+					"                         WHERE a.attrelid = c.oid\n"
+					"                           AND a.attnum = ANY (i.indkey::int2[])\n"
+					"                           AND a.attnotnull) AS cols\n"
+					"                  FROM pg_index i\n"
+					"                 WHERE i.indrelid = c.oid AND i.indisunique\n"
+					"                   AND i.indisvalid AND i.indimmediate\n"
+					"                   AND i.indpred IS NULL AND i.indexprs IS NULL\n"
+					"                   AND i.indnatts = i.indnkeyatts\n"
+					"                   AND (SELECT count(*) FROM pg_attribute a\n"
+					"                         WHERE a.attrelid = c.oid\n"
+					"                           AND a.attnum = ANY (i.indkey::int2[])\n"
+					"                           AND a.attnotnull)\n"
+					"                       = array_length(i.indkey::int2[], 1)) u\n"
+					"         WHERE cols IS NOT NULL)\n"
 					"  FROM pg_class c LEFT JOIN gp_distribution_policy p ON p.localoid = c.oid\n"
 					" WHERE c.oid = to_regclass($1)",
 					1, params);
@@ -627,10 +665,45 @@ sync_fetch_keys(LrSync *s, PGconn *conn, const char *who, const char *qualified,
 		keys->replident = PQgetvalue(res, 0, 1)[0];
 		keys->distkey = name_list(PQgetvalue(res, 0, 2));
 		keys->identity = name_list(PQgetvalue(res, 0, 3));
+		keys->uniques = semi_list(PQgetvalue(res, 0, 4));
 	}
 	PQclear(res);
 }
 
+/*
+ * Is any of the target's unique indexes made only of columns the source sends
+ * as the old row's identity?  That is what makes one identity name at most
+ * one target row; without it the apply takes whichever row it finds first and
+ * the two sides quietly drift apart.
+ */
+static bool
+identity_is_unique_on_target(LrRelKeys *tgt, List *src_identity, bool identity_is_all)
+{
+	ListCell   *lc;
+
+	foreach(lc, tgt->uniques)
+		if (identity_is_all ||
+			names_subset(name_list((char *) lfirst(lc)), src_identity))
+			return true;
+	return false;
+}
+
+/* DISTRIBUTED RANDOMLY: a policy with no key at all (replicated is 'r') */
+static bool
+is_random(LrRelKeys *k)
+{
+	return k->policytype == 'p' && k->distkey == NIL;
+}
+
+/*
+ * What a table has to look like on both sides for its changes to be applied
+ * to exactly the right row, on exactly the right segment, every time.
+ *
+ * These are refusals rather than warnings.  Each of them, left to run, goes
+ * wrong silently: a row applied on the wrong segment, or to the wrong one of
+ * several rows that look alike.  A subscription that cannot be right is
+ * better stopped before it has moved any data.
+ */
 static void
 sync_check_keys(LrSync *s, LrSyncRel *r)
 {
@@ -642,34 +715,78 @@ sync_check_keys(LrSync *s, LrSyncRel *r)
 	sync_fetch_keys(s, s->tgt2, "target", r->qualified, &tgt);
 
 	/*
-	 * Applying an UPDATE needs to know which target segment holds the row,
-	 * which means the old value of the target's distribution key.  The
-	 * source only sends old values of its replica identity.
+	 * A randomly distributed table has no key, so nothing says which segment
+	 * a row belongs on.  The target would have to be told to look everywhere,
+	 * and the source could not be asked where a row came from.
 	 */
-	if (tgt.policytype == 'p' && tgt.distkey != NIL &&
-		src.replident != REPLICA_IDENTITY_FULL &&
-		!names_subset(tgt.distkey, src.identity))
-		ereport(WARNING,
-				(errmsg("logical replication: the distribution key (%s) of target relation %s is not part of the replica identity of the source relation",
-						names_text(tgt.distkey), r->qualified),
-				 errdetail("An UPDATE that changes it moves the row to another target segment, which needs the old value of the key; the source does not send it. Such an UPDATE will be refused."),
-				 errhint("Set REPLICA IDENTITY FULL on the source relation, or distribute the target relation by columns of its replica identity. INSERT and DELETE are not affected.")));
+	if (is_random(&src) || is_random(&tgt))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("logical replication: %s is DISTRIBUTED RANDOMLY on the %s",
+						r->qualified, is_random(&src) ? "source" : "target"),
+				 errdetail("A randomly distributed table has no key to say which segment a row belongs on."),
+				 errhint("Distribute both sides by a key, or leave the table out of the publication.")));
 
 	/*
-	 * An UPDATE of the source's distribution key moves the row between
-	 * source segments, so it reaches the target as a DELETE from one stream
-	 * and an INSERT from another.  The target must be able to tell those two
-	 * rows apart, or it sees one row deleted and inserted in an order nobody
-	 * defines.
+	 * The rest is about finding an existing row again.  A source relation
+	 * with no replica identity has none to find it by, so it can only ever
+	 * publish INSERTs -- the server refuses an UPDATE or a DELETE on it --
+	 * and an INSERT is routed by the new row alone.  Nothing below applies.
 	 */
-	if (src.policytype == 'p' && src.distkey != NIL &&
-		tgt.replident != REPLICA_IDENTITY_FULL &&
-		!names_subset(src.distkey, tgt.identity))
+	if (src.replident != REPLICA_IDENTITY_FULL && src.identity == NIL)
+		return;
+
+	/*
+	 * The target's key has to be part of the source's, so that rows the
+	 * source keeps together stay together on the target.  Then a change that
+	 * leaves the source's key alone cannot move the row on the target either,
+	 * and an UPDATE is an UPDATE on one segment -- the source already sends a
+	 * change of its own key as a DELETE and an INSERT.
+	 */
+	if (tgt.distkey != NIL && !names_subset(tgt.distkey, src.distkey))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("logical replication: the distribution key (%s) of target relation %s is not part of the source's (%s)",
+						names_text(tgt.distkey), r->qualified, names_text(src.distkey)),
+				 errdetail("Rows the source holds on one segment would be spread over several target segments, and an UPDATE could have to move a row between them."),
+				 errhint("Distribute the target by the same columns as the source, or by some of them.")));
+
+	/*
+	 * And part of what the source sends as the old row, or the target segment
+	 * a row is leaving cannot be worked out at all.  REPLICA IDENTITY FULL
+	 * sends every column, so it covers any key.
+	 */
+	if (tgt.distkey != NIL && src.replident != REPLICA_IDENTITY_FULL &&
+		!names_subset(tgt.distkey, src.identity))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("logical replication: the distribution key (%s) of target relation %s is not part of the replica identity of the source relation",
+						names_text(tgt.distkey), r->qualified),
+				 errdetail("Applying a change needs the old value of the target's distribution key to know which segment holds the row; the source does not send it."),
+				 errhint("Set REPLICA IDENTITY FULL on the source relation, or distribute the target by columns of its replica identity.")));
+
+	/*
+	 * Finally, one identity must name one target row.  A source that sends
+	 * whole rows (FULL) cannot do better than the rows themselves, and rows
+	 * that are equal in every column are interchangeable, so that case is
+	 * only worth a warning.
+	 */
+	if (src.replident != REPLICA_IDENTITY_FULL &&
+		!identity_is_unique_on_target(&tgt, src.identity, false))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("logical replication: target relation %s has no unique index over the replica identity (%s) of the source relation",
+						r->qualified, names_text(src.identity)),
+				 errdetail("The source names a row by those columns. With nothing on the target to make them unique, an UPDATE or DELETE is applied to whichever matching row is found first, and the two sides drift apart without an error."),
+				 errhint("Create a unique index on the target over those columns, or some of them.")));
+
+	if (src.replident == REPLICA_IDENTITY_FULL &&
+		!identity_is_unique_on_target(&tgt, src.identity, true))
 		ereport(WARNING,
-				(errmsg("logical replication: the distribution key (%s) of source relation %s is not part of the replica identity of the target relation",
-						names_text(src.distkey), r->qualified),
-				 errdetail("Updating it on the source moves the row between source segments, which reaches the target as a DELETE and an INSERT of what it considers the same row, in no defined order."),
-				 errhint("Include those columns in the target's replica identity, or distribute both sides by the same columns. Changes that leave the source's distribution key alone are not affected.")));
+				(errmsg("logical replication: target relation %s has no unique index, and the source sends whole rows as the replica identity",
+						r->qualified),
+				 errdetail("An UPDATE or DELETE is applied to the first row that matches in every column. Rows that are equal in every column are interchangeable, so this is consistent as long as the target holds no rows the source does not."),
+				 errhint("Create a unique index on the target to have each change applied to a row of its own.")));
 }
 
 /*

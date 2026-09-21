@@ -238,19 +238,46 @@ enough to carry this module honours logical slots on the coordinator too.)
 Requirements on the tables
 --------------------------
 
-Two conditions are checked per table when it is synchronised, and
-reported as warnings rather than errors so that a subscription covering
-many tables still starts.
+A change is applied to one row, on one segment.  For that to be the right
+row on the right segment every time, a published table has to satisfy all
+of the following on both sides.  They are checked when the table joins
+the subscription -- at the start, or in ALTER SUBSCRIPTION ... REFRESH
+PUBLICATION for one added later -- and a table that fails stops the
+subscription with the reason recorded, because every one of them goes
+wrong silently if it is let through.
 
-The target's distribution key must be covered by the source's replica
-identity.  An UPDATE that changes a target distribution column has to
-move the row between segments, which apply does as DELETE + INSERT, and
-that needs the whole old key.  Without it the UPDATE is refused.
+Neither side may be DISTRIBUTED RANDOMLY.  Such a table has no key to say
+which segment a row belongs on.
 
-The source's distribution key must be covered by the target's replica
-identity.  Otherwise two rows that lived on different source segments
-can collide on one target row, and the DELETE + INSERT pair for one of
-them lands out of order.
+The target's distribution key must be part of the source's.  Then a
+change that leaves the source's key alone cannot move the row on the
+target either, so an UPDATE is an UPDATE of one row on one segment.  A
+change of the source's key does not arrive as an UPDATE at all: moving a
+row between source segments is a DELETE and an INSERT there, and that is
+what the stream carries.  Distributing the target by the same columns, or
+by some of them, satisfies this; distributing it by other columns does
+not.
+
+The target's distribution key must also be part of what the source sends
+as the old row, or the segment a row is leaving cannot be worked out.
+REPLICA IDENTITY FULL sends every column and so covers any key.  (In
+Cloudberry every unique index contains the distribution key, so a source
+with a primary key satisfies this as soon as the condition above holds.)
+
+The target must have a unique index over the source's replica identity --
+over those columns or some of them, valid, immediate, whole-table, and on
+columns declared NOT NULL.  It is what makes one identity name one target
+row.  Without it, an UPDATE or a DELETE is applied to whichever matching
+row is found first, and the two sides drift apart with no error anywhere.
+When the source sends whole rows (REPLICA IDENTITY FULL) this is a
+warning rather than a refusal: rows equal in every column are
+interchangeable, so applying to the first is consistent as long as the
+target holds no rows the source does not.
+
+A source relation with no replica identity at all is exempt from the
+three conditions above.  It can only ever publish INSERTs -- the server
+refuses an UPDATE or a DELETE on it -- and an INSERT is routed by the new
+row alone.
 
 Only heap tables can be published.  Append-optimised tables (ao_row,
 ao_column) and PAX have no logical decoding routine on the publisher, so

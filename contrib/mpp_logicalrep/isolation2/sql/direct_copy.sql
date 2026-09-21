@@ -11,9 +11,8 @@
 -- distribution key and the key's operator class all have to match, which is
 -- what tells the legacy hash from the jump-consistent one.
 --
---   dc_same  keyed the same on both sides   -> loaded where it lands
---   dc_diff  keyed on another column        -> redistributed, as before
---   dc_rand  randomly distributed on both   -> loaded where it lands
+--   dc_same    keyed the same on both sides    -> loaded where it lands
+--   dc_narrow  target keyed on fewer columns   -> redistributed, as before
 --
 -- gp_enable_segment_copy_checking is left at its default, which is what makes
 -- the direct path safe: every segment recomputes where each row belongs and
@@ -26,17 +25,14 @@ SELECT count(*) = 3 AS three_primaries
 CREATE DATABASE mpp_lr_dc;
 
 CREATE TABLE dc_same (id int, v text) DISTRIBUTED BY (id);
-CREATE TABLE dc_diff (id int, k int, v text) DISTRIBUTED BY (id);
-CREATE TABLE dc_rand (id int, v text) DISTRIBUTED RANDOMLY;
+CREATE TABLE dc_narrow (id int, k int, v text) DISTRIBUTED BY (id, k);
 INSERT INTO dc_same SELECT g, 'x' || g FROM generate_series(1, 300000) g;
-INSERT INTO dc_diff SELECT g, g * 2, 'y' || g FROM generate_series(1, 50000) g;
-INSERT INTO dc_rand SELECT g, 'z' || g FROM generate_series(1, 50000) g;
-CREATE PUBLICATION dc_pub FOR TABLE dc_same, dc_diff, dc_rand;
+INSERT INTO dc_narrow SELECT g, g * 2, 'y' || g FROM generate_series(1, 50000) g;
+CREATE PUBLICATION dc_pub FOR TABLE dc_same, dc_narrow;
 
--- the target: same placement, other placement, random
+-- the target: same placement, and one keyed on fewer of the same columns
 1:@db_name mpp_lr_dc: CREATE TABLE dc_same (id int, v text) DISTRIBUTED BY (id);
-1:@db_name mpp_lr_dc: CREATE TABLE dc_diff (id int, k int, v text) DISTRIBUTED BY (k);
-1:@db_name mpp_lr_dc: CREATE TABLE dc_rand (id int, v text) DISTRIBUTED RANDOMLY;
+1:@db_name mpp_lr_dc: CREATE TABLE dc_narrow (id int, k int, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_dc: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 
 -- Which statement each table was loaded with, caught while it runs.  Reads
@@ -44,13 +40,13 @@ CREATE PUBLICATION dc_pub FOR TABLE dc_same, dc_diff, dc_rand;
 -- pg_stat_activity is a snapshot taken once per transaction, and this whole
 -- loop is one transaction, so every round would otherwise read the same
 -- frozen view: pg_stat_clear_snapshot() is what makes it look again.
-2:@db_name mpp_lr_dc: CREATE FUNCTION dc_watch() RETURNS text AS $$ DECLARE direct bool DEFAULT false; motion bool DEFAULT false; n int; BEGIN FOR i IN 1 .. 6000 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE query LIKE 'COPY%dc_same%FROM PROGRAM%ON SEGMENT'; IF n > 0 THEN SELECT true INTO direct; END IF; SELECT count(*) INTO n FROM pg_stat_activity WHERE query LIKE 'INSERT INTO%dc_diff%gp_lr_copy_recv%'; IF n > 0 THEN SELECT true INTO motion; END IF; EXIT WHEN direct AND motion; PERFORM pg_sleep(0.05); END LOOP; RETURN 'same_loaded_where_it_landed=' || direct || ' diff_went_through_a_redistribution=' || motion; END $$ LANGUAGE plpgsql;
+2:@db_name mpp_lr_dc: CREATE FUNCTION dc_watch() RETURNS text AS $$ DECLARE direct bool DEFAULT false; motion bool DEFAULT false; n int; BEGIN FOR i IN 1 .. 6000 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE query LIKE 'COPY%dc_same%FROM PROGRAM%ON SEGMENT'; IF n > 0 THEN SELECT true INTO direct; END IF; SELECT count(*) INTO n FROM pg_stat_activity WHERE query LIKE 'INSERT INTO%dc_narrow%gp_lr_copy_recv%'; IF n > 0 THEN SELECT true INTO motion; END IF; EXIT WHEN direct AND motion; PERFORM pg_sleep(0.05); END LOOP; RETURN 'same_loaded_where_it_landed=' || direct || ' narrow_went_through_a_redistribution=' || motion; END $$ LANGUAGE plpgsql;
 
 2&:@db_name mpp_lr_dc: SELECT dc_watch() AS how_each_was_loaded;
 1:@db_name mpp_lr_dc: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION dc_sub CONNECTION %L PUBLICATION dc_pub WITH (slot_name = ''dc_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 2<:
 
-1:@db_name mpp_lr_dc: SELECT lr_wait($$SELECT count(*) = 3 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'dc_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS all_synced;
+1:@db_name mpp_lr_dc: SELECT lr_wait($$SELECT count(*) = 2 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'dc_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS all_synced;
 
 -- every row arrived, and on the segment the target's own policy puts it on:
 -- a reference copy made by an ordinary INSERT lands the same way, segment by
@@ -61,16 +57,14 @@ CREATE PUBLICATION dc_pub FOR TABLE dc_same, dc_diff, dc_rand;
 
 SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM dc_same;
 1:@db_name mpp_lr_dc: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM dc_same;
-SELECT count(*) AS rows, sum(hashtext(id || '|' || k || '|' || v)) AS digest FROM dc_diff;
-1:@db_name mpp_lr_dc: SELECT count(*) AS rows, sum(hashtext(id || '|' || k || '|' || v)) AS digest FROM dc_diff;
-SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM dc_rand;
-1:@db_name mpp_lr_dc: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM dc_rand;
+SELECT count(*) AS rows, sum(hashtext(id || '|' || k || '|' || v)) AS digest FROM dc_narrow;
+1:@db_name mpp_lr_dc: SELECT count(*) AS rows, sum(hashtext(id || '|' || k || '|' || v)) AS digest FROM dc_narrow;
 
 -- and the stream runs on afterwards, over both kinds of table
 INSERT INTO dc_same VALUES (900001, 'after');
-INSERT INTO dc_diff VALUES (900002, 7, 'after');
+INSERT INTO dc_narrow VALUES (900002, 7, 'after');
 1:@db_name mpp_lr_dc: SELECT lr_wait('SELECT count(*) = 300001 FROM dc_same') AS same_streams;
-1:@db_name mpp_lr_dc: SELECT lr_wait('SELECT count(*) = 50001 FROM dc_diff') AS diff_streams;
+1:@db_name mpp_lr_dc: SELECT lr_wait('SELECT count(*) = 50001 FROM dc_narrow') AS diff_streams;
 1:@db_name mpp_lr_dc: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'dc_sub';
 
 1:@db_name mpp_lr_dc: DROP SUBSCRIPTION dc_sub;
@@ -78,5 +72,5 @@ INSERT INTO dc_diff VALUES (900002, 7, 'after');
 2q:
 SELECT gp_drop_replication_slot('dc_slot');
 DROP PUBLICATION dc_pub;
-DROP TABLE dc_same, dc_diff, dc_rand;
+DROP TABLE dc_same, dc_narrow;
 DROP DATABASE mpp_lr_dc;

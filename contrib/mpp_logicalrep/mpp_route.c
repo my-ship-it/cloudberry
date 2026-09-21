@@ -26,8 +26,10 @@
  * route_rel_open() checks that the invariant holds for each relation rather
  * than trusting it.
  *   replicated   everything to every segment
- *   randomly     INSERT stays on the reader's own segment; UPDATE and DELETE
- *                go to every segment, only one of which finds the row
+ *
+ * A randomly distributed table has no key to route by and is refused when it
+ * joins the subscription; this refuses it again here, because either side can
+ * be altered afterwards without anyone looking.
  *
  * Only the distribution key columns are decoded, with the target column's
  * input (or receive) function; the rest of the tuple is forwarded as the
@@ -60,7 +62,6 @@ typedef enum LrDistKind
 {
 	LR_DIST_HASH,
 	LR_DIST_REPLICATED,
-	LR_DIST_RANDOM,
 } LrDistKind;
 
 /* one target relation, open for the lifetime of the router */
@@ -98,7 +99,6 @@ static LrRouteRel *route_rel_open(LrRouter *r, const LogicalRepRelation *remoter
 static void route_rel_close(LrRouter *r, LrRouteRel *rr);
 static int	route_tuple(LrRouter *r, LrRouteRel *rr, const LogicalRepTupleData *tup,
 						bool key_only_tuple);
-static int	split_update(const char *body, int len, int *old_end);
 
 LrRouter *
 LrRouterCreate(MemoryContext cxt, int nsegs, int source_seg)
@@ -190,9 +190,6 @@ LrRouteChange(LrRouter *r, const LogicalRepRelation *remoterel,
 					case LR_DIST_REPLICATED:
 						out[0].target = LR_TARGET_ALL;
 						break;
-					case LR_DIST_RANDOM:
-						out[0].target = r->source_seg % r->nsegs;
-						break;
 					case LR_DIST_HASH:
 						out[0].target = route_tuple(r, rr, &newtup, false);
 						if (out[0].target == LR_TARGET_UNKNOWN)
@@ -237,7 +234,7 @@ LrRouteChange(LrRouter *r, const LogicalRepRelation *remoterel,
 
 				if (rr->kind != LR_DIST_HASH)
 				{
-					/* replicated: everywhere; random: only one segment has it */
+					/* replicated: every segment holds every row */
 					out[0].target = LR_TARGET_ALL;
 					n = 1;
 					break;
@@ -278,42 +275,26 @@ LrRouteChange(LrRouter *r, const LogicalRepRelation *remoterel,
 										remoterel->nspname, remoterel->relname)));
 				}
 
-				if (old_t == new_t)
-				{
-					out[0].target = new_t;
-					n = 1;
-				}
-				else
-				{
-					/*
-					 * The row moves, or its old segment cannot be computed:
-					 * DELETE the old row where it is (everywhere if unknown)
-					 * and INSERT the new one where it belongs.  Both bodies
-					 * reuse the bytes of the UPDATE message.
-					 */
-					int			old_end;
-					char	   *dbody,
-							   *ibody;
+				/*
+				 * The row cannot move.  The target's distribution key is part
+				 * of the source's, so a change that leaves the source's key
+				 * alone leaves the target's alone too -- and a change of the
+				 * source's key never arrives as an UPDATE, because moving a
+				 * row between source segments is a DELETE and an INSERT
+				 * there.  Both are checked when the table joins the
+				 * subscription; either side can still be altered afterwards
+				 * without anyone looking again, so say so rather than guess.
+				 */
+				if (old_t != new_t)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("cannot apply UPDATE to \"%s.%s\": it would move the row to another target segment",
+									remoterel->nspname, remoterel->relname),
+							 errdetail("The target's distribution key must be part of the source's, which rules this out; one of them has been altered since the table joined the subscription."),
+							 errhint("Restore the distribution keys, or drop the table from the publication and add it again.")));
 
-					if (!split_update(body, len, &old_end))
-						elog(ERROR, "malformed UPDATE message");
-
-					dbody = palloc(old_end);
-					memcpy(dbody, body, old_end);	/* relid + K/O + old tuple */
-					ibody = palloc(4 + (len - old_end));
-					memcpy(ibody, body, 4);	/* relid */
-					memcpy(ibody + 4, body + old_end, len - old_end);	/* N + new */
-
-					out[0].op = LR_OP_DELETE;
-					out[0].target = old_t == LR_TARGET_UNKNOWN ? LR_TARGET_ALL : old_t;
-					out[0].data = dbody;
-					out[0].len = old_end;
-					out[1].op = LR_OP_INSERT;
-					out[1].target = new_t;
-					out[1].data = ibody;
-					out[1].len = 4 + (len - old_end);
-					n = 2;
-				}
+				out[0].target = new_t;
+				n = 1;
 				break;
 			}
 
@@ -323,31 +304,6 @@ LrRouteChange(LrRouter *r, const LogicalRepRelation *remoterel,
 
 	MemoryContextSwitchTo(oldcxt);
 	return n;
-}
-
-/*
- * Offset in an UPDATE body where the 'N' of the new tuple starts, i.e. the
- * end of the old tuple part.  The body must carry an old tuple.
- */
-static int
-split_update(const char *body, int len, int *old_end)
-{
-	StringInfoData s;
-	LogicalRepTupleData oldtup;
-
-	if (len <= 5 || (body[4] != 'K' && body[4] != 'O'))
-		return 0;
-
-	/* relid + K/O + tuple is exactly what a DELETE body looks like */
-	s.data = (char *) body;
-	s.len = len;
-	s.maxlen = -1;
-	s.cursor = 0;
-	(void) logicalrep_read_delete(&s, &oldtup);
-	if (s.cursor >= len || body[s.cursor] != 'N')
-		return 0;
-	*old_end = s.cursor;
-	return 1;
 }
 
 /*
@@ -432,7 +388,12 @@ route_rel_open(LrRouter *r, const LogicalRepRelation *remoterel,
 	if (policy->ptype == POLICYTYPE_REPLICATED)
 		rr->kind = LR_DIST_REPLICATED;
 	else if (policy->nattrs == 0)
-		rr->kind = LR_DIST_RANDOM;
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot apply changes to \"%s.%s\": it is DISTRIBUTED RANDOMLY",
+						remoterel->nspname, remoterel->relname),
+				 errdetail("A randomly distributed table has no key to say which segment a row belongs on. This is checked when the table joins the subscription; it has been altered since."),
+				 errhint("Distribute the table by a key, or drop it from the publication.")));
 	else
 	{
 		rr->kind = LR_DIST_HASH;
