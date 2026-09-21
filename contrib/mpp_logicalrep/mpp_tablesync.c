@@ -180,7 +180,8 @@ static void sync_check_keys(LrSync *s, LrSyncRel *r);
 static void copy_via_coordinators(LrSync *s, LrSyncRel *r);
 static void sync_set_rel_state(LrSync *s, Oid relid, char state, const char *job);
 static void sync_finish(LrSync *s);
-static void sync_apply_snapshot(LrWorkerConfig *cfg, const char *text);
+static void sync_apply_snapshot(LrWorkerConfig *cfg, const char *text,
+								MemoryContext cxt);
 static int	sync_count_slots(LrSync *s);
 static bool sync_handle_slot_loss(LrSync *s);
 static void sync_wait(LrSync *s, int ms);
@@ -247,7 +248,7 @@ LrInitialSync(LrWorkerConfig *cfg)
 		{
 			/* streaming phase: only the cut point matters, for the filter */
 			if (snapshot)
-				sync_apply_snapshot(cfg, snapshot);
+				sync_apply_snapshot(cfg, snapshot, oldcxt);
 		}
 		else
 		{
@@ -265,7 +266,7 @@ LrInitialSync(LrWorkerConfig *cfg)
 				sync_copy_table(s, (LrSyncRel *) lfirst(lc));
 			PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
 			sync_finish(s);
-			sync_apply_snapshot(cfg, s->ds_text);
+			sync_apply_snapshot(cfg, s->ds_text, oldcxt);
 			did_sync = true;
 
 			elog(LOG, "mpp apply worker: subscription %u: initial synchronisation done: %d tables, L_t %s, DS_t xmax " INT64_FORMAT ", %d in progress",
@@ -1487,6 +1488,14 @@ sync_barrier(LrSync *s)
 	int64		xmax_pre = sync_snapshot_field(s, "xmax");
 	TimestampTz started = GetCurrentTimestamp();
 
+	/*
+	 * Say what is being waited for.  A barrier that sits here for its whole
+	 * budget and then fails is otherwise a minute of silence followed by one
+	 * number with nothing to compare it against.
+	 */
+	elog(LOG, "mpp apply worker: subscription %u: barrier: waiting for the distributed transactions below " INT64_FORMAT " to finish",
+		 s->cfg->subid, xmax_pre);
+
 	for (;;)
 	{
 		int64		xmin = sync_snapshot_field(s, "xmin");
@@ -1553,9 +1562,16 @@ sync_cut_point(LrSync *s)
 		 s->cfg->subid, s->lt, s->ds_text);
 }
 
-/* "xmax=<n>;inprogress=<a,b,..>" -> cfg */
+/*
+ * "xmax=<n>;inprogress=<a,b,..>" -> cfg
+ *
+ * The array outlives this synchronisation: the driver reads it for as long as
+ * the filter is live, which is well after LrInitialSync() has thrown its own
+ * context away.  So it goes in cxt, the caller's, which is the one cfg itself
+ * was allocated in.
+ */
 static void
-sync_apply_snapshot(LrWorkerConfig *cfg, const char *text)
+sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 {
 	const char *p;
 	char	   *copy;
@@ -1576,7 +1592,7 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text)
 		if (*tok == ',')
 			n++;
 	n++;
-	arr = palloc(sizeof(int64) * n);
+	arr = (int64 *) MemoryContextAlloc(cxt, sizeof(int64) * n);
 	n = 0;
 	for (tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
 		arr[n++] = strtoll(tok, NULL, 10);

@@ -20,3 +20,4 @@ test: monitoring
 test: faults
 test: crash_recovery
 test: shutdown
+test: sync_filter
