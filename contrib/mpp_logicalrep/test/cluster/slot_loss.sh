@@ -169,6 +169,18 @@ $T -c "ALTER SUBSCRIPTION $SUB DISABLE" >/dev/null
 for k in $(seq 1 60); do
   [ "$($T -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type='mpp apply worker'")" = "0" ] && break; sleep 0.5
 done
+# Capping the WAL is a setting of the whole source cluster, and the WAL
+# switches below invalidate every slot that is behind -- not just this test's.
+# Only do it when this test's slot is the only one there is.
+OTHERS=$($S -c "SELECT count(DISTINCT slot_name) FROM gp_replication_slots WHERE slot_name <> '$SLOT'")
+if [ "${OTHERS:-0}" != "0" ]; then
+  echo "  SKIPPED: the source has $OTHERS other replication slot(s), and capping"
+  echo "           max_slot_wal_keep_size here would invalidate them too."
+  echo "           Drop them, or run this phase on a cluster of your own."
+  $T -c "ALTER SUBSCRIPTION $SUB ENABLE" >/dev/null
+  echo; echo "==== cleanup"; cleanup
+  echo; [ $FAILS -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURE(S)"; exit 1; }
+fi
 CO="PGOPTIONS=-cgp_role=utility psql -p $SRC_PORT -d postgres -Atq"
 eval "$CO -c \"ALTER SYSTEM SET max_slot_wal_keep_size = '64MB'\"" >/dev/null
 eval "$CO -c 'SELECT pg_reload_conf()'" >/dev/null
