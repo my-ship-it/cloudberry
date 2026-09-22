@@ -1535,8 +1535,16 @@ MppLauncherMain(Datum main_arg)
 	 * The driver replicates into every segment from the coordinator, so it
 	 * runs there and nowhere else.  A segment's own catalog carries the same
 	 * subscription row after dispatch, and must not act on it.
+	 *
+	 * Nor does a coordinator started in utility mode count.  gpstart brings
+	 * one up that way to do its own bootstrapping and stops it again a second
+	 * later, and a worker started in it has no gangs to drive and no way to
+	 * reach the segments: it would read the source as having lost most of its
+	 * slots and disable the subscription over it, in a postmaster that is
+	 * about to go away.  gp_role is fixed for a postmaster's life, so there
+	 * is nothing here to wait for.
 	 */
-	if (!IS_QUERY_DISPATCHER())
+	if (!IS_QUERY_DISPATCHER() || Gp_role != GP_ROLE_DISPATCH)
 		proc_exit(0);
 
 	/* no database: pg_subscription is a shared catalog */

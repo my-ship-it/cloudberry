@@ -78,6 +78,10 @@ distributed transactions and their own failures.
                             first, and the one to run after a change.
     slot_loss.sh            the source's slots disappear under a running
                             subscription, as a segment failover does
+    restart.sh              the target cluster is stopped and started
+                            under a live subscription: that a smart
+                            gpstop finishes at all, and that gpstart
+                            brings the subscription back by itself
 
     usage: <test>.sh [-s <source port>] [-t <target port>]
            (defaults: source 7100, target 7300)
