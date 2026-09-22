@@ -356,6 +356,8 @@ sync_error_is_permanent(int sqlerrcode)
 		case ERRCODE_FEATURE_NOT_SUPPORTED: /* an AM whose changes are not decoded */
 		case ERRCODE_UNDEFINED_TABLE:	/* a relation one side does not have */
 		case ERRCODE_UNDEFINED_COLUMN:
+		case ERRCODE_UNDEFINED_FUNCTION:	/* a source too old for what the
+											 * synchronisation asks of it */
 		case ERRCODE_INVALID_PARAMETER_VALUE:
 		case ERRCODE_OBJECT_IN_USE:		/* the slots exist on some nodes only */
 			return true;
@@ -882,6 +884,8 @@ driver_connect_readers(LrDriver *d)
 						 (char *) list_nth(d->seg_conninfos, s));
 		appendStringInfo(&spec, "flush.%d=" INT64_FORMAT "\npos.%d=" INT64_FORMAT "\n",
 						 s, d->seg_flush[s], s, d->seg_pos[s]);
+		if (s < d->cfg->nsync_local && d->cfg->sync_local[s] != NULL)
+			appendStringInfo(&spec, "localsnap.%d=%s\n", s, d->cfg->sync_local[s]);
 	}
 
 	/* applied gxids above seg_flush, per segment */

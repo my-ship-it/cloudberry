@@ -1430,6 +1430,8 @@ sync_handle_slot_loss(LrSync *s)
 	s->cfg->sync_ds_xmax = 0;
 	s->cfg->nsync_ds_inprogress = 0;
 	s->cfg->sync_ds_inprogress = NULL;
+	s->cfg->nsync_local = 0;
+	s->cfg->sync_local = NULL;
 	return true;
 }
 
@@ -1521,9 +1523,32 @@ sync_cut_point(LrSync *s)
 {
 	PGresult   *res;
 	StringInfoData ds;
+	StringInfoData local;
 	char	   *ip;
 
 	PQclear(sync_exec(s, s->src, "source", "BEGIN ISOLATION LEVEL REPEATABLE READ", 0, NULL));
+
+	/*
+	 * First, and dispatched.  That statement is what freezes, on every source
+	 * segment, the snapshot every copy below then runs under, and this one
+	 * reports the snapshot it froze -- which is the boundary for transactions
+	 * that have no distributed xid to be judged by.  It has to come before the
+	 * coordinator-only statement that follows: that one freezes nothing out
+	 * there, so leading with it would record snapshots later than the copies'
+	 * own, and a local transaction the copy never saw would then be dropped
+	 * from the stream as already copied.
+	 */
+	res = sync_exec(s, s->src, "source",
+					"SELECT segid, xmin || ':' || xmax || ':' || "
+					"       coalesce(array_to_string(xip, ','), '') "
+					"FROM pg_catalog.gp_lr_local_snapshot() ORDER BY segid",
+					0, NULL);
+	initStringInfo(&local);
+	for (int i = 0; i < PQntuples(res); i++)
+		appendStringInfo(&local, "%s%s/%s", i ? "|" : "",
+						 PQgetvalue(res, i, 0), PQgetvalue(res, i, 1));
+	PQclear(res);
+
 	res = sync_exec(s, s->src, "source",
 					"SELECT pg_current_wal_lsn()::text, xmax, coalesce(array_to_string(in_progress, ','), '') "
 					"FROM gp_current_distributed_snapshot()",
@@ -1556,6 +1581,8 @@ sync_cut_point(LrSync *s)
 			appendStringInfo(&ds, "%s" INT64_FORMAT, lc == list_head(s->ds_inprogress) ? "" : ",",
 							 *(int64 *) lfirst(lc));
 	}
+	appendStringInfo(&ds, ";local=%s", local.data);
+	pfree(local.data);
 	s->ds_text = ds.data;
 
 	elog(LOG, "mpp apply worker: subscription %u: cut point L_t %s, DS_t %s",
@@ -1563,13 +1590,28 @@ sync_cut_point(LrSync *s)
 }
 
 /*
- * "xmax=<n>;inprogress=<a,b,..>" -> cfg
+ * "xmax=<n>;inprogress=<a,b,..>;local=<seg>/<snap>|<seg>/<snap>" -> cfg
  *
- * The array outlives this synchronisation: the driver reads it for as long as
- * the filter is live, which is well after LrInitialSync() has thrown its own
- * context away.  So it goes in cxt, the caller's, which is the one cfg itself
+ * The arrays outlive this synchronisation: they are read for as long as the
+ * filter is live, which is well after LrInitialSync() has thrown its own
+ * context away.  So they go in cxt, the caller's, which is the one cfg itself
  * was allocated in.
  */
+static char *
+sync_field(const char *text, const char *name)
+{
+	const char *p = strstr(text, name);
+	char	   *copy,
+			   *semi;
+
+	if (p == NULL || p[strlen(name)] == '\0')
+		return NULL;
+	copy = pstrdup(p + strlen(name));
+	if ((semi = strchr(copy, ';')) != NULL)
+		*semi = '\0';			/* the next field, not part of this one */
+	return *copy ? copy : NULL;
+}
+
 static void
 sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 {
@@ -1585,9 +1627,40 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 	cfg->sync_ds_xmax = strtoll(p + 5, NULL, 10);
 	cfg->nsync_ds_inprogress = 0;
 	cfg->sync_ds_inprogress = NULL;
-	if ((p = strstr(text, "inprogress=")) == NULL || p[11] == '\0')
+	cfg->nsync_local = 0;
+	cfg->sync_local = NULL;
+
+	/* the per-source-segment snapshots, for the readers' own dedup */
+	if ((copy = sync_field(text, "local=")) != NULL)
+	{
+		char	   *seg_save = NULL;
+		char	   *entry;
+		int			nsegs = 0;
+
+		/* one pass to learn how far the segment numbering goes */
+		for (tok = copy; *tok; tok++)
+			if (*tok == '|')
+				nsegs++;
+		nsegs++;
+		cfg->sync_local = (char **) MemoryContextAllocZero(cxt, sizeof(char *) * nsegs);
+		cfg->nsync_local = nsegs;
+		for (entry = strtok_r(copy, "|", &seg_save); entry != NULL;
+			 entry = strtok_r(NULL, "|", &seg_save))
+		{
+			char	   *slash = strchr(entry, '/');
+			int			seg;
+
+			if (slash == NULL)
+				continue;
+			*slash = '\0';
+			seg = atoi(entry);
+			if (seg >= 0 && seg < nsegs)
+				cfg->sync_local[seg] = MemoryContextStrdup(cxt, slash + 1);
+		}
+	}
+
+	if ((copy = sync_field(text, "inprogress=")) == NULL)
 		return;
-	copy = pstrdup(p + 11);
 	for (tok = copy; *tok; tok++)
 		if (*tok == ',')
 			n++;

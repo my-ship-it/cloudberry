@@ -103,6 +103,16 @@ typedef struct LrWorkerConfig
 	const int64 *sync_ds_inprogress;
 
 	/*
+	 * And the other half of the same cut point: each source segment's own
+	 * snapshot, as txid_current_snapshot() wrote it.  Transactions with no
+	 * gxid cannot be judged by the distributed snapshot above, so the readers
+	 * judge them against these instead; the driver only carries them down.
+	 * Indexed by source segment; NULL entries mean nothing was recorded.
+	 */
+	int			nsync_local;
+	char	  **sync_local;
+
+	/*
 	 * Run the initial synchronisation (mpp_tablesync.c) before streaming
 	 * unless gp_subscription_rel says it is done; fills sync_ds_* above.
 	 */

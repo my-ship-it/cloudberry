@@ -351,15 +351,35 @@ lr_worker_attach(Oid subid, Oid dbid)
 	slot = slot_find(subid);
 	if (slot == NULL)
 	{
+		LrWorkerSlot *idle = NULL;
+
 		for (i = 0; i < lr_shared->nslots; i++)
 		{
 			if (!OidIsValid(lr_shared->slots[i].subid))
 			{
 				slot = &lr_shared->slots[i];
-				slot->subid = subid;
-				slot->not_ours = false;
 				break;
 			}
+
+			/*
+			 * A slot is not given up when its worker goes, so that the
+			 * monitoring view can still name a subscription that has stopped.
+			 * That is worth having, but not worth a subscription that can
+			 * never start: when every slot is spoken for, the ones whose
+			 * worker is gone are taken back, least recently started first.
+			 * The view falls back to the state tables for those.
+			 */
+			if (lr_shared->slots[i].pid == 0 &&
+				(idle == NULL ||
+				 lr_shared->slots[i].rep.start_time < idle->rep.start_time))
+				idle = &lr_shared->slots[i];
+		}
+		if (slot == NULL)
+			slot = idle;
+		if (slot != NULL)
+		{
+			slot->subid = subid;
+			slot->not_ours = false;
 		}
 	}
 	if (slot != NULL)

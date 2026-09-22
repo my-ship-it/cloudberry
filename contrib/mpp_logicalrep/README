@@ -384,11 +384,20 @@ what they cost is described there.  A table with no primary key and
 REPLICA IDENTITY FULL, written concurrently on several source segments
 under the same key, has no defined order between those segments.
 
-No utility-mode writes on the source while a table is being synchronised.
-The initial copy deduplicates by distributed snapshot, and a utility
-write has no distributed transaction to be in, so one made between the
-slots being created and the cut point being taken would be applied twice.
-While streaming they are replicated normally, on the idle poll.
+A utility-mode write on the source -- one made straight to a segment,
+with no distributed transaction to be in -- is replicated like any other,
+on the idle poll while streaming.  It cannot be judged by the cut point's
+distributed snapshot, so the cut point records each source segment's own
+snapshot as well, and each reader drops the local transactions its own
+says the copy already had.  A table added to a running subscription is
+the exception, and a worse one.  The readers are told of a cut point when
+they connect; an added table takes one of its own afterwards, which never
+reaches them.  Worse, a local transaction is released as soon as its batch
+commits whether or not it touched a table whose copy is still running --
+only transactions with a distributed xid are held back for the catch-up.
+Its changes to that table were skipped on the way through, so a
+utility-mode write between an added table's cut point and that table
+going live is lost rather than duplicated.  Do not make one.
 
 Partitioned tables are not supported as target tables.
 

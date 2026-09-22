@@ -133,6 +133,12 @@ struct LrReaderState
 								 * applied-gxid set no longer covers (it is
 								 * trimmed at seg_flush). */
 	XLogRecPtr	replay_seg_pos; /* replay dedup for local transactions */
+
+	/* the cut point's snapshot of this source segment (LrReaderStartPoint) */
+	TransactionId sync_xmin;
+	TransactionId sync_xmax;
+	int			nsync_xip;
+	TransactionId *sync_xip;
 	List	   *pending;		/* LrTxn*: ready, not yet reported */
 	List	   *local_ready;	/* LrTxn*: local, committed, in stream order */
 
@@ -187,6 +193,7 @@ static void txn_note_subxact(LrReaderState *st, LrTxn *txn,
 static void txn_abort_subxact(LrReaderState *st, LrTxn *txn,
 							  TransactionId subxid);
 static bool parse_gid(const char *gid, int64 *gxid);
+static bool txn_covered_by_sync(LrReaderState *st, TransactionId xid);
 static void maybe_spill(LrReaderState *st);
 static void changelog_init(LrChangeLog *log);
 static void changelog_append(LrReaderState *st, LrChangeLog *log,
@@ -253,6 +260,15 @@ LrReaderCreate(Oid subid, int srcseg, int64 token, const LrReaderStartPoint *sta
 	{
 		st->start_lsn = start->seg_flush;
 		st->replay_seg_pos = start->seg_pos;
+		st->sync_xmin = start->sync_xmin;
+		st->sync_xmax = start->sync_xmax;
+		st->nsync_xip = start->nsync_xip;
+		if (start->nsync_xip > 0)
+		{
+			st->sync_xip = palloc(sizeof(TransactionId) * start->nsync_xip);
+			memcpy(st->sync_xip, start->sync_xip,
+				   sizeof(TransactionId) * start->nsync_xip);
+		}
 		for (int i = 0; i < start->napplied; i++)
 			hash_search(st->applied, &start->applied[i], HASH_ENTER, NULL);
 	}
@@ -1116,7 +1132,14 @@ txn_finish(LrReaderState *st, LrTxn *txn, LrTxnState state,
 	if (txn->kind == LR_TXN_KIND_UNKNOWN)
 		txn->kind = LR_TXN_LOCAL;
 
-	/* replay dedup */
+	/*
+	 * Replay dedup, and for a local transaction the initial copy's as well.
+	 * A transaction with a gxid is judged by the driver against the
+	 * distributed snapshot of the cut point; one without has no gxid to judge
+	 * and is judged here instead, against this segment's own snapshot at the
+	 * same cut point.  Both answer the one question: is it in the copy
+	 * already?
+	 */
 	if (txn->gxid != 0)
 	{
 		if (hash_search(st->applied, &txn->gxid, HASH_FIND, NULL) != NULL)
@@ -1125,8 +1148,9 @@ txn_finish(LrReaderState *st, LrTxn *txn, LrTxnState state,
 			return;
 		}
 	}
-	else if (!XLogRecPtrIsInvalid(st->replay_seg_pos) &&
-			 commit_lsn <= st->replay_seg_pos)
+	else if (txn_covered_by_sync(st, txn->xid) ||
+			 (!XLogRecPtrIsInvalid(st->replay_seg_pos) &&
+			  commit_lsn <= st->replay_seg_pos))
 	{
 		txn_drop(st, txn);
 		return;
@@ -1140,6 +1164,31 @@ txn_finish(LrReaderState *st, LrTxn *txn, LrTxnState state,
 	if (txn->kind == LR_TXN_LOCAL)
 		st->local_ready = lappend(st->local_ready, txn);
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Was this local transaction already in the initial copy?
+ *
+ * The copy ran under this segment's snapshot, frozen at the cut point, so
+ * "the copy has it" is exactly "it is visible under that snapshot" -- the
+ * same shape as the question the driver asks of a gxid against the
+ * distributed snapshot.  Self-limiting: everything that committed after the
+ * cut point is at or above xmax and falls out on the first test, so the scan
+ * below stops mattering shortly after a synchronisation ends.
+ */
+static bool
+txn_covered_by_sync(LrReaderState *st, TransactionId xid)
+{
+	if (!TransactionIdIsValid(st->sync_xmax) || !TransactionIdIsValid(xid))
+		return false;
+	if (!TransactionIdPrecedes(xid, st->sync_xmax))
+		return false;			/* committed after the cut point */
+	if (TransactionIdPrecedes(xid, st->sync_xmin))
+		return true;			/* long finished by then */
+	for (int i = 0; i < st->nsync_xip; i++)
+		if (TransactionIdEquals(xid, st->sync_xip[i]))
+			return false;		/* in flight at the cut point: not copied */
+	return true;
 }
 
 static void
@@ -1697,10 +1746,4 @@ LrChangesEnd(LrChangeCursor *cur)
 		pfree(cur->buf);
 	cur->buf = NULL;
 	cur->bufsize = 0;
-}
-
-bool
-LrTxnIsSpilled(LrTxn *txn)
-{
-	return txn->changes->spilled;
 }

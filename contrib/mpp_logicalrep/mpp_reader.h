@@ -99,6 +99,17 @@ typedef struct LrReaderStartPoint
 	XLogRecPtr	seg_pos;		/* local transactions at or below are applied */
 	int			napplied;
 	const int64 *applied;		/* gxids applied above seg_flush */
+
+	/*
+	 * This source segment's own snapshot at the initial copy's cut point.  A
+	 * local transaction visible under it is in the copy already and must not
+	 * be applied again; one in flight at it is not, and must be.  xmax
+	 * invalid = no such copy, or none was recorded.
+	 */
+	TransactionId sync_xmin;
+	TransactionId sync_xmax;
+	int			nsync_xip;
+	const TransactionId *sync_xip;
 } LrReaderStartPoint;
 
 typedef enum LrReceiveResult
@@ -191,7 +202,6 @@ extern void LrChangesBegin(LrTxn *txn, LrChangeCursor *cur);
 extern bool LrChangesNext(LrChangeCursor *cur, char *op, Oid *relid,
 						  const char **data, int *len);
 extern void LrChangesEnd(LrChangeCursor *cur);
-extern bool LrTxnIsSpilled(LrTxn *txn);
 
 extern void LrReaderGetStats(LrReaderState *st, LrReaderStats *stats);
 

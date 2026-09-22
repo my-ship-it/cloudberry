@@ -18,6 +18,8 @@ CREATE DATABASE mpp_lr_cr;
 CREATE TABLE cr_t (id int, v text) DISTRIBUTED BY (id);
 INSERT INTO cr_t SELECT g, 'seed' FROM generate_series(1, 100) g;
 CREATE PUBLICATION cr_pub FOR TABLE cr_t;
+-- a waiter on the source side too, for the slot the worker leaves behind
+CREATE FUNCTION lr_wait_src(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 600 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 CREATE PROCEDURE cr_churn() AS $$ BEGIN FOR r IN 1 .. 60 LOOP INSERT INTO cr_t SELECT r * 1000 + i, 'round ' || r FROM generate_series(0, 19) i; COMMIT; PERFORM pg_sleep(0.15); END LOOP; END $$ LANGUAGE plpgsql;
 
 1:@db_name mpp_lr_cr: CREATE TABLE cr_t (id int, v text) DISTRIBUTED BY (id);
@@ -47,7 +49,11 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM cr_t;
 
 1:@db_name mpp_lr_cr: DROP SUBSCRIPTION cr_sub;
 1q:
+-- the worker is gone, but the walsender it left on the source takes a moment
+-- to notice and let the slot go
+SELECT lr_wait_src($$SELECT count(*) = 0 FROM gp_replication_slots WHERE slot_name = 'cr_slot' AND active$$) AS slot_released;
 SELECT gp_drop_replication_slot('cr_slot');
+DROP FUNCTION lr_wait_src(text);
 DROP PUBLICATION cr_pub;
 DROP TABLE cr_t;
 DROP PROCEDURE cr_churn();

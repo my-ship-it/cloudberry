@@ -139,6 +139,7 @@ static List *parse_kv(const char *payload);
 static const char *kv_get(List *kv, const char *key);
 static const char *kv_get_seg(List *kv, const char *key, int seg);
 static List *parse_int64_list(const char *value);
+static void parse_local_snapshot(const char *value, LrReaderStartPoint *start);
 static XLogRecPtr parse_lsn(const char *value);
 
 const CustomScanMethods LrSourceScanMethods = {
@@ -424,6 +425,9 @@ queue_cold(LrSourceState *state)
  * CONNECT: open one stream per source segment this reader was given.
  *
  * The driver spreads the source segments over the readers with
+ * "localsnap.<srcseg>=xmin:xmax:xip,..." -- that segment's snapshot at the
+ * initial copy's cut point, for the reader's own dedup of local transactions.
+ *
  * "srcsegs.<reader>=a,b,..." -- one each when the counts match, several when
  * the source has more segments, none at all when it has fewer.  The
  * per-stream keys (conninfo, flush, pos, applied) are
@@ -571,6 +575,7 @@ do_connect(LrSourceState *state)
 			start.seg_flush = parse_lsn(v);
 		if ((v = kv_get_seg(state->kv, "pos", srcseg)) != NULL)
 			start.seg_pos = parse_lsn(v);
+		parse_local_snapshot(kv_get_seg(state->kv, "localsnap", srcseg), &start);
 		applied = parse_int64_list(kv_get_seg(state->kv, "applied", srcseg));
 		start.napplied = list_length(applied);
 		if (start.napplied > 0)
@@ -1189,6 +1194,59 @@ kv_get_seg(List *kv, const char *key, int seg)
 }
 
 /* comma-separated integers; NULL or empty gives NIL */
+/*
+ * "xmin:xmax:xip,xip,..." -- txid_current_snapshot()'s own text, as the cut
+ * point recorded it for this source segment.  The values are epoch-extended;
+ * the stream carries plain 32-bit xids, so the low half is what is compared,
+ * which is right for as long as the filter matters (it stops matching a
+ * wraparound away, and stops mattering long before that).
+ */
+static void
+parse_local_snapshot(const char *value, LrReaderStartPoint *start)
+{
+	char	   *copy,
+			   *xip,
+			   *saveptr = NULL,
+			   *tok;
+	List	   *xids = NIL;
+	ListCell   *lc;
+	TransactionId *arr;
+	int			i = 0;
+
+	if (value == NULL || *value == '\0')
+		return;
+	copy = pstrdup(value);
+	tok = strtok_r(copy, ":", &saveptr);
+	if (tok == NULL)
+		return;
+	start->sync_xmin = (TransactionId) strtoull(tok, NULL, 10);
+	tok = strtok_r(NULL, ":", &saveptr);
+	if (tok == NULL)
+	{
+		start->sync_xmin = InvalidTransactionId;
+		return;
+	}
+	start->sync_xmax = (TransactionId) strtoull(tok, NULL, 10);
+
+	/* the rest of the string, if any, is the in-flight list */
+	xip = strtok_r(NULL, ":", &saveptr);
+	for (tok = xip ? strtok_r(xip, ",", &saveptr) : NULL; tok != NULL;
+		 tok = strtok_r(NULL, ",", &saveptr))
+	{
+		TransactionId *v = palloc(sizeof(TransactionId));
+
+		*v = (TransactionId) strtoull(tok, NULL, 10);
+		xids = lappend(xids, v);
+	}
+	start->nsync_xip = list_length(xids);
+	if (start->nsync_xip == 0)
+		return;
+	arr = palloc(sizeof(TransactionId) * start->nsync_xip);
+	foreach(lc, xids)
+		arr[i++] = *(TransactionId *) lfirst(lc);
+	start->sync_xip = arr;
+}
+
 static List *
 parse_int64_list(const char *value)
 {

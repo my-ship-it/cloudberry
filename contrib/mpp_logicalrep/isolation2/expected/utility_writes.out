@@ -1,0 +1,134 @@
+-- A write made straight to a segment, and an initial copy taken over it.
+--
+-- Such a write has no distributed xid, so the cut point's distributed
+-- snapshot cannot say whether the copy already contains it, and the copy and
+-- the stream both deliver it: the row lands twice.  What can say is the
+-- segment's own snapshot at the same cut point, which is why the cut point
+-- records one per source segment and each reader drops the local
+-- transactions its own says were already copied.
+--
+-- The window to hit is "after the slots are consistent, before the cut
+-- point".  Rather than race the barrier for it, this arranges it exactly: a
+-- subscription that has already synchronised has consistent slots retaining
+-- WAL, so a write made while it is stopped is certainly in the stream, and a
+-- copy redone afterwards certainly contains it.
+--
+-- The key matters.  A utility-mode insert puts the row on the segment it is
+-- connected to whatever the distribution policy says, so a key that belongs
+-- elsewhere is misplaced data, and the copy's per-row check refuses it --
+-- gp_enable_segment_copy_checking doing its job, but not this test's subject.
+-- uw_key carries one that belongs on segment 0, replicated so that the
+-- utility session on that segment can read it.
+
+CREATE DATABASE mpp_lr_uw;
+CREATE
+
+CREATE TABLE uw_t (id int, v text) DISTRIBUTED BY (id);
+CREATE
+INSERT INTO uw_t SELECT g, 'seed' FROM generate_series(1, 300) g;
+INSERT 300
+CREATE TABLE uw_key (id int) DISTRIBUTED REPLICATED;
+CREATE
+INSERT INTO uw_key SELECT min(id) FROM uw_t WHERE gp_segment_id = 0;
+INSERT 1
+SELECT count(*) = 1 AS a_key_that_belongs_on_segment_0 FROM uw_key;
+ a_key_that_belongs_on_segment_0 
+---------------------------------
+ t                               
+(1 row)
+CREATE PUBLICATION uw_pub FOR TABLE uw_t;
+CREATE
+
+1:@db_name mpp_lr_uw: CREATE TABLE uw_t (id int, v text) DISTRIBUTED BY (id);
+CREATE
+1:@db_name mpp_lr_uw: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+1:@db_name mpp_lr_uw: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+
+1:@db_name mpp_lr_uw: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION uw_sub CONNECTION %L PUBLICATION uw_pub WITH (slot_name = ''uw_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_uw: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'uw_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
+ synced 
+--------
+ t      
+(1 row)
+1:@db_name mpp_lr_uw: SELECT count(*) AS copied FROM uw_t;
+ copied 
+--------
+ 300    
+(1 row)
+
+-- stopped, but the slots stay and keep the WAL
+1:@db_name mpp_lr_uw: ALTER SUBSCRIPTION uw_sub DISABLE;
+ALTER
+1:@db_name mpp_lr_uw: SELECT lr_worker_gone() AS stopped;
+ stopped 
+---------
+ t       
+(1 row)
+
+-- the write: straight to segment 0, no distributed transaction anywhere
+0U: INSERT INTO uw_t SELECT id, 'written straight to a segment' FROM uw_key;
+INSERT 1
+SELECT count(*) AS on_the_source FROM uw_t WHERE v = 'written straight to a segment';
+ on_the_source 
+---------------
+ 1             
+(1 row)
+
+-- redo the copy: the marker row back to 'i' is what the worker reads as "not
+-- finished", the same state an interrupted synchronisation leaves behind
+-- every row, not just the marker: leaving the table's own row at 'r' would
+-- make the wait below true before the copy had even started
+1:@db_name mpp_lr_uw: UPDATE gp_subscription_rel SET state = 'i';
+UPDATE 2
+1:@db_name mpp_lr_uw: SELECT count(*) = 0 AS nothing_is_ready_now FROM gp_subscription_rel WHERE state = 'r';
+ nothing_is_ready_now 
+----------------------
+ t                    
+(1 row)
+1:@db_name mpp_lr_uw: ALTER SUBSCRIPTION uw_sub ENABLE;
+ALTER
+1:@db_name mpp_lr_uw: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'uw_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS resynced;
+ resynced 
+----------
+ t        
+(1 row)
+1:@db_name mpp_lr_uw: SELECT lr_wait('SELECT count(*) = 301 FROM uw_t') AS caught_up;
+ caught_up 
+-----------
+ t         
+(1 row)
+
+-- once: the copy has it, so the stream's own copy of it is dropped
+1:@db_name mpp_lr_uw: SELECT count(*) AS on_the_target FROM uw_t WHERE v = 'written straight to a segment';
+ on_the_target 
+---------------
+ 1             
+(1 row)
+1:@db_name mpp_lr_uw: SELECT count(*) AS rows_total FROM uw_t;
+ rows_total 
+------------
+ 301        
+(1 row)
+1:@db_name mpp_lr_uw: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'uw_sub';
+ phase     | stuck_errors 
+-----------+--------------
+ streaming | 0            
+(1 row)
+
+1:@db_name mpp_lr_uw: DROP SUBSCRIPTION uw_sub;
+DROP
+1q: ... <quitting>
+SELECT gp_drop_replication_slot('uw_slot');
+ gp_drop_replication_slot 
+--------------------------
+                          
+(1 row)
+DROP PUBLICATION uw_pub;
+DROP
+DROP TABLE uw_t, uw_key;
+DROP
+DROP DATABASE mpp_lr_uw;
+DROP
