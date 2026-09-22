@@ -76,6 +76,7 @@ int			gp_lr_slot_loss_action = LR_SLOT_LOSS_REINIT;
 #define LR_SYNC_BARRIER_TIMEOUT_MS	120000
 #define LR_SYNC_PORTS_TIMEOUT_MS	120000
 #define LR_SYNC_POLL_MS				100
+#define LR_SYNC_POLL_FIRST_MS		1
 
 /* one table of the publication */
 typedef struct LrSyncRel
@@ -1842,15 +1843,32 @@ copy_poll_done(LrSync *s, LrSyncRel *r)
 	return true;
 }
 
+/*
+ * How long to wait before asking again.  Both things waited on below -- the
+ * target segments publishing their ports, and the two ends finishing --
+ * usually take about one round trip, so a fixed interval is paid in full by
+ * every table however small it is: measured, fifty tables took fifteen
+ * seconds whether they held one row each or ten thousand, and two such waits
+ * per table were most of it.  Start at a millisecond and double towards the
+ * old interval, which is where a copy that really does take a while ends up.
+ */
+static int
+sync_backoff(int ms)
+{
+	return ms >= LR_SYNC_POLL_MS ? LR_SYNC_POLL_MS : Min(ms * 2, LR_SYNC_POLL_MS);
+}
+
 static void
 sync_copy_table(LrSync *s, LrSyncRel *r)
 {
+	int			ms;
+
 	copy_begin(s, r);
-	while (!copy_ports_ready(s, r))
-		sync_wait(s, LR_SYNC_POLL_MS);
+	for (ms = LR_SYNC_POLL_FIRST_MS; !copy_ports_ready(s, r); ms = sync_backoff(ms))
+		sync_wait(s, ms);
 	copy_send(s, r);
-	while (!copy_poll_done(s, r))
-		sync_wait(s, LR_SYNC_POLL_MS);
+	for (ms = LR_SYNC_POLL_FIRST_MS; !copy_poll_done(s, r); ms = sync_backoff(ms))
+		sync_wait(s, ms);
 }
 
 
