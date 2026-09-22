@@ -236,7 +236,8 @@ extern struct LrSync *LrSyncAddStart(LrWorkerConfig *cfg);
 extern bool LrSyncAddStep(struct LrSync *job);
 extern int64 LrSyncAddCutLsn(struct LrSync *job);
 extern void LrSyncAddSnapshot(struct LrSync *job, int64 *xmax,
-							  int *ninprogress, int64 **inprogress);
+							  int *ninprogress, int64 **inprogress,
+							  int *nlocal, char ***local);
 extern List *LrSyncAddNames(struct LrSync *job);
 extern void LrSyncAddFinish(struct LrSync *job);
 extern void LrSyncAddAbort(struct LrSync *job);

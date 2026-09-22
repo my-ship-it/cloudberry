@@ -390,14 +390,10 @@ on the idle poll while streaming.  It cannot be judged by the cut point's
 distributed snapshot, so the cut point records each source segment's own
 snapshot as well, and each reader drops the local transactions its own
 says the copy already had.  A table added to a running subscription is
-the exception, and a worse one.  The readers are told of a cut point when
-they connect; an added table takes one of its own afterwards, which never
-reaches them.  Worse, a local transaction is released as soon as its batch
-commits whether or not it touched a table whose copy is still running --
-only transactions with a distributed xid are held back for the catch-up.
-Its changes to that table were skipped on the way through, so a
-utility-mode write between an added table's cut point and that table
-going live is lost rather than duplicated.  Do not make one.
+held to the same rule by its own cut point.  Such a write is held back
+for the catch-up like a distributed one, and the catch-up replays it
+unless that segment's snapshot at that cut point says the copy already
+had it.
 
 Partitioned tables are not supported as target tables.
 

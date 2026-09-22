@@ -195,6 +195,13 @@ typedef struct LrReport
 {
 	int32		seg;
 	char		kind;
+
+	/*
+	 * What identifies the transaction, which depends on the kind: the gxid of
+	 * a READY one, the source segment's own xid of a LOCAL one (a utility
+	 * write has no gxid, and the xid is what a cut point's local snapshot is
+	 * stated in), and the reader's flush position of a STATUS row.
+	 */
 	int64		gxid;
 	int64		seg_lsn;
 	List	   *remote_relids;	/* list of Oid */

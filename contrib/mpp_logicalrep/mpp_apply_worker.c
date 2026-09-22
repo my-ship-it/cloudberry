@@ -33,6 +33,7 @@
 
 #include "libpq-fe.h"
 
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_subscription.h"
 #include "commands/dbcommands.h"
@@ -116,12 +117,18 @@ typedef struct LrGxidTxn
  * held back.  Kept in commit order until the copy of
  * that table finishes and the driver catches it up; the reader keeps the
  * buffer because the driver does not release the transaction.
+ *
+ * A utility write is held the same way, and is told apart by gxid == 0: it
+ * belongs to one segment, so seg and event_lsn (that segment's position) are
+ * all of it and seg_lsn is not used.
  */
 typedef struct LrDeferredTxn
 {
-	int64		gxid;
-	int64		event_lsn;
-	int64	   *seg_lsn;		/* per target segment; -1 = not there */
+	int64		gxid;			/* 0 = a local (utility) transaction */
+	int64		xid;			/* local only: its xid on that segment */
+	int			seg;			/* local only: the segment it belongs to */
+	int64		event_lsn;		/* gxid: coordinator position; local: seg_lsn */
+	int64	   *seg_lsn;		/* gxid only; per source segment, -1 = not there */
 	int			lockmode;
 } LrDeferredTxn;
 
@@ -136,11 +143,26 @@ typedef struct LrRelName
 typedef struct LrLocalTxn
 {
 	int			seg;
+	int64		xid;			/* its xid on that segment, from the report */
 	int64		seg_lsn;
 	List	   *rel_names;
 	int			lockmode;
 	int64		nbytes;
 } LrLocalTxn;
+
+/*
+ * One source segment's local snapshot at a cut point, as
+ * gp_lr_local_snapshot() froze it.  A local transaction visible under it
+ * committed before the copy started reading, so the copy already contains
+ * its rows.
+ */
+typedef struct LrLocalSnap
+{
+	TransactionId xmin;
+	TransactionId xmax;			/* InvalidTransactionId = no snapshot */
+	int			nxip;
+	TransactionId *xip;
+} LrLocalSnap;
 
 typedef struct LrDriver
 {
@@ -196,6 +218,8 @@ typedef struct LrDriver
 	int64		sync_ds_xmax;
 	int			sync_nds_inprogress;
 	int64	   *sync_ds_inprogress;
+	int			sync_nlocal;	/* the local half of the same cut point */
+	LrLocalSnap *sync_local;
 	bool		catchup_mode;	/* the copy is done: drain the held ones */
 	int			stuck_errors;	/* errors in a row that committed nothing */
 
@@ -1506,6 +1530,7 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 					LrLocalTxn *l = palloc0(sizeof(LrLocalTxn));
 
 					l->seg = seg;
+					l->xid = rgxid;		/* a LOCAL report states its xid here */
 					l->seg_lsn = seg_lsn;
 					l->rel_names = rel_names;
 					l->lockmode = lockmode;
@@ -1849,6 +1874,81 @@ stream_applied_through(LrDriver *d, int64 lsn)
 }
 
 /*
+ * "xmin:xmax:xip,..." as gp_lr_local_snapshot() states it -> one source
+ * segment's snapshot.  The values are epoch-extended; the stream carries
+ * plain 32-bit xids, so the low half is what is compared, which is right for
+ * as long as the filter matters (it stops matching a wraparound away, and
+ * stops mattering long before that).
+ */
+static void
+parse_local_snap(const char *value, LrLocalSnap *snap)
+{
+	char	   *copy;
+	char	   *save = NULL;
+	char	   *tok;
+	char	   *xip;
+	List	   *xids = NIL;
+	ListCell   *lc;
+	int			i = 0;
+
+	memset(snap, 0, sizeof(*snap));
+	if (value == NULL || *value == '\0')
+		return;
+	copy = pstrdup(value);
+	if ((tok = strtok_r(copy, ":", &save)) == NULL)
+		return;
+	snap->xmin = (TransactionId) strtoull(tok, NULL, 10);
+	if ((tok = strtok_r(NULL, ":", &save)) == NULL)
+	{
+		snap->xmin = InvalidTransactionId;
+		return;					/* no xmax: the snapshot stays unusable */
+	}
+	snap->xmax = (TransactionId) strtoull(tok, NULL, 10);
+
+	/* the rest of the string, if any, is the in-flight list */
+	xip = strtok_r(NULL, ":", &save);
+	for (tok = xip ? strtok_r(xip, ",", &save) : NULL; tok != NULL;
+		 tok = strtok_r(NULL, ",", &save))
+	{
+		TransactionId *v = palloc(sizeof(TransactionId));
+
+		*v = (TransactionId) strtoull(tok, NULL, 10);
+		xids = lappend(xids, v);
+	}
+	snap->nxip = list_length(xids);
+	if (snap->nxip == 0)
+		return;
+	snap->xip = palloc(sizeof(TransactionId) * snap->nxip);
+	foreach(lc, xids)
+		snap->xip[i++] = *(TransactionId *) lfirst(lc);
+}
+
+/*
+ * Take the cut point of the job that has just started: the distributed
+ * snapshot, which tells which held gxid the copy already contains, and the
+ * per-segment local one, which answers the same for a utility write.  Both
+ * are read for as long as the job's transactions are held, so both are
+ * allocated in the caller's context, which is the run's.
+ */
+static void
+driver_take_add_snapshot(LrDriver *d)
+{
+	char	  **text;
+	int			ntext;
+
+	LrSyncAddSnapshot(d->sync, &d->sync_ds_xmax, &d->sync_nds_inprogress,
+					  &d->sync_ds_inprogress, &ntext, &text);
+	d->sync_nlocal = 0;
+	d->sync_local = NULL;
+	if (ntext <= 0)
+		return;
+	d->sync_local = (LrLocalSnap *) palloc0(sizeof(LrLocalSnap) * ntext);
+	d->sync_nlocal = ntext;
+	for (int seg = 0; seg < ntext; seg++)
+		parse_local_snap(text[seg], &d->sync_local[seg]);
+}
+
+/*
  * Start, step and complete the incremental job.  Called once per iteration
  * of the apply loop, and never blocks for longer than one libpq round trip.
  *
@@ -1874,6 +1974,8 @@ driver_sync_progress(LrDriver *d)
 		d->sync_names = NIL;
 		d->sync_ds_xmax = 0;
 		d->sync_nds_inprogress = 0;
+		d->sync_nlocal = 0;
+		d->sync_local = NULL;
 		d->catchup_mode = false;
 		driver_check_pending(d, true);
 		return false;
@@ -1889,8 +1991,7 @@ driver_sync_progress(LrDriver *d)
 			return false;		/* the rows went away under us */
 		oldcxt = MemoryContextSwitchTo(d->cxt);
 		d->sync_names = LrSyncAddNames(d->sync);
-		LrSyncAddSnapshot(d->sync, &d->sync_ds_xmax, &d->sync_nds_inprogress,
-						  &d->sync_ds_inprogress);
+		driver_take_add_snapshot(d);
 		MemoryContextSwitchTo(oldcxt);
 		return false;
 	}
@@ -1938,6 +2039,32 @@ driver_sync_progress(LrDriver *d)
  * the writers should replay.
  * ------------------------------------------------------------------------
  */
+
+/*
+ * The same question for a utility write, which has no gxid: its own segment
+ * froze a snapshot at the cut point, and a transaction visible under that
+ * one had committed before the copy read the table.
+ */
+static bool
+local_covered_by_add_sync(LrDriver *d, int seg, int64 xid64)
+{
+	TransactionId xid = (TransactionId) xid64;
+	const LrLocalSnap *snap;
+
+	if (seg < 0 || seg >= d->sync_nlocal)
+		return false;
+	snap = &d->sync_local[seg];
+	if (!TransactionIdIsValid(snap->xmax) || !TransactionIdIsValid(xid))
+		return false;
+	if (!TransactionIdPrecedes(xid, snap->xmax))
+		return false;			/* started after the cut => not copied */
+	if (TransactionIdPrecedes(xid, snap->xmin))
+		return true;
+	for (int i = 0; i < snap->nxip; i++)
+		if (TransactionIdEquals(xid, snap->xip[i]))
+			return false;		/* in flight at the cut => not copied */
+	return true;
+}
 
 /* is this held transaction already inside the copy of the running job? */
 static bool
@@ -2060,6 +2187,31 @@ unit_build_from_batch(LrDriver *d)
 }
 
 /*
+ * Let a held transaction go: the next DRAIN tells the reader, which is what
+ * frees its buffer and lets its slot feedback move.  A distributed
+ * transaction is named by its gxid, a utility write by (segment, position).
+ */
+static void
+deferred_release(LrDriver *d, LrDeferredTxn *dt)
+{
+	if (dt->gxid != 0)
+	{
+		int64	   *g = palloc(sizeof(int64));
+
+		*g = dt->gxid;
+		d->release_gxids = lappend(d->release_gxids, g);
+	}
+	else
+	{
+		LrLocalTxn *l = palloc0(sizeof(LrLocalTxn));
+
+		l->seg = dt->seg;
+		l->seg_lsn = dt->event_lsn;
+		d->release_locals = lappend(d->release_locals, l);
+	}
+}
+
+/*
  * A catch-up unit: up to gp_lr_batch_max_txns of the transactions held for
  * a table that has just finished copying, in commit order, replayed for
  * that table alone.  The ones the copy already contains are not replayed at
@@ -2089,7 +2241,9 @@ unit_build_catchup(LrDriver *d)
 
 			if (list_length(batch) + list_length(drop) >= gp_lr_batch_max_txns)
 				break;
-			if (gxid_covered_by_add_sync(d, dt->gxid))
+			if (dt->gxid != 0
+				? gxid_covered_by_add_sync(d, dt->gxid)
+				: local_covered_by_add_sync(d, dt->seg, dt->xid))
 			{
 				drop = lappend(drop, dt);
 				continue;
@@ -2101,10 +2255,8 @@ unit_build_catchup(LrDriver *d)
 		foreach(lc, drop)
 		{
 			LrDeferredTxn *dt = (LrDeferredTxn *) lfirst(lc);
-			int64	   *g = palloc(sizeof(int64));
 
-			*g = dt->gxid;
-			d->release_gxids = lappend(d->release_gxids, g);
+			deferred_release(d, dt);
 			d->deferred_txns = list_delete_ptr(d->deferred_txns, dt);
 			d->stats->txns_catchup_dropped++;
 			d->unit_dropped++;
@@ -2132,6 +2284,19 @@ unit_build_catchup(LrDriver *d)
 
 		at->gxid = (uint64) dt->gxid;
 		at->commit_order_pos = (XLogRecPtr) dt->event_lsn;
+
+		/* a utility write is one segment's transaction and nothing else */
+		if (dt->gxid == 0)
+		{
+			at->nparticipants = 1;
+			at->participant_segidx = palloc(sizeof(int));
+			at->participant_pos = palloc(sizeof(XLogRecPtr));
+			at->participant_segidx[0] = dt->seg;
+			at->participant_pos[0] = (XLogRecPtr) dt->event_lsn;
+			u->commit_order_pos = at->commit_order_pos;
+			continue;
+		}
+
 		at->participant_segidx = palloc(sizeof(int) * d->nsrcsegs);
 		at->participant_pos = palloc(sizeof(XLogRecPtr) * d->nsrcsegs);
 		for (int seg = 0; seg < d->nsrcsegs; seg++)
@@ -2373,6 +2538,13 @@ assembly_unit_progress(LogicalRepAssembly *self, const LogicalRepUnit *unit,
 	{
 		LrDeferredTxn *dt = (LrDeferredTxn *) lfirst(lc);
 
+		if (dt->gxid == 0)
+		{
+			/* a utility write holds back the one segment it belongs to */
+			if (dt->seg < nsegs && dt->event_lsn < d->unit_flush[dt->seg])
+				d->unit_flush[dt->seg] = dt->event_lsn;
+			continue;
+		}
 		for (int seg = 0; seg < nsegs; seg++)
 			if (dt->seg_lsn[seg] >= 0 && dt->seg_lsn[seg] < d->unit_flush[seg])
 				d->unit_flush[seg] = dt->seg_lsn[seg];
@@ -2439,10 +2611,8 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 		foreach(lc, d->unit_batch)
 		{
 			LrDeferredTxn *dt = (LrDeferredTxn *) lfirst(lc);
-			int64	   *g = palloc(sizeof(int64));
 
-			*g = dt->gxid;
-			d->release_gxids = lappend(d->release_gxids, g);
+			deferred_release(d, dt);
 			d->deferred_txns = list_delete_ptr(d->deferred_txns, dt);
 		}
 		elog(LOG, "mpp apply worker: subscription %u: caught up %d transaction(s), dropped %d already copied, %d left",
@@ -2495,11 +2665,26 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 	foreach(lc, d->batch_locals)
 	{
 		LrLocalTxn *src = (LrLocalTxn *) lfirst(lc);
-		LrLocalTxn *l = palloc0(sizeof(LrLocalTxn));
 
-		l->seg = src->seg;
-		l->seg_lsn = src->seg_lsn;
-		d->release_locals = lappend(d->release_locals, l);
+		if (txn_is_deferred(d, src->rel_names))
+		{
+			LrDeferredTxn *dt = palloc0(sizeof(LrDeferredTxn));
+
+			dt->gxid = 0;		/* a utility write; seg + event_lsn name it */
+			dt->xid = src->xid;
+			dt->seg = src->seg;
+			dt->event_lsn = src->seg_lsn;
+			dt->lockmode = src->lockmode;
+			d->deferred_txns = lappend(d->deferred_txns, dt);
+		}
+		else
+		{
+			LrLocalTxn *l = palloc0(sizeof(LrLocalTxn));
+
+			l->seg = src->seg;
+			l->seg_lsn = src->seg_lsn;
+			d->release_locals = lappend(d->release_locals, l);
+		}
 	}
 
 	elog(LOG, "mpp apply worker: batch " INT64_FORMAT " committed: %d gxid txns, %d local txns, %d tables, coordinator position %X/%X",
@@ -2663,6 +2848,8 @@ assembly_reset(LogicalRepAssembly *self)
 		d->sync_names = NIL;
 		d->sync_ds_xmax = 0;
 		d->sync_nds_inprogress = 0;
+		d->sync_nlocal = 0;
+		d->sync_local = NULL;
 	}
 	d->catchup_mode = false;
 	d->deferred_txns = NIL;

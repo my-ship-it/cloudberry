@@ -1,0 +1,101 @@
+-- A write made straight to a segment while a table added to a running
+-- subscription is being copied.
+--
+-- Such a write has no distributed xid.  The readers withhold the added
+-- table's changes whatever kind of transaction they belong to -- the filter
+-- is by relid -- so the rows of one are held back like any other's, and the
+-- driver has to remember the transaction and replay it once the copy is
+-- done.  It used to remember only the distributed ones and let the local
+-- ones go, which lost their rows outright: withheld by the reader, never
+-- replayed by the catch-up.
+--
+-- The catch-up also has to tell the two sides of the cut point apart, and a
+-- gxid is no help for a write that has none.  What can tell is the segment's
+-- own snapshot at the same cut point, the local half of it.
+--
+--   1  written after the cut point: the copy cannot contain it, so the
+--      catch-up must replay it -- exactly once
+--   2  written before the cut point: the copy does contain it, so the
+--      catch-up must drop the stream's copy of it -- still exactly once
+--
+-- The key matters.  A utility-mode insert puts the row on the segment it is
+-- connected to whatever the distribution policy says, so a key that belongs
+-- elsewhere is misplaced data.  aw_key carries one that belongs on segment
+-- 0, replicated so that the utility session on that segment can read it.
+
+CREATE DATABASE mpp_lr_aw;
+
+CREATE TABLE aw_t (id int, v text) DISTRIBUTED BY (id);
+INSERT INTO aw_t SELECT g, 'seed' FROM generate_series(1, 300) g;
+CREATE TABLE aw_key (id int) DISTRIBUTED REPLICATED;
+INSERT INTO aw_key SELECT min(id) FROM aw_t WHERE gp_segment_id = 0;
+SELECT count(*) = 1 AS a_key_that_belongs_on_segment_0 FROM aw_key;
+CREATE PUBLICATION aw_pub FOR TABLE aw_t;
+
+1:@db_name mpp_lr_aw: CREATE TABLE aw_t (id int, v text) DISTRIBUTED BY (id);
+1:@db_name mpp_lr_aw: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_aw: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+-- reads the state row only: a reader on a table being copied would block the
+-- copy it is waiting for
+1:@db_name mpp_lr_aw: CREATE FUNCTION lr_state(rel text) RETURNS text AS $$ SELECT coalesce(min(cast(r.state as text)), 'none') FROM gp_subscription_rel r JOIN pg_class c ON c.oid = r.relid WHERE c.relname = $1 $$ LANGUAGE sql;
+
+1:@db_name mpp_lr_aw: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION aw_sub CONNECTION %L PUBLICATION aw_pub WITH (slot_name = ''aw_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+1:@db_name mpp_lr_aw: SELECT lr_wait($$SELECT lr_state('aw_t') = 'r'$$) AS base_ready;
+
+-- ------------------------------------------------------------------
+-- 1. written after the cut point: the catch-up must replay it
+-- ------------------------------------------------------------------
+CREATE TABLE aw_b (id int, v text) DISTRIBUTED BY (id);
+INSERT INTO aw_b SELECT g, 'seed' FROM generate_series(1, 400000) g;
+ALTER PUBLICATION aw_pub ADD TABLE aw_b;
+1:@db_name mpp_lr_aw: CREATE TABLE aw_b (id int, v text) DISTRIBUTED BY (id);
+1:@db_name mpp_lr_aw: ALTER SUBSCRIPTION aw_sub REFRESH PUBLICATION;
+
+-- 'd' with a copy job is set inside copy_begin(), which runs after
+-- sync_cut_point(): once it is there the cut point is taken, and the copy is
+-- reading under a snapshot that predates everything written from now on.
+-- The table is large so that the copy is still running a moment later.
+1:@db_name mpp_lr_aw: SELECT lr_wait($$SELECT lr_state('aw_b') = 'd'$$) AS copy_started;
+
+0U: INSERT INTO aw_b SELECT id, 'after the cut point' FROM aw_key;
+SELECT count(*) AS on_the_source FROM aw_b WHERE v = 'after the cut point';
+
+-- the write landed in the window this test is about
+1:@db_name mpp_lr_aw: SELECT lr_state('aw_b') <> 'r' AS still_copying;
+
+1:@db_name mpp_lr_aw: SELECT lr_wait($$SELECT lr_state('aw_b') = 'r'$$) AS b_ready;
+1:@db_name mpp_lr_aw: SELECT lr_wait('SELECT count(*) = 400001 FROM aw_b') AS b_caught_up;
+1:@db_name mpp_lr_aw: SELECT count(*) AS replayed_once FROM aw_b WHERE v = 'after the cut point';
+
+-- ------------------------------------------------------------------
+-- 2. written before the cut point: the catch-up must drop it
+-- ------------------------------------------------------------------
+-- stopped, but the slots stay and keep the WAL, so the write below is
+-- certainly on the stream and the copy taken afterwards certainly has it
+1:@db_name mpp_lr_aw: ALTER SUBSCRIPTION aw_sub DISABLE;
+1:@db_name mpp_lr_aw: SELECT lr_worker_gone() AS stopped;
+
+CREATE TABLE aw_c (id int, v text) DISTRIBUTED BY (id);
+INSERT INTO aw_c SELECT g, 'seed' FROM generate_series(1, 300) g;
+ALTER PUBLICATION aw_pub ADD TABLE aw_c;
+0U: INSERT INTO aw_c SELECT id, 'before the cut point' FROM aw_key;
+SELECT count(*) AS on_the_source FROM aw_c WHERE v = 'before the cut point';
+
+1:@db_name mpp_lr_aw: CREATE TABLE aw_c (id int, v text) DISTRIBUTED BY (id);
+1:@db_name mpp_lr_aw: ALTER SUBSCRIPTION aw_sub REFRESH PUBLICATION;
+1:@db_name mpp_lr_aw: ALTER SUBSCRIPTION aw_sub ENABLE;
+1:@db_name mpp_lr_aw: SELECT lr_wait($$SELECT lr_state('aw_c') = 'r'$$) AS c_ready;
+1:@db_name mpp_lr_aw: SELECT lr_wait('SELECT count(*) = 301 FROM aw_c') AS c_caught_up;
+1:@db_name mpp_lr_aw: SELECT count(*) AS copied_once FROM aw_c WHERE v = 'before the cut point';
+
+-- the phase is sampled after waiting for it: the job is done the moment the
+-- last table reads 'r', but the worker reports the change on its next turn
+1:@db_name mpp_lr_aw: SELECT lr_wait($$SELECT phase = 'streaming' FROM gp_stat_mpp_subscription WHERE subname = 'aw_sub'$$) AS streaming_again;
+1:@db_name mpp_lr_aw: SELECT stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'aw_sub';
+
+1:@db_name mpp_lr_aw: DROP SUBSCRIPTION aw_sub;
+1q:
+SELECT gp_drop_replication_slot('aw_slot');
+DROP PUBLICATION aw_pub;
+DROP TABLE aw_t, aw_b, aw_c, aw_key;
+DROP DATABASE mpp_lr_aw;

@@ -1464,6 +1464,48 @@ sync_field(const char *text, const char *name)
 	return *copy ? copy : NULL;
 }
 
+/*
+ * "local=<seg>/<snap>|<seg>/<snap>" of a cut point -> an array of the
+ * per-source-segment snapshot strings, indexed by source segment.  Both the
+ * readers' own deduplication and the driver's catch-up filter read it, so it
+ * is allocated in the caller's context and outlives the job that produced it.
+ */
+static void
+sync_parse_local(const char *text, MemoryContext cxt, int *nlocal, char ***local)
+{
+	char	   *copy;
+	char	   *seg_save = NULL;
+	char	   *entry;
+	char	   *tok;
+	int			nsegs = 0;
+
+	*nlocal = 0;
+	*local = NULL;
+	if ((copy = sync_field(text, "local=")) == NULL)
+		return;
+
+	/* one pass to learn how far the segment numbering goes */
+	for (tok = copy; *tok; tok++)
+		if (*tok == '|')
+			nsegs++;
+	nsegs++;
+	*local = (char **) MemoryContextAllocZero(cxt, sizeof(char *) * nsegs);
+	*nlocal = nsegs;
+	for (entry = strtok_r(copy, "|", &seg_save); entry != NULL;
+		 entry = strtok_r(NULL, "|", &seg_save))
+	{
+		char	   *slash = strchr(entry, '/');
+		int			seg;
+
+		if (slash == NULL)
+			continue;
+		*slash = '\0';
+		seg = atoi(entry);
+		if (seg >= 0 && seg < nsegs)
+			(*local)[seg] = MemoryContextStrdup(cxt, slash + 1);
+	}
+}
+
 static void
 sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 {
@@ -1483,33 +1525,7 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 	cfg->sync_local = NULL;
 
 	/* the per-source-segment snapshots, for the readers' own dedup */
-	if ((copy = sync_field(text, "local=")) != NULL)
-	{
-		char	   *seg_save = NULL;
-		char	   *entry;
-		int			nsegs = 0;
-
-		/* one pass to learn how far the segment numbering goes */
-		for (tok = copy; *tok; tok++)
-			if (*tok == '|')
-				nsegs++;
-		nsegs++;
-		cfg->sync_local = (char **) MemoryContextAllocZero(cxt, sizeof(char *) * nsegs);
-		cfg->nsync_local = nsegs;
-		for (entry = strtok_r(copy, "|", &seg_save); entry != NULL;
-			 entry = strtok_r(NULL, "|", &seg_save))
-		{
-			char	   *slash = strchr(entry, '/');
-			int			seg;
-
-			if (slash == NULL)
-				continue;
-			*slash = '\0';
-			seg = atoi(entry);
-			if (seg >= 0 && seg < nsegs)
-				cfg->sync_local[seg] = MemoryContextStrdup(cxt, slash + 1);
-		}
-	}
+	sync_parse_local(text, cxt, &cfg->nsync_local, &cfg->sync_local);
 
 	if ((copy = sync_field(text, "inprogress=")) == NULL)
 		return;
@@ -2072,7 +2088,8 @@ LrSyncAddCutLsn(LrSync *s)
 
 /* the cut point of this job: what the driver filters the catch-up with */
 void
-LrSyncAddSnapshot(LrSync *s, int64 *xmax, int *ninprogress, int64 **inprogress)
+LrSyncAddSnapshot(LrSync *s, int64 *xmax, int *ninprogress, int64 **inprogress,
+				  int *nlocal, char ***local)
 {
 	ListCell   *lc;
 	int			n = 0;
@@ -2082,6 +2099,13 @@ LrSyncAddSnapshot(LrSync *s, int64 *xmax, int *ninprogress, int64 **inprogress)
 	*inprogress = palloc(sizeof(int64) * Max(*ninprogress, 1));
 	foreach(lc, s->ds_inprogress)
 		(*inprogress)[n++] = *(int64 *) lfirst(lc);
+
+	/*
+	 * The local half of the same cut point: a utility write has no gxid, so
+	 * the only way to tell whether the copy already contains it is that
+	 * segment's own snapshot.
+	 */
+	sync_parse_local(s->ds_text, CurrentMemoryContext, nlocal, local);
 }
 
 /* the tables of this job, "nsp.rel" as the reader names them */

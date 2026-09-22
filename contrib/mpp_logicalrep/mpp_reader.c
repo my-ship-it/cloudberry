@@ -1429,7 +1429,13 @@ LrReaderFillReport(LrReaderState *st, LrTxn *txn, int seg, LrReport *rpt)
 	memset(rpt, 0, sizeof(LrReport));
 	rpt->seg = seg;
 	rpt->kind = txn->kind == LR_TXN_LOCAL ? LR_REPORT_LOCAL : LR_REPORT_READY;
-	rpt->gxid = txn->gxid;
+
+	/*
+	 * A utility write has no gxid.  What identifies it against a cut point is
+	 * its own xid on this segment, so that is what the field carries for one;
+	 * see LrReport.
+	 */
+	rpt->gxid = txn->kind == LR_TXN_LOCAL ? (int64) txn->xid : txn->gxid;
 	rpt->seg_lsn = txn->commit_lsn;
 	rpt->remote_relids = list_copy(txn->relids);
 	foreach(lc, txn->relids)
