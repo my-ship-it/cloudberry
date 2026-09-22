@@ -12393,6 +12393,11 @@
   proargtypes => '', proallargtypes => '{int8,int8,_int8}', proargmodes => '{o,o,o}',
   proargnames => '{xmin,xmax,in_progress}', prosrc => 'gp_current_distributed_snapshot' },
 
+{ oid => 7007, descr => 'local snapshot of each segment, for a cut point',
+  proname => 'gp_lr_local_snapshot', prorows => '1000', proretset => 't', prorettype => 'record', provolatile => 'v', proparallel => 'u', proexeclocation => 's',
+  proargtypes => '', proallargtypes => '{int4,int8,int8,_int8}', proargmodes => '{o,o,o,o}',
+  proargnames => '{segid,xmin,xmax,xip}', prosrc => 'gp_lr_local_snapshot' },
+
 { oid => 9184, descr => 'unordered percentile_cont float8 transition function',
   proname => 'gp_percentile_cont_float8_transition',
   proisstrict => 'f',

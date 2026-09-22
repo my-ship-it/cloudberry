@@ -26,6 +26,7 @@
 #include "utils/builtins.h"
 #include "utils/array.h"
 #include "funcapi.h"
+#include "utils/tuplestore.h"
 
 int
 GetMaxSnapshotDistributedXidCount()
@@ -353,6 +354,73 @@ DistributedSnapshot_Deserialize(const char *buf, DistributedSnapshot *ds)
  * snapshot (a REPEATABLE READ transaction taken at the sync cut point).
  * Avoids parsing pg_export_snapshot's ds* lines and needing pg_read_file.
  */
+/*
+ * gp_lr_local_snapshot(OUT segid int4, OUT xmin int8, OUT xmax int8,
+ *                      OUT xip int8[])
+ *
+ * This segment's own snapshot of local transaction ids, as the current
+ * statement sees it.  Declared EXECUTE ON ALL SEGMENTS, so a caller gets one
+ * row per segment, each reporting its own.
+ *
+ * A logical replication receiver needs it for the half of a cut point that
+ * gp_current_distributed_snapshot() cannot answer for: a transaction written
+ * straight to a segment has no distributed xid, so whether an initial copy
+ * already contains it is decided by that segment's local snapshot alone.  The
+ * statement calling this is also what freezes that snapshot for the rest of
+ * the transaction, which is why it is worth being able to read it back.
+ *
+ * Raw 32-bit xids, unlike txid_current_snapshot(), because what they are
+ * compared against -- the xids in a segment's logical decoding stream -- is
+ * raw as well.
+ */
+Datum
+gp_lr_local_snapshot(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcxt;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	Snapshot	snap;
+	Datum	   *elems;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		(rsinfo->allowedModes & SFRM_Materialize) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gp_lr_local_snapshot() must be called in a context that accepts a set")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcxt = MemoryContextSwitchTo(per_query_ctx);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	snap = GetActiveSnapshot();
+	if (snap == NULL)
+		snap = GetTransactionSnapshot();
+
+	values[0] = Int32GetDatum(GpIdentity.segindex);
+	values[1] = Int64GetDatum((int64) snap->xmin);
+	values[2] = Int64GetDatum((int64) snap->xmax);
+
+	elems = (Datum *) palloc(sizeof(Datum) * Max(snap->xcnt, 1));
+	for (int i = 0; i < snap->xcnt; i++)
+		elems[i] = Int64GetDatum((int64) snap->xip[i]);
+	values[3] = PointerGetDatum(construct_array(elems, snap->xcnt, INT8OID,
+												8, FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+
+	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	MemoryContextSwitchTo(oldcxt);
+
+	return (Datum) 0;
+}
+
 Datum
 gp_current_distributed_snapshot(PG_FUNCTION_ARGS)
 {
