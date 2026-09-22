@@ -152,8 +152,6 @@ extern bool LrWorkerStopRequested(void);
 extern struct pg_conn *LrPQConnect(const char *conninfo);
 extern struct pg_result *LrPQGetResult(struct pg_conn *conn);
 extern void LrPQWaitIO(struct pg_conn *conn, int io_flag);
-extern bool LrPQFlush(struct pg_conn *conn);
-extern bool LrPQPutCopyData(struct pg_conn *conn, const char *buf, int n);
 
 /* ------------------------------------------------------------------------
  * What a running worker publishes about itself

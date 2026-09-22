@@ -485,35 +485,6 @@ LrPQGetResult(PGconn *conn)
 	return PQgetResult(conn);
 }
 
-/* push whatever libpq has buffered, waiting for room rather than blocking */
-bool
-LrPQFlush(PGconn *conn)
-{
-	int			rc;
-
-	while ((rc = PQflush(conn)) > 0)
-		LrPQWaitIO(conn, WL_SOCKET_WRITEABLE);
-	return rc == 0;
-}
-
-/* PQputCopyData() on a connection put in non-blocking mode for the copy */
-bool
-LrPQPutCopyData(PGconn *conn, const char *buf, int n)
-{
-	for (;;)
-	{
-		int			rc = PQputCopyData(conn, buf, n);
-
-		if (rc == 1)
-			return true;
-		if (rc < 0)
-			return false;
-		/* the buffer is full: drain it towards the far side and try again */
-		if (!LrPQFlush(conn))
-			return false;
-	}
-}
-
 /*
  * Connect, stepping the handshake by hand so that the wait for a coordinator
  * that never answers is a wait we can be woken out of.  Returns a connection

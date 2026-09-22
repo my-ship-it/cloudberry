@@ -101,7 +101,7 @@ typedef struct LrSyncRel
 /* where an incremental job stands between two calls of LrSyncAddStep() */
 typedef enum LrSyncStep
 {
-	LR_SYNC_STEP_INIT,			/* nothing sent yet */
+	LR_SYNC_STEP_INIT,			/* nothing sent yet (the initial value only) */
 	LR_SYNC_STEP_PORTS,			/* target INSERT sent, ports not published */
 	LR_SYNC_STEP_COPY,			/* source COPY sent, both sides running */
 	LR_SYNC_STEP_DONE			/* every table copied */
@@ -150,6 +150,8 @@ typedef struct LrSync
 	TimestampTz cur_started;
 	bool		src_busy;		/* a COPY is in flight on src */
 	int64		cur_src_rows;
+	int64		cur_want_rows;	/* replicated: what one copy of it holds, so
+								 * that taking none or several is caught */
 } LrSync;
 
 static PGresult *sync_exec(LrSync *s, PGconn *conn, const char *who,
@@ -177,7 +179,6 @@ static void sync_read_unsupported_mode(LrSync *s);
 static void sync_report_unsupported(LrSync *s, LrSyncRel *r, const char *am);
 static void sync_mark_untracked(LrSync *s);
 static void sync_check_keys(LrSync *s, LrSyncRel *r);
-static void copy_via_coordinators(LrSync *s, LrSyncRel *r);
 static void sync_set_rel_state(LrSync *s, Oid relid, char state, const char *job);
 static void sync_finish(LrSync *s);
 static void sync_apply_snapshot(LrWorkerConfig *cfg, const char *text,
@@ -983,156 +984,6 @@ LrUnsupportedTablesName(LrUnsupportedTables mode)
 	return mode == LR_UNSUPPORTED_SNAPSHOT ? "snapshot" : "error";
 }
 
-/*
- * The copy of a replicated table: every segment holds every
- * row, so the rows are read once on the source coordinator and written once
- * on the target coordinator, which broadcasts them again.  Both directions
- * of a replicated table are small by construction, so the coordinators are
- * not a bottleneck here -- and this is also the only shape the
- * segment-to-segment transport cannot express.
- */
-static void
-copy_via_coordinators(LrSync *s, LrSyncRel *r)
-{
-	StringInfoData sql;
-	PGresult   *res;
-	int64		nrows = 0;
-	char	   *buf = NULL;
-	int			n;
-	char	   *msg = NULL;
-
-	sync_set_rel_state(s, r->relid, 'd', NULL);
-	if (s->tgt == NULL)
-		s->tgt = sync_connect_one(s->cfg->target_conninfo, "target coordinator",
-								  " options='-c client_connection_check_interval=1000'");
-
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "COPY (SELECT %s FROM %s) TO STDOUT", r->collist, r->qualified);
-	res = PQsendQuery(s->src, sql.data) ? LrPQGetResult(s->src) : NULL;
-	if (res == NULL || PQresultStatus(res) != PGRES_COPY_OUT)
-	{
-		msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(s->src));
-		if (res)
-			PQclear(res);
-		pfree(sql.data);
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION),
-				 errmsg("initial sync, source COPY of replicated %s: %s", r->qualified, msg)));
-	}
-	PQclear(res);
-
-	resetStringInfo(&sql);
-	appendStringInfo(&sql, "COPY %s (%s) FROM STDIN", r->qualified, r->collist);
-	res = PQsendQuery(s->tgt, sql.data) ? LrPQGetResult(s->tgt) : NULL;
-	if (res == NULL || PQresultStatus(res) != PGRES_COPY_IN)
-	{
-		msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(s->tgt));
-		if (res)
-			PQclear(res);
-		pfree(sql.data);
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION),
-				 errmsg("initial sync, target COPY of replicated %s: %s", r->qualified, msg)));
-	}
-	PQclear(res);
-	pfree(sql.data);
-	s->tgt_busy = true;
-
-	/*
-	 * Read and write without blocking in either direction: a source that
-	 * stops sending, or a target that stops reading, must not make this
-	 * worker deaf for as long as it lasts.
-	 */
-	(void) PQsetnonblocking(s->tgt, 1);
-	for (;;)
-	{
-		n = PQgetCopyData(s->src, &buf, 1);
-		if (n == 0)
-		{
-			/* nothing buffered yet -- wait on the socket, not on the read */
-			LrPQWaitIO(s->src, WL_SOCKET_READABLE);
-			if (PQconsumeInput(s->src) == 0)
-			{
-				n = -2;
-				break;
-			}
-			continue;
-		}
-		if (n < 0)
-			break;
-		if (!LrPQPutCopyData(s->tgt, buf, n))
-		{
-			PQfreemem(buf);
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("initial sync, target COPY of replicated %s: %s",
-							r->qualified, PQerrorMessage(s->tgt))));
-		}
-		PQfreemem(buf);
-		buf = NULL;
-		nrows++;
-	}
-	if (n == -2)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION),
-				 errmsg("initial sync, source COPY of replicated %s: %s",
-						r->qualified, PQerrorMessage(s->src))));
-	while ((res = LrPQGetResult(s->src)) != NULL)
-	{
-		if (PQresultStatus(res) != PGRES_COMMAND_OK && msg == NULL)
-			msg = pstrdup(PQresultErrorMessage(res));
-		PQclear(res);
-	}
-	if (msg)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION),
-				 errmsg("initial sync, source COPY of replicated %s: %s", r->qualified, msg)));
-
-	for (;;)
-	{
-		int			rc = PQputCopyEnd(s->tgt, NULL);
-
-		if (rc == 1)
-			break;
-		if (rc < 0 || !LrPQFlush(s->tgt))
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("initial sync, target COPY of replicated %s: %s",
-							r->qualified, PQerrorMessage(s->tgt))));
-	}
-	if (!LrPQFlush(s->tgt))
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION),
-				 errmsg("initial sync, target COPY of replicated %s: %s",
-						r->qualified, PQerrorMessage(s->tgt))));
-	(void) PQsetnonblocking(s->tgt, 0);
-	{
-		int64		tgt_rows = -1;
-
-		while ((res = LrPQGetResult(s->tgt)) != NULL)
-		{
-			if (PQresultStatus(res) == PGRES_COMMAND_OK)
-				tgt_rows = strtoll(PQcmdTuples(res), NULL, 10);
-			else if (msg == NULL)
-				msg = pstrdup(PQresultErrorMessage(res));
-			PQclear(res);
-		}
-		s->tgt_busy = false;
-		if (msg)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("initial sync, target COPY of replicated %s: %s", r->qualified, msg)));
-		if (tgt_rows != nrows)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("initial sync: %s: source sent " INT64_FORMAT " rows, target received " INT64_FORMAT,
-							r->qualified, nrows, tgt_rows)));
-	}
-
-	sync_set_rel_state(s, r->relid, 'f', NULL);
-	elog(LOG, "mpp apply worker: subscription %u: copied replicated %s: " INT64_FORMAT " rows (through the coordinators)",
-		 s->cfg->subid, r->qualified, nrows);
-}
 
 /*
  * The tables of this subscription that are not ready yet (state 'i', 'd'
@@ -1713,6 +1564,25 @@ copy_begin(LrSync *s, LrSyncRel *r)
 	s->cur_job = sync_new_job(s, r);
 	s->cur_targets = NULL;
 	s->cur_src_rows = -1;
+	s->cur_want_rows = -1;
+
+	/*
+	 * What one copy of a replicated table holds.  The check below compares
+	 * source rows sent with target rows received, which says whether the
+	 * transport lost anything -- not whether the right number was sent in
+	 * the first place.  Taking a replicated table needs exactly one segment's
+	 * worth, and both ways of getting that wrong (none, or one per segment)
+	 * leave the two sides agreeing with each other.  So ask beforehand.
+	 */
+	if (r->replicated)
+	{
+		char	   *sql2 = psprintf("SELECT count(*) FROM %s", r->qualified);
+		PGresult   *cnt = sync_exec(s, s->src, "source", sql2, 0, NULL);
+
+		s->cur_want_rows = strtoll(PQgetvalue(cnt, 0, 0), NULL, 10);
+		PQclear(cnt);
+		pfree(sql2);
+	}
 	sync_set_rel_state(s, r->relid, 'd', s->cur_job);
 
 	/*
@@ -1830,8 +1700,36 @@ copy_send(LrSync *s, LrSyncRel *r)
 	char	   *lit = PQescapeLiteral(s->src, prog, strlen(prog));
 
 	initStringInfo(&sql);
-	appendStringInfo(&sql, "COPY (SELECT %s FROM %s) TO PROGRAM %s ON SEGMENT",
-					 r->collist, r->qualified, lit);
+	if (r->replicated)
+	{
+		/*
+		 * Every segment holds every row, so an unqualified scan would send
+		 * the table once per segment.  gp_dist_random() is what makes taking
+		 * one copy right rather than lucky: the scan of a replicated table
+		 * may be placed on any single segment the planner likes -- both
+		 * optimizers do that, and they do not agree on which -- so
+		 * gp_execution_segment() in a plain qual reads back whichever segment
+		 * was chosen, and the filter keeps everything or nothing.
+		 * gp_dist_random() asks for the scan on every segment, and then the
+		 * qual means what it says.  Do not simplify it away: what that breaks
+		 * is a silently empty copy.
+		 *
+		 * Segment 0 to match the streaming side, which lets the reader of
+		 * source segment 0 be the one that reports a replicated table's
+		 * changes.  Any single segment would do; having one answer is what
+		 * matters.
+		 */
+		char	   *relname = PQescapeLiteral(s->src, r->qualified, strlen(r->qualified));
+
+		appendStringInfo(&sql,
+						 "COPY (SELECT %s FROM gp_dist_random(%s) "
+						 "WHERE gp_execution_segment() = 0) TO PROGRAM %s ON SEGMENT",
+						 r->collist, relname, lit);
+		PQfreemem(relname);
+	}
+	else
+		appendStringInfo(&sql, "COPY (SELECT %s FROM %s) TO PROGRAM %s ON SEGMENT",
+						 r->collist, r->qualified, lit);
 	PQfreemem(lit);
 	pfree(prog);
 	if (!PQsendQuery(s->src, sql.data))
@@ -1930,6 +1828,12 @@ copy_poll_done(LrSync *s, LrSyncRel *r)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("initial sync: %s: source sent " INT64_FORMAT " rows, target received " INT64_FORMAT,
 						r->qualified, s->cur_src_rows, tgt_rows)));
+	if (s->cur_want_rows >= 0 && s->cur_want_rows != tgt_rows)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("initial sync: replicated %s holds " INT64_FORMAT " rows, but " INT64_FORMAT " were copied",
+						r->qualified, s->cur_want_rows, tgt_rows),
+				 errdetail("One segment's worth is what a replicated table needs; none means the scan was placed where the filter kept nothing, several means it ran on every segment.")));
 
 	sync_set_rel_state(s, r->relid, 'f', NULL);
 	elog(LOG, "mpp apply worker: subscription %u: copied %s: " INT64_FORMAT " rows, %s (job %s)",
@@ -1941,11 +1845,6 @@ copy_poll_done(LrSync *s, LrSyncRel *r)
 static void
 sync_copy_table(LrSync *s, LrSyncRel *r)
 {
-	if (r->replicated)
-	{
-		copy_via_coordinators(s, r);
-		return;
-	}
 	copy_begin(s, r);
 	while (!copy_ports_ready(s, r))
 		sync_wait(s, LR_SYNC_POLL_MS);
@@ -2045,13 +1944,8 @@ add_start_body(LrSync *s)
 
 	sync_cut_point(s);
 	s->cur = list_head(s->rels);
-	if (((LrSyncRel *) lfirst(s->cur))->replicated)
-		s->step = LR_SYNC_STEP_INIT;	/* copied through the coordinators */
-	else
-	{
-		copy_begin(s, (LrSyncRel *) lfirst(s->cur));
-		s->step = LR_SYNC_STEP_PORTS;
-	}
+	copy_begin(s, (LrSyncRel *) lfirst(s->cur));
+	s->step = LR_SYNC_STEP_PORTS;
 
 	elog(LOG, "mpp apply worker: subscription %u: synchronising %d added table(s), cut point L_t %s, DS_t %s",
 		 s->cfg->subid, list_length(s->rels), s->lt, s->ds_text);
@@ -2111,29 +2005,7 @@ LrSyncAddStep(LrSync *s)
 	}
 	r = (LrSyncRel *) lfirst(s->cur);
 
-	/*
-	 * A replicated table goes through the coordinators in one step; it is
-	 * small by construction, so the apply loop does not stall noticeably.
-	 */
-	if (s->step == LR_SYNC_STEP_INIT)
-	{
-		copy_via_coordinators(s, r);
-		s->cur = lnext(s->rels, s->cur);
-		if (s->cur == NULL)
-		{
-			PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
-			s->step = LR_SYNC_STEP_DONE;
-			done = true;
-		}
-		else if (((LrSyncRel *) lfirst(s->cur))->replicated)
-			s->step = LR_SYNC_STEP_INIT;
-		else
-		{
-			copy_begin(s, (LrSyncRel *) lfirst(s->cur));
-			s->step = LR_SYNC_STEP_PORTS;
-		}
-	}
-	else if (s->step == LR_SYNC_STEP_PORTS)
+	if (s->step == LR_SYNC_STEP_PORTS)
 	{
 		if (copy_ports_ready(s, r))
 		{
@@ -2152,8 +2024,6 @@ LrSyncAddStep(LrSync *s)
 				s->step = LR_SYNC_STEP_DONE;
 				done = true;
 			}
-			else if (((LrSyncRel *) lfirst(s->cur))->replicated)
-				s->step = LR_SYNC_STEP_INIT;	/* through the coordinators */
 			else
 			{
 				copy_begin(s, (LrSyncRel *) lfirst(s->cur));

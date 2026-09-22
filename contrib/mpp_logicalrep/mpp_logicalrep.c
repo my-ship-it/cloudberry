@@ -374,8 +374,22 @@ lr_worker_attach(Oid subid, Oid dbid)
 				 lr_shared->slots[i].rep.start_time < idle->rep.start_time))
 				idle = &lr_shared->slots[i];
 		}
-		if (slot == NULL)
+		if (slot == NULL && idle != NULL)
+		{
+			/*
+			 * Taking one back is better than a subscription that can never
+			 * start, but it is worth saying: it means max_workers is too
+			 * small for the number of subscriptions this cluster runs, and
+			 * the one evicted loses its row in the monitoring view until its
+			 * own worker runs again.  Silence here would make a shortage look
+			 * like a subscription that merely takes a while to come up.
+			 */
+			ereport(LOG,
+					(errmsg("mpp_logicalrep: taking the worker slot of subscription %u for subscription %u",
+							idle->subid, subid),
+					 errhint("Raise \"mpp_logicalrep.max_workers\" above the number of subscriptions this cluster runs.")));
 			slot = idle;
+		}
 		if (slot != NULL)
 		{
 			slot->subid = subid;
