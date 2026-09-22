@@ -41,6 +41,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
+#include "storage/fd.h"
 #include "replication/worker_internal.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
@@ -66,6 +67,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "utils/pidfile.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -2975,6 +2977,7 @@ LrMakeCbdbAssembly(LrCbdbTransport *tr, LrWorkerConfig *cfg, LrWorkerStats *stat
  * coordinator session through libpq.
  */
 static volatile sig_atomic_t mpp_worker_stop = false;
+static bool mpp_in_worker = false;
 
 static void
 mpp_worker_sigterm(SIGNAL_ARGS)
@@ -2983,22 +2986,83 @@ mpp_worker_sigterm(SIGNAL_ARGS)
 	SetLatch(MyLatch);
 }
 
+/* how often the lock file is worth re-reading */
+#define LR_PM_STATUS_MS		1000
+
+/* miscinit.c keeps DIRECTORY_LOCK_FILE to itself */
+#define LR_PM_LOCK_FILE		"postmaster.pid"
+
+/*
+ * Is the postmaster shutting down?
+ *
+ * A smart shutdown -- gpstop's default -- waits for every client backend to
+ * go before it touches anything else, and this worker drives its gangs
+ * through an ordinary session of its own, so from the server's point of view
+ * a client stays connected and the shutdown never finishes.  Nothing tells
+ * us: background workers are signalled only once the client backends are
+ * gone, which is the very thing being waited for.
+ *
+ * What the postmaster does do is record the shutdown in the data directory
+ * lock file, on the line pg_ctl reads to wait for one.  Read it too.  Once a
+ * second is often enough, and a shutdown cannot be called off -- only
+ * escalated to fast or immediate -- so once this is true it stays true.
+ */
+bool
+LrPostmasterStopping(void)
+{
+	static bool stopping = false;
+	static TimestampTz last = 0;
+	TimestampTz now;
+	char		path[MAXPGPATH];
+	char		buf[1024];
+	FILE	   *fh;
+	int			line;
+
+	if (stopping)
+		return true;
+	now = GetCurrentTimestamp();
+	if (last != 0 && !TimestampDifferenceExceeds(last, now, LR_PM_STATUS_MS))
+		return false;
+	last = now;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, LR_PM_LOCK_FILE);
+	if ((fh = AllocateFile(path, PG_BINARY_R)) == NULL)
+		return false;			/* unreadable: not something to act on */
+	buf[0] = '\0';
+	for (line = 1; line <= LOCK_FILE_LINE_PM_STATUS; line++)
+		if (fgets(buf, sizeof(buf), fh) == NULL)
+			break;
+	if (line > LOCK_FILE_LINE_PM_STATUS &&
+		strncmp(buf, PM_STATUS_STOPPING, strlen(PM_STATUS_STOPPING)) == 0)
+		stopping = true;
+	FreeFile(fh);
+	return stopping;
+}
+
 /*
  * Has this worker been told to stop?  Cheap enough to ask while waiting for
  * a socket, which is the point: it is what makes the libpq waits above give
  * up on a SIGTERM.  Always false in the SQL test entry, which runs in an
- * ordinary backend where CHECK_FOR_INTERRUPTS does the same job.
+ * ordinary backend where CHECK_FOR_INTERRUPTS does the same job, and where a
+ * smart shutdown is the caller's business rather than ours.
  */
 bool
 LrWorkerStopRequested(void)
 {
-	return mpp_worker_stop;
+	if (mpp_worker_stop)
+		return true;
+	if (!mpp_in_worker || !LrPostmasterStopping())
+		return false;
+	ereport(LOG,
+			(errmsg("mpp apply worker: the server is shutting down, stopping")));
+	mpp_worker_stop = true;
+	return true;
 }
 
 static bool
 mpp_worker_should_stop(void *arg)
 {
-	return mpp_worker_stop || !LrSubscriptionEnabled(*(Oid *) arg);
+	return LrWorkerStopRequested() || !LrSubscriptionEnabled(*(Oid *) arg);
 }
 
 /*
@@ -3034,6 +3098,7 @@ MppApplyWorkerMain(Datum main_arg)
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(arg));
 	subid = arg.subid;
 
+	mpp_in_worker = true;
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, mpp_worker_sigterm);
 	BackgroundWorkerUnblockSignals();

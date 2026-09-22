@@ -403,18 +403,17 @@ be resynchronised afterwards.
 Throughput is one writer gang and one distributed commit per batch;
 parallel apply is not implemented.
 
-An enabled subscription keeps gpstop from finishing in its default
-smart mode.  The worker drives its gangs from an ordinary session of its
-own, and smart shutdown is defined as waiting for every client session to
-end, so from the server's point of view a client is always connected.
-This is what smart mode means rather than a fault -- an idle psql does
-the same -- but a subscription does not look like a user connection, so
-it is worth knowing where the wait comes from.  gpstop reports it: after
-its timeout it lists the sessions it is waiting for, where this one
-appears with application_name = mpp_apply_worker, and offers fast or
-immediate mode.  Answer fast, or run gpstop -M fast, or disable the
-subscriptions first.  A non-interactive gpstop (-q, or no terminal to
-answer on) has nobody to ask and waits indefinitely.
+A smart shutdown -- gpstop's default -- stops the workers.  It is defined
+as waiting for every client session to end, and a worker drives its gangs
+from an ordinary session of its own, so a subscription left running would
+keep a client connected and the shutdown would never finish.  Nothing
+signals the workers: the postmaster leaves background workers alone until
+the client backends have gone, which is the very thing it is waiting for.
+Each worker therefore reads the shutdown out of the data directory lock
+file, on the line pg_ctl reads to wait for one, and stops of its own
+accord, saying so in the log; the launcher starts no more while that line
+stands.  The subscriptions are not disabled and the workers come back on
+the next start.
 
 A subscription dumped by pg_dump cannot be restored as it stands,
 because pg_dump writes connect = false and this module refuses that

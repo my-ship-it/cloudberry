@@ -149,6 +149,7 @@ extern void LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats);
  */
 #define LR_CONNECT_TIMEOUT_S	60
 extern bool LrWorkerStopRequested(void);
+extern bool LrPostmasterStopping(void);
 extern struct pg_conn *LrPQConnect(const char *conninfo);
 extern struct pg_result *LrPQGetResult(struct pg_conn *conn);
 extern void LrPQWaitIO(struct pg_conn *conn, int io_flag);

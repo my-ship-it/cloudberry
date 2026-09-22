@@ -1525,6 +1525,8 @@ launch_due_workers(void)
 void
 MppLauncherMain(Datum main_arg)
 {
+	bool		stopping_said = false;
+
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -1556,7 +1558,23 @@ MppLauncherMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		launch_due_workers();
+		/*
+		 * A worker that noticed a smart shutdown stopped itself; starting it
+		 * again would put its session back and leave the shutdown waiting on
+		 * the very thing it just gave up.  Keep napping until the postmaster
+		 * gets round to signalling background workers.
+		 */
+		if (LrPostmasterStopping())
+		{
+			if (!stopping_said)
+			{
+				ereport(LOG,
+						(errmsg("mpp logical replication launcher: the server is shutting down, starting no more workers")));
+				stopping_said = true;
+			}
+		}
+		else
+			launch_due_workers();
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
