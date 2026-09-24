@@ -101,6 +101,59 @@ typedef struct LrSyncRel
 								 * the redistribution the general path does */
 } LrSyncRel;
 
+/*
+ * The two shapes that cannot be applied, reported while there is still time
+ * to change them.  Neither is fatal: they only bite the
+ * UPDATEs described below, and a table that is only inserted into or deleted
+ * from is fine either way, so this warns instead of refusing.
+ */
+typedef struct LrRelKeys
+{
+	char		policytype;		/* 'p' hash or random, 'r' replicated */
+	char		replident;		/* pg_class.relreplident */
+	List	   *distkey;		/* char*: distribution key columns */
+	List	   *identity;		/* char*: replica identity columns */
+	List	   *uniques;		/* char*: one comma-joined column list per
+								 * unique index that could identify a row on
+								 * its own -- valid, immediate, whole-table,
+								 * over plain NOT NULL columns */
+} LrRelKeys;
+
+/*
+ * The tables' names as one text[] literal, in list order.  Every catalogue
+ * question the prologue asks is the same question about each table, and a
+ * round trip apiece is what made it the longest serial stretch of a
+ * synchronisation -- seven round trips a table, fifty tables, 2.7 s of a
+ * 7.6 s run.  Asked once with unnest(), it is seven round trips in total,
+ * whatever the number of tables.
+ */
+static char *
+sync_names_array(List *rels)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '{');
+	foreach(lc, rels)
+	{
+		const char *p = ((LrSyncRel *) lfirst(lc))->qualified;
+
+		if (buf.len > 1)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoChar(&buf, '"');
+		for (; *p; p++)
+		{
+			if (*p == '"' || *p == '\\')
+				appendStringInfoChar(&buf, '\\');
+			appendStringInfoChar(&buf, *p);
+		}
+		appendStringInfoChar(&buf, '"');
+	}
+	appendStringInfoChar(&buf, '}');
+	return buf.data;
+}
+
 /* where an incremental job stands between two calls of LrSyncAddStep() */
 typedef enum LrSyncStep
 {
@@ -192,12 +245,15 @@ static void sync_connect_source(LrSync *s);
 static void sync_fetch_pending(LrSync *s);
 static void sync_finish_rels(LrSync *s);
 static void add_start_body(LrSync *s);
-static void sync_fill_columns(LrSync *s, LrSyncRel *r);
-static void sync_fill_source_info(LrSync *s, LrSyncRel *r);
+static void sync_fill_all(LrSync *s);
+static void sync_fetch_keys_all(LrSync *s, PGconn *conn, const char *who,
+								List *rels, LrRelKeys *keys);
+static void sync_fill_source_info_all(LrSync *s);
 static void sync_read_unsupported_mode(LrSync *s);
 static void sync_report_unsupported(LrSync *s, LrSyncRel *r, const char *am);
 static void sync_mark_untracked(LrSync *s);
-static void sync_check_keys(LrSync *s, LrSyncRel *r);
+static void sync_check_keys(LrSync *s, LrSyncRel *r,
+							const LrRelKeys *srcp, const LrRelKeys *tgtp);
 static void sync_set_rel_state(LrSync *s, Oid relid, char state, const char *job);
 static void sync_finish(LrSync *s);
 static void sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt);
@@ -426,39 +482,6 @@ sync_connect(LrSync *s)
 }
 
 /*
- * How a side places this table's rows, as one string: the policy, then the
- * distribution key as column name and operator class in key order.  Two sides
- * that answer the same place every row the same way -- the operator class is
- * in it because that is what tells the legacy hash from the jump-consistent
- * one, and a table keyed on the same column with the other hash lands its rows
- * somewhere else entirely.  A randomly distributed table answers with an empty
- * key, which is the honest answer: any row may live anywhere, on both sides.
- */
-static char *
-sync_placement(LrSync *s, PGconn *conn, const char *who, const char *qualified)
-{
-	const char *params[1] = {qualified};
-	PGresult   *res;
-	char	   *sig;
-
-	res = sync_exec(s, conn, who,
-					"SELECT cast(p.policytype as text) || '|' || coalesce(\n"
-					"        (SELECT string_agg(a.attname || ':' || n.nspname || '.' || o.opcname,\n"
-					"                           ',' ORDER BY k.ord)\n"
-					"           FROM unnest(cast(p.distkey as int2[])) WITH ORDINALITY AS k(attnum, ord)\n"
-					"           JOIN pg_attribute a ON a.attrelid = p.localoid AND a.attnum = k.attnum\n"
-					"           JOIN pg_opclass o ON o.oid = p.distclass[k.ord - 1]\n"
-					"           JOIN pg_namespace n ON n.oid = o.opcnamespace), '')\n"
-					"  FROM gp_distribution_policy p\n"
-					" WHERE p.localoid = to_regclass($1)",
-					1, params);
-	sig = (PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
-		? pstrdup(PQgetvalue(res, 0, 0)) : NULL;
-	PQclear(res);
-	return sig;
-}
-
-/*
  * Stop an in-flight receiving INSERT before closing its connection.  Just
  * closing would leave the QD backend blocked in gp_lr_copy_recv() (the helper
  * waits for senders that will never come) holding the table's lock until the
@@ -574,50 +597,86 @@ sync_connect_source(LrSync *s)
 	PQclear(res);
 }
 
-/* target-side column list and definition list of one relation */
+/*
+ * Every table's column list and definition list, target order, in one go --
+ * and its target relid, which the publication path has no other source for.
+ */
 static void
-sync_fill_columns(LrSync *s, LrSyncRel *r)
+sync_fill_columns_all(LrSync *s)
 {
-	const char *params[1] = {r->qualified};
+	char	   *names;
+	const char *params[1];
 	PGresult   *res;
+	ListCell   *lc;
+	int			i = 0;
 
+	if (s->rels == NIL)
+		return;
+	names = sync_names_array(s->rels);
+	params[0] = names;
 	res = sync_exec(s, s->tgt2, "target",
-					"SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum),\n"
-					"       string_agg(quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod), ', ' ORDER BY a.attnum)\n"
-					"  FROM pg_attribute a\n"
-					" WHERE a.attrelid = to_regclass($1) AND a.attnum > 0\n"
-					"   AND NOT a.attisdropped AND a.attgenerated = ''",
+					"SELECT to_regclass(q.nm)::oid,\n"
+					"       string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum),\n"
+					"       string_agg(quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod),\n"
+					"                  ', ' ORDER BY a.attnum)\n"
+					"  FROM unnest(cast($1 as text[])) WITH ORDINALITY AS q(nm, ord)\n"
+					"  LEFT JOIN pg_attribute a ON a.attrelid = to_regclass(q.nm)\n"
+					"       AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''\n"
+					" GROUP BY q.ord, q.nm\n"
+					" ORDER BY q.ord",
 					1, params);
-	if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+	foreach(lc, s->rels)
 	{
-		PQclear(res);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("table synchronisation: target relation %s does not exist", r->qualified),
-				 errhint("DDL is not replicated; create the table on the target first.")));
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+		if (i >= PQntuples(res) || PQgetisnull(res, i, 1))
+		{
+			PQclear(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("table synchronisation: target relation %s does not exist",
+							r->qualified),
+					 errhint("DDL is not replicated; create the table on the target first.")));
+		}
+		r->relid = (Oid) strtoul(PQgetvalue(res, i, 0), NULL, 10);
+		r->collist = pstrdup(PQgetvalue(res, i, 1));
+		r->coldefs = pstrdup(PQgetvalue(res, i, 2));
+		i++;
 	}
-	r->collist = pstrdup(PQgetvalue(res, 0, 0));
-	r->coldefs = pstrdup(PQgetvalue(res, 0, 1));
 	PQclear(res);
 }
 
 /*
- * The two shapes that cannot be applied, reported while there is still time
- * to change them.  Neither is fatal: they only bite the
- * UPDATEs described below, and a table that is only inserted into or deleted
- * from is fine either way, so this warns instead of refusing.
+ * Everything the prologue has to know about the tables it is about to copy,
+ * asked once for the lot rather than once per table.
  */
-typedef struct LrRelKeys
+static void
+sync_fill_all(LrSync *s)
 {
-	char		policytype;		/* 'p' hash or random, 'r' replicated */
-	char		replident;		/* pg_class.relreplident */
-	List	   *distkey;		/* char*: distribution key columns */
-	List	   *identity;		/* char*: replica identity columns */
-	List	   *uniques;		/* char*: one comma-joined column list per
-								 * unique index that could identify a row on
-								 * its own -- valid, immediate, whole-table,
-								 * over plain NOT NULL columns */
-} LrRelKeys;
+	int			n = list_length(s->rels);
+	LrRelKeys  *srckeys;
+	LrRelKeys  *tgtkeys;
+	ListCell   *lc;
+	int			i = 0;
+
+	if (n == 0)
+		return;
+	sync_fill_columns_all(s);
+	sync_fill_source_info_all(s);
+
+	srckeys = palloc0(sizeof(LrRelKeys) * n);
+	tgtkeys = palloc0(sizeof(LrRelKeys) * n);
+	sync_fetch_keys_all(s, s->src, "source", s->rels, srckeys);
+	sync_fetch_keys_all(s, s->tgt2, "target", s->rels, tgtkeys);
+	foreach(lc, s->rels)
+	{
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+		if (r->tracked)
+			sync_check_keys(s, r, &srckeys[i], &tgtkeys[i]);
+		i++;
+	}
+}
 
 static List *
 name_list(const char *csv)
@@ -683,15 +742,17 @@ names_text(List *names)
 	return buf.data;
 }
 
-/* one side's policy and keys, by name */
+/* one side's policy and keys, for every table, in list order */
 static void
-sync_fetch_keys(LrSync *s, PGconn *conn, const char *who, const char *qualified,
-				LrRelKeys *keys)
+sync_fetch_keys_all(LrSync *s, PGconn *conn, const char *who, List *rels,
+					LrRelKeys *keys)
 {
-	const char *params[1] = {qualified};
+	char	   *names = sync_names_array(rels);
+	const char *params[1] = {names};
 	PGresult   *res;
+	int			n = list_length(rels);
 
-	memset(keys, 0, sizeof(*keys));
+	memset(keys, 0, sizeof(LrRelKeys) * Max(n, 1));
 	res = sync_exec(s, conn, who,
 					"SELECT coalesce(p.policytype::text, ''), c.relreplident::text,\n"
 					"       (SELECT coalesce(string_agg(a.attname, ','), '')\n"
@@ -720,16 +781,20 @@ sync_fetch_keys(LrSync *s, PGconn *conn, const char *who, const char *qualified,
 					"                           AND a.attnotnull)\n"
 					"                       = array_length(i.indkey::int2[], 1)) u\n"
 					"         WHERE cols IS NOT NULL)\n"
-					"  FROM pg_class c LEFT JOIN gp_distribution_policy p ON p.localoid = c.oid\n"
-					" WHERE c.oid = to_regclass($1)",
+					"  FROM unnest(cast($1 as text[])) WITH ORDINALITY AS q(nm, ord)\n"
+					"  LEFT JOIN pg_class c ON c.oid = to_regclass(q.nm)\n"
+					"  LEFT JOIN gp_distribution_policy p ON p.localoid = c.oid\n"
+					" ORDER BY q.ord",
 					1, params);
-	if (PQntuples(res) == 1)
+	for (int i = 0; i < PQntuples(res) && i < n; i++)
 	{
-		keys->policytype = PQgetvalue(res, 0, 0)[0];
-		keys->replident = PQgetvalue(res, 0, 1)[0];
-		keys->distkey = name_list(PQgetvalue(res, 0, 2));
-		keys->identity = name_list(PQgetvalue(res, 0, 3));
-		keys->uniques = semi_list(PQgetvalue(res, 0, 4));
+		if (PQgetisnull(res, i, 1))
+			continue;			/* the name does not resolve on this side */
+		keys[i].policytype = PQgetvalue(res, i, 0)[0];
+		keys[i].replident = PQgetvalue(res, i, 1)[0];
+		keys[i].distkey = name_list(PQgetvalue(res, i, 2));
+		keys[i].identity = name_list(PQgetvalue(res, i, 3));
+		keys[i].uniques = semi_list(PQgetvalue(res, i, 4));
 	}
 	PQclear(res);
 }
@@ -769,14 +834,11 @@ is_random(LrRelKeys *k)
  * better stopped before it has moved any data.
  */
 static void
-sync_check_keys(LrSync *s, LrSyncRel *r)
+sync_check_keys(LrSync *s, LrSyncRel *r, const LrRelKeys *srcp,
+				const LrRelKeys *tgtp)
 {
-	LrRelKeys	src,
-				tgt;
-
-	sync_connect_source(s);
-	sync_fetch_keys(s, s->src, "source", r->qualified, &src);
-	sync_fetch_keys(s, s->tgt2, "target", r->qualified, &tgt);
+	LrRelKeys	src = *srcp,
+				tgt = *tgtp;
 
 	/*
 	 * A randomly distributed table has no key, so nothing says which segment
@@ -905,54 +967,104 @@ sync_report_unsupported(LrSync *s, LrSyncRel *r, const char *am)
 	r->tracked = false;
 }
 
+/* one side's placement signature for every table, in list order */
+static char **
+sync_placement_all(LrSync *s, PGconn *conn, const char *who, List *rels)
+{
+	char	   *names = sync_names_array(rels);
+	const char *params[1] = {names};
+	PGresult   *res;
+	int			n = list_length(rels);
+	char	  **sigs = palloc0(sizeof(char *) * Max(n, 1));
+
+	res = sync_exec(s, conn, who,
+					"SELECT (SELECT cast(p.policytype as text) || '|' || coalesce(\n"
+					"          (SELECT string_agg(a.attname || ':' || ns.nspname || '.' || o.opcname,\n"
+					"                             ',' ORDER BY k.ord)\n"
+					"             FROM unnest(cast(p.distkey as int2[])) WITH ORDINALITY AS k(attnum, ord)\n"
+					"             JOIN pg_attribute a ON a.attrelid = p.localoid AND a.attnum = k.attnum\n"
+					"             JOIN pg_opclass o ON o.oid = p.distclass[k.ord - 1]\n"
+					"             JOIN pg_namespace ns ON ns.oid = o.opcnamespace), '')\n"
+					"          FROM gp_distribution_policy p\n"
+					"         WHERE p.localoid = to_regclass(q.nm))\n"
+					"  FROM unnest(cast($1 as text[])) WITH ORDINALITY AS q(nm, ord)\n"
+					" ORDER BY q.ord",
+					1, params);
+	for (int i = 0; i < PQntuples(res) && i < n; i++)
+		if (!PQgetisnull(res, i, 0))
+			sigs[i] = pstrdup(PQgetvalue(res, i, 0));
+	PQclear(res);
+	return sigs;
+}
+
 /*
- * The source side of one table: is it DISTRIBUTED REPLICATED (which decides
- * how it is copied), and can its changes be decoded at all?
+ * The source side of every table: is it DISTRIBUTED REPLICATED (which decides
+ * how it is copied), can its changes be decoded at all, and may it be loaded
+ * where it lands?  The last one needs both sides to place its rows the same
+ * way, so it compares two placement signatures; a replicated table never
+ * qualifies, having a copy path of its own.
  */
 static void
-sync_fill_source_info(LrSync *s, LrSyncRel *r)
+sync_fill_source_info_all(LrSync *s)
 {
-	const char *params[1] = {r->qualified};
+	char	   *names;
+	const char *params[1];
 	PGresult   *res;
+	ListCell   *lc;
+	char	  **srcsig = NULL;
+	char	  **tgtsig = NULL;
+	bool		want_direct;
+	int			i = 0;
 
+	if (s->rels == NIL)
+		return;
 	sync_connect_source(s);		/* the pending-table path has not yet */
-	r->tracked = true;
+	names = sync_names_array(s->rels);
+	params[0] = names;
 	res = sync_exec(s, s->src, "source",
-					"SELECT coalesce(p.policytype::text, ''), coalesce(am.amname, '')\n"
-					"  FROM pg_class c\n"
+					"SELECT coalesce(cast(p.policytype as text), ''),\n"
+					"       coalesce(am.amname, ''), (c.oid IS NOT NULL)\n"
+					"  FROM unnest(cast($1 as text[])) WITH ORDINALITY AS q(nm, ord)\n"
+					"  LEFT JOIN pg_class c ON c.oid = to_regclass(q.nm)\n"
 					"  LEFT JOIN gp_distribution_policy p ON p.localoid = c.oid\n"
 					"  LEFT JOIN pg_am am ON am.oid = c.relam\n"
-					" WHERE c.oid = to_regclass($1)",
+					" ORDER BY q.ord",
 					1, params);
-	if (PQntuples(res) == 1)
+	foreach(lc, s->rels)
 	{
-		char	   *am = pstrdup(PQgetvalue(res, 0, 1));
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
 
-		r->replicated = (PQgetvalue(res, 0, 0)[0] == 'r');
-		if (strcmp(am, "heap") != 0)
-			sync_report_unsupported(s, r, *am ? am : "none");
+		r->tracked = true;
+		if (i < PQntuples(res) && PQgetvalue(res, i, 2)[0] == 't')
+		{
+			char	   *am = PQgetvalue(res, i, 1);
+
+			r->replicated = (PQgetvalue(res, i, 0)[0] == 'r');
+			if (strcmp(am, "heap") != 0)
+				sync_report_unsupported(s, r, *am ? am : "none");
+		}
+		i++;
 	}
 	PQclear(res);
 
-	/*
-	 * May this table be loaded where it lands?  Only if both sides have the
-	 * same number of segments and place its rows the same way.  A replicated
-	 * table never can: every segment holds every row, and it has a copy path
-	 * of its own.
-	 */
-	r->direct = false;
-	if (s->allow_direct && !r->replicated && s->nsrcsegs == s->ntgtsegs)
+	want_direct = s->allow_direct && s->nsrcsegs == s->ntgtsegs;
+	if (want_direct)
 	{
-		char	   *src_sig = sync_placement(s, s->src, "source", r->qualified);
-		char	   *tgt_sig = sync_placement(s, s->tgt2, "target", r->qualified);
+		srcsig = sync_placement_all(s, s->src, "source", s->rels);
+		tgtsig = sync_placement_all(s, s->tgt2, "target", s->rels);
+	}
+	i = 0;
+	foreach(lc, s->rels)
+	{
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
 
-		r->direct = (src_sig != NULL && tgt_sig != NULL &&
-					 strcmp(src_sig, tgt_sig) == 0);
+		r->direct = (want_direct && !r->replicated &&
+					 srcsig[i] != NULL && tgtsig[i] != NULL &&
+					 strcmp(srcsig[i], tgtsig[i]) == 0);
 		if (!r->direct)
-			elog(DEBUG1, "mpp apply worker: subscription %u: %s is copied through a redistribution: source places it as %s, target as %s, over %d and %d segments",
-				 s->cfg->subid, r->qualified,
-				 src_sig ? src_sig : "?", tgt_sig ? tgt_sig : "?",
-				 s->nsrcsegs, s->ntgtsegs);
+			elog(DEBUG1, "mpp apply worker: subscription %u: %s is copied through a redistribution",
+				 s->cfg->subid, r->qualified);
+		i++;
 	}
 }
 
@@ -1047,13 +1159,10 @@ sync_fetch_pending(LrSync *s)
 
 		r->relid = (Oid) strtoul(PQgetvalue(res, i, 0), NULL, 10);
 		r->qualified = pstrdup(PQgetvalue(res, i, 1));
-		sync_fill_columns(s, r);
-		sync_fill_source_info(s, r);
-		if (r->tracked)
-			sync_check_keys(s, r);
 		s->rels = lappend(s->rels, r);
 	}
 	PQclear(res);
+	sync_fill_all(s);
 }
 
 /*
@@ -1095,39 +1204,14 @@ sync_fetch_tables(LrSync *s)
 	for (int i = 0; i < PQntuples(res); i++)
 	{
 		LrSyncRel  *r = palloc0(sizeof(LrSyncRel));
-		const char *params[1];
-		PGresult   *tres;
 
 		r->qualified = pstrdup(PQgetvalue(res, i, 0));
-		params[0] = r->qualified;
-		tres = sync_exec(s, s->tgt2, "target",
-						 "SELECT c.oid,\n"
-						 "       string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum),\n"
-						 "       string_agg(quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod), ', ' ORDER BY a.attnum)\n"
-						 "  FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid\n"
-						 " WHERE c.oid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''\n"
-						 " GROUP BY c.oid",
-						 1, params);
-		if (PQntuples(tres) != 1)
-		{
-			PQclear(tres);
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_TABLE),
-					 errmsg("initial sync: target relation %s does not exist", r->qualified),
-					 errhint("DDL is not replicated; create the table on the target first.")));
-		}
-		r->relid = (Oid) strtoul(PQgetvalue(tres, 0, 0), NULL, 10);
-		r->collist = pstrdup(PQgetvalue(tres, 0, 1));
-		r->coldefs = pstrdup(PQgetvalue(tres, 0, 2));
-		PQclear(tres);
-		sync_fill_source_info(s, r);
-		if (r->tracked)
-			sync_check_keys(s, r);
 		s->rels = lappend(s->rels, r);
 	}
 	PQclear(res);
 	pfree(sql.data);
 	pfree(pubs.data);
+	sync_fill_all(s);
 }
 
 /*
@@ -1166,18 +1250,27 @@ sync_write_states(LrSync *s, char rel_state, bool truncate)
 					  "ON CONFLICT (subid, relid) DO UPDATE SET state = EXCLUDED.state, "
 					  "sync_lsn = NULL, sync_snapshot = NULL, copy_job = NULL",
 					  3, params));
-	/* tables */
-	state[0] = rel_state;
-	foreach(lc, s->rels)
+	/* the tables, all of them in one statement */
+	if (s->rels != NIL)
 	{
-		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+		StringInfoData oids;
 
-		snprintf(relid, sizeof(relid), "%u", r->relid);
+		initStringInfo(&oids);
+		appendStringInfoChar(&oids, '{');
+		foreach(lc, s->rels)
+			appendStringInfo(&oids, "%s%u", oids.len > 1 ? "," : "",
+							 ((LrSyncRel *) lfirst(lc))->relid);
+		appendStringInfoChar(&oids, '}');
+
+		state[0] = rel_state;
+		params[1] = oids.data;
 		PQclear(sync_exec(s, s->tgt2, "target",
-						  "INSERT INTO pg_catalog.gp_subscription_rel (subid, relid, state) VALUES ($1, $2, $3) "
+						  "INSERT INTO pg_catalog.gp_subscription_rel (subid, relid, state) "
+						  "SELECT $1, x, $3 FROM unnest(cast($2 as oid[])) AS x "
 						  "ON CONFLICT (subid, relid) DO UPDATE SET state = EXCLUDED.state, "
 						  "sync_lsn = NULL, sync_snapshot = NULL, copy_job = NULL",
 						  3, params));
+		pfree(oids.data);
 	}
 	PQclear(sync_exec(s, s->tgt2, "target", "COMMIT", 0, NULL));
 }
