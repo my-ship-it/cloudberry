@@ -2256,6 +2256,47 @@ sync_lane_open(LrSync *lead)
 }
 
 /*
+ * Wait for any lane to have something to do, or for ms to pass.
+ *
+ * A lane in flight has two sockets that go readable when its work is done --
+ * the source's COPY and the target's INSERT -- so waiting on them costs
+ * nothing and ends the moment either finishes, instead of the backoff's up
+ * to a tenth of a second late.  It has to be the pool that waits, not the
+ * lane: a lane blocking on its own two sockets would hold up every other
+ * one, which is the whole point of having lanes.
+ *
+ * A lane waiting for its receiving segments to publish their ports has no
+ * socket to offer -- what it waits for is a file appearing on the far side --
+ * so the timeout still governs that one, and the caller still backs it off.
+ */
+static void
+sync_wait_pool(LrSync *s, int ms)
+{
+	WaitEventSet *set;
+	WaitEvent	ev;
+	int			nlanes = Max(s->nlanes, 1);
+
+	sync_check_interrupts(s);
+	set = CreateWaitEventSet(CurrentMemoryContext, 2 + 2 * nlanes);
+	AddWaitEventToSet(set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	AddWaitEventToSet(set, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	for (int i = 0; i < s->nlanes; i++)
+	{
+		LrSync	   *ln = s->lanes[i];
+
+		if (ln->src_busy && ln->src != NULL && PQsocket(ln->src) >= 0)
+			AddWaitEventToSet(set, WL_SOCKET_READABLE, PQsocket(ln->src),
+							  NULL, NULL);
+		if (ln->tgt_busy && ln->tgt != NULL && PQsocket(ln->tgt) >= 0)
+			AddWaitEventToSet(set, WL_SOCKET_READABLE, PQsocket(ln->tgt),
+							  NULL, NULL);
+	}
+	(void) WaitEventSetWait(set, ms, &ev, 1, WAIT_EVENT_LOGICAL_SYNC_DATA);
+	FreeWaitEventSet(set);
+	ResetLatch(MyLatch);
+}
+
+/*
  * Copy every table, up to mpp_logicalrep.max_concurrent_copies of them at
  * once.  Each lane is idle for most of a table -- waiting for the receiving
  * segments to publish their ports, then for the copy to finish -- and those
@@ -2305,7 +2346,7 @@ sync_copy_all(LrSync *s)
 		if (all_free)
 			break;
 		ms = any ? LR_SYNC_POLL_FIRST_MS : sync_backoff(ms);
-		sync_wait(s, ms);
+		sync_wait_pool(s, ms);
 	}
 
 	for (int i = 1; i < s->nlanes; i++)
