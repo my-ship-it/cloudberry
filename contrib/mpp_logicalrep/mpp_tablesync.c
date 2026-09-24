@@ -1374,17 +1374,51 @@ sync_finish(LrSync *s)
 
 	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
 	PQclear(sync_exec(s, s->tgt2, "target", "BEGIN", 0, NULL));
-	foreach(lc, s->rels)
-	{
-		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
 
-		snprintf(relid, sizeof(relid), "%u", r->relid);
-		params[2] = r->lt;
-		params[3] = r->ds_text;
-		PQclear(sync_exec(s, s->tgt2, "target",
-						  "UPDATE pg_catalog.gp_subscription_rel SET state = 'r', sync_lsn = $3::pg_lsn, "
-						  "sync_snapshot = $4, copy_job = NULL WHERE subid = $1 AND relid = $2",
-						  4, params));
+	/*
+	 * All of them in one statement.  Each carries its own cut point now, so
+	 * a row apiece is a round trip apiece -- seven seconds of them on a
+	 * thousand tables, measured, after the copies were already done.
+	 */
+	if (s->rels != NIL)
+	{
+		StringInfoData oids;
+		StringInfoData lts;
+		StringInfoData dss;
+
+		initStringInfo(&oids);
+		initStringInfo(&lts);
+		initStringInfo(&dss);
+		appendStringInfoChar(&oids, '{');
+		appendStringInfoChar(&lts, '{');
+		appendStringInfoChar(&dss, '{');
+		foreach(lc, s->rels)
+		{
+			LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+			appendStringInfo(&oids, "%s%u", oids.len > 1 ? "," : "", r->relid);
+			appendStringInfo(&lts, "%s\"%s\"", lts.len > 1 ? "," : "", r->lt);
+			appendStringInfo(&dss, "%s\"%s\"", dss.len > 1 ? "," : "", r->ds_text);
+		}
+		appendStringInfoChar(&oids, '}');
+		appendStringInfoChar(&lts, '}');
+		appendStringInfoChar(&dss, '}');
+
+		{
+			const char *up[4] = {subid, oids.data, lts.data, dss.data};
+
+			PQclear(sync_exec(s, s->tgt2, "target",
+							  "UPDATE pg_catalog.gp_subscription_rel r "
+							  "   SET state = 'r', sync_lsn = cast(x.lt as pg_lsn), "
+							  "       sync_snapshot = x.ds, copy_job = NULL "
+							  "  FROM unnest(cast($2 as oid[]), cast($3 as text[]), "
+							  "              cast($4 as text[])) AS x(relid, lt, ds) "
+							  " WHERE r.subid = $1 AND r.relid = x.relid",
+							  4, up));
+		}
+		pfree(oids.data);
+		pfree(lts.data);
+		pfree(dss.data);
 	}
 	snprintf(relid, sizeof(relid), "%d", LR_SYNC_MARKER_RELID);
 	params[2] = s->rels != NIL ? ((LrSyncRel *) linitial(s->rels))->lt : s->lt;
