@@ -2026,12 +2026,13 @@ LrSyncAddStart(LrWorkerConfig *cfg)
 
 /* one non-blocking step; true once every table has been copied */
 bool
-LrSyncAddStep(LrSync *s)
+LrSyncAddStep(LrSync *s, bool *advanced)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(s->cxt);
 	LrSyncRel  *r;
 	bool		done = false;
 
+	*advanced = false;
 	if (s->step == LR_SYNC_STEP_DONE)
 	{
 		MemoryContextSwitchTo(oldcxt);
@@ -2045,12 +2046,14 @@ LrSyncAddStep(LrSync *s)
 		{
 			copy_send(s, r);
 			s->step = LR_SYNC_STEP_COPY;
+			*advanced = true;
 		}
 	}
 	else if (s->step == LR_SYNC_STEP_COPY)
 	{
 		if (copy_poll_done(s, r))
 		{
+			*advanced = true;
 			s->cur = lnext(s->rels, s->cur);
 			if (s->cur == NULL)
 			{

@@ -235,7 +235,12 @@ struct pg_conn;
 
 extern List *LrSyncPendingNames(struct pg_conn *qd, Oid subid);
 extern struct LrSync *LrSyncAddStart(LrWorkerConfig *cfg);
-extern bool LrSyncAddStep(struct LrSync *job);
+/*
+ * One turn of the job's state machine.  Returns true when the job is done;
+ * *advanced says whether this turn moved it on, which is what tells the
+ * caller whether to try again at once or to back off.
+ */
+extern bool LrSyncAddStep(struct LrSync *job, bool *advanced);
 extern int64 LrSyncAddCutLsn(struct LrSync *job);
 extern void LrSyncAddSnapshot(struct LrSync *job, int64 *xmax,
 							  int *ninprogress, int64 **inprogress,

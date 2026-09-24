@@ -83,6 +83,17 @@ int			gp_lr_apply_max_retries = 10;
 #define LR_DCOMMIT_PREFIX		"cbdb.dcommit"
 #define LR_FEEDBACK_MS			1000
 #define LR_PENDING_CHECK_MS		2000	/* poll for tables added by REFRESH */
+
+/*
+ * A synchronisation job advances one step per pass of the apply loop, so how
+ * long the driver waits on the sources is also how long each of its steps
+ * takes.  While one is in flight the assembly asks to be called back sooner
+ * than that, starting at LR_SYNC_STEP_FIRST_MS and backing off to
+ * LR_SYNC_STEP_MAX_MS -- the same shape, and the same ceiling, as the poll
+ * the initial synchronisation runs on its own (mpp_tablesync.c).
+ */
+#define LR_SYNC_STEP_FIRST_MS	1
+#define LR_SYNC_STEP_MAX_MS		100
 #define LR_MAX_SEGS				4096
 
 /* one source segment's view of a transaction with a gxid */
@@ -224,6 +235,7 @@ typedef struct LrDriver
 	int			sync_nlocal;	/* the local half of the same cut point */
 	LrLocalSnap *sync_local;
 	bool		catchup_mode;	/* the copy is done: drain the held ones */
+	int			sync_poll_ms;	/* how soon the job wants to be stepped again */
 	bool		reading_held;	/* the readers are not consuming the source */
 	int			stuck_errors;	/* errors in a row that committed nothing */
 
@@ -2082,6 +2094,7 @@ static bool
 driver_sync_progress(LrDriver *d)
 {
 	MemoryContext oldcxt;
+	bool		advanced;
 
 	if (d->catchup_mode)
 	{
@@ -2115,11 +2128,21 @@ driver_sync_progress(LrDriver *d)
 		d->sync_names = LrSyncAddNames(d->sync);
 		driver_take_add_snapshot(d);
 		MemoryContextSwitchTo(oldcxt);
+		d->sync_poll_ms = LR_SYNC_STEP_FIRST_MS;
 		return false;
 	}
 
-	if (!LrSyncAddStep(d->sync))
+	if (!LrSyncAddStep(d->sync, &advanced))
+	{
+		/*
+		 * Waiting on the same thing as last time: back off.  Having just
+		 * moved on, try the next step at once -- the backoff starts again per
+		 * phase, as the initial synchronisation's own poll does.
+		 */
+		d->sync_poll_ms = advanced ? LR_SYNC_STEP_FIRST_MS
+			: Min(d->sync_poll_ms * 2, LR_SYNC_STEP_MAX_MS);
 		return false;
+	}
 
 	/*
 	 * Copied -- but the tables may not go live yet.  Everything the copy
@@ -2565,6 +2588,15 @@ assembly_poll(LogicalRepAssembly *self, int timeout_ms)
 		timeout = Max(0, gp_lr_batch_max_latency_ms - (int) age);
 	}
 	timeout = Min(timeout, timeout_ms);
+
+	/*
+	 * A synchronisation job is stepped once per pass of the apply loop
+	 * (assembly_housekeeping), so this wait is also how long each of its
+	 * steps takes: seconds over a copy whose steps are milliseconds.  While
+	 * one is in flight, wait no longer than it asks for.
+	 */
+	if (d->sync != NULL)
+		timeout = Min(timeout, d->sync_poll_ms);
 
 	if (!driver_pump_source(d, timeout))
 		return false;
