@@ -336,6 +336,18 @@ mpp_logicalrep.reader_mem (integer, default 64MB)
     per subscription.  This is where the buffer moves to disk, not a
     ceiling on it; hold_max below is the ceiling.
 
+mpp_logicalrep.max_concurrent_copies (integer, default 2)
+    How many tables the initial synchronisation copies at once.  Each one
+    takes a session on either side and a port on every target segment, so
+    mpp_logicalrep.copy_port_lo/hi bounds it and the setting is clamped
+    to what the range allows.
+
+    Two is what a three-segment cluster on one host was measured
+    saturating at, whether the tables were many and small or few and
+    large; a cluster with more hosts and spare capacity may do better
+    with more.  PostgreSQL's max_sync_workers_per_subscription defaults
+    to two for the same kind of reason.
+
 mpp_logicalrep.hold_max (integer, default 1GB)
     How much one reader may hold -- completed transactions the driver
     has not released, in memory and spilled together -- before the

@@ -187,6 +187,16 @@ define_gucs(void)
 							65536, 64, MAX_KILOBYTES,
 							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
 
+	DefineCustomIntVariable("mpp_logicalrep.max_concurrent_copies",
+							"How many tables the initial synchronisation copies at once.",
+							"Each one takes a session on either side and a port on every "
+							"target segment, so the port range bounds it.  Two is what a "
+							"three-segment cluster on one host was measured saturating at; "
+							"raise it where there is capacity to use.",
+							&gp_lr_max_concurrent_copies,
+							2, 1, 16,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable("mpp_logicalrep.hold_max",
 							"How much one reader may buffer before the coordinator stops reading the source.",
 							"Per source segment, memory and spill together.  0 disables the limit.",

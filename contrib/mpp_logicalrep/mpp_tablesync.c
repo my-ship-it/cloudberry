@@ -110,10 +110,26 @@ typedef enum LrSyncStep
 	LR_SYNC_STEP_DONE			/* every table copied */
 } LrSyncStep;
 
+int			gp_lr_max_concurrent_copies = 2;
+
 typedef struct LrSync
 {
 	LrWorkerConfig *cfg;
 	MemoryContext cxt;
+
+	/*
+	 * Copies run in lanes: one LrSync per lane, each with its own sessions on
+	 * either side and its own table at a time.  lanes[0] is this one, the
+	 * lead, which owns the table list and hands tables out; a lane has none
+	 * of that and points at the lead instead.  Each table has its own cut
+	 * point now (LrSyncRel.lt / ds_text), which is what lets a lane be a
+	 * whole LrSync rather than a slice of one.
+	 */
+	struct LrSync **lanes;
+	int			nlanes;
+	struct LrSync *lead;		/* NULL in the lead itself */
+	ListCell   *handout;		/* the lead's cursor: the next table to give */
+	LrSyncRel  *cur_rel;		/* a lane's table, NULL when it is free */
 
 	PGconn	   *tgt;			/* target: the INSERT ... SELECT side */
 	bool		tgt_busy;		/* an INSERT is in flight on tgt */
@@ -167,7 +183,7 @@ static void sync_write_states(LrSync *s, char rel_state, bool truncate);
 static void sync_ensure_slots(LrSync *s);
 static void sync_barrier(LrSync *s);
 static void sync_cut_point(LrSync *s);
-static void sync_copy_table(LrSync *s, LrSyncRel *r);
+static void sync_copy_all(LrSync *s);
 static void copy_begin(LrSync *s, LrSyncRel *r);
 static bool copy_ports_ready(LrSync *s, LrSyncRel *r);
 static void copy_send(LrSync *s, LrSyncRel *r);
@@ -208,7 +224,6 @@ LrInitialSync(LrWorkerConfig *cfg)
 	MemoryContext oldcxt;
 	char		marker;
 	char	   *snapshot = NULL;
-	ListCell   *lc;
 	bool		did_sync = false;
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "LrSync", ALLOCSET_DEFAULT_SIZES);
@@ -275,16 +290,7 @@ LrInitialSync(LrWorkerConfig *cfg)
 			 * that the streaming filter is per table (LrSyncCut): one
 			 * transaction can be inside one table's copy and not another's.
 			 */
-			foreach(lc, s->rels)
-			{
-				LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
-
-				sync_cut_point(s);
-				r->lt = s->lt;
-				r->ds_text = s->ds_text;
-				sync_copy_table(s, r);
-				PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
-			}
+			sync_copy_all(s);
 			sync_finish(s);
 			sync_load_cuts(s, cfg, oldcxt);
 			did_sync = true;
@@ -480,6 +486,13 @@ sync_cancel_tgt(LrSync *s)
 static void
 sync_disconnect(LrSync *s)
 {
+	for (int i = 1; i < s->nlanes; i++)
+	{
+		if (s->lanes[i] == NULL)
+			continue;
+		sync_disconnect(s->lanes[i]);	/* a lane has no lanes of its own */
+		s->lanes[i] = NULL;
+	}
 	sync_cancel_tgt(s);
 	if (s->tgt)
 		PQfinish(s->tgt);
@@ -1988,17 +2001,155 @@ sync_backoff(int ms)
 	return ms >= LR_SYNC_POLL_MS ? LR_SYNC_POLL_MS : Min(ms * 2, LR_SYNC_POLL_MS);
 }
 
-static void
-sync_copy_table(LrSync *s, LrSyncRel *r)
+/* the next table to copy, or NULL when they have all been handed out */
+static LrSyncRel *
+sync_take_next(LrSync *lead)
 {
-	int			ms;
+	LrSyncRel  *r;
 
-	copy_begin(s, r);
-	for (ms = LR_SYNC_POLL_FIRST_MS; !copy_ports_ready(s, r); ms = sync_backoff(ms))
+	if (lead->handout == NULL)
+		return NULL;
+	r = (LrSyncRel *) lfirst(lead->handout);
+	lead->handout = lnext(lead->rels, lead->handout);
+	return r;
+}
+
+/*
+ * One non-blocking turn of a lane: take a table if it is free, else move the
+ * one it has along.  Returns true when the lane is free and there is nothing
+ * left to take, which is how the caller knows it is finished; *advanced says
+ * whether this turn did anything, which is what the caller's backoff resets
+ * on.
+ *
+ * A table's cut point is taken here, when its own copy starts, and its
+ * transaction is committed when that copy ends -- so a lane holds the
+ * source's xmin for one table's copy, not for the whole set (P2).
+ */
+static bool
+sync_lane_step(LrSync *lane, bool *advanced)
+{
+	LrSync	   *lead = lane->lead ? lane->lead : lane;
+
+	*advanced = false;
+
+	if (lane->cur_rel == NULL)
+	{
+		LrSyncRel  *r = sync_take_next(lead);
+
+		if (r == NULL)
+			return true;
+		lane->cur_rel = r;
+		sync_cut_point(lane);
+		r->lt = lane->lt;
+		r->ds_text = lane->ds_text;
+		copy_begin(lane, r);
+		lane->step = LR_SYNC_STEP_PORTS;
+		*advanced = true;
+		return false;
+	}
+
+	if (lane->step == LR_SYNC_STEP_PORTS)
+	{
+		if (copy_ports_ready(lane, lane->cur_rel))
+		{
+			copy_send(lane, lane->cur_rel);
+			lane->step = LR_SYNC_STEP_COPY;
+			*advanced = true;
+		}
+	}
+	else if (lane->step == LR_SYNC_STEP_COPY)
+	{
+		if (copy_poll_done(lane, lane->cur_rel))
+		{
+			PQclear(sync_exec(lane, lane->src, "source", "COMMIT", 0, NULL));
+			lane->cur_rel = NULL;
+			*advanced = true;
+		}
+	}
+	return false;
+}
+
+/* a lane of its own: same configuration, its own sessions */
+static LrSync *
+sync_lane_open(LrSync *lead)
+{
+	LrSync	   *lane = palloc0(sizeof(LrSync));
+
+	lane->cfg = lead->cfg;
+	lane->cxt = lead->cxt;
+	lane->unsupported = lead->unsupported;
+	lane->lead = lead;
+
+	/*
+	 * Its own sessions on both sides.  The lead reaches the source on its way
+	 * to the barrier; a lane never passes that way, so it connects here --
+	 * which is also where its nsrcsegs comes from.
+	 */
+	sync_connect(lane);			/* reads the same settings for itself */
+	sync_connect_source(lane);
+	return lane;
+}
+
+/*
+ * Copy every table, up to mpp_logicalrep.max_concurrent_copies of them at
+ * once.  Each lane is idle for most of a table -- waiting for the receiving
+ * segments to publish their ports, then for the copy to finish -- and those
+ * waits are what overlap.
+ */
+static void
+sync_copy_all(LrSync *s)
+{
+	int			want = gp_lr_max_concurrent_copies;
+	int			room;
+	int			k;
+	int			ms = LR_SYNC_POLL_FIRST_MS;
+
+	/*
+	 * Every lane's receiver listens on a port of its own on every target
+	 * segment, so the range is the ceiling on how many may run at once.
+	 */
+	room = s->ntgtsegs > 0 ? (s->port_hi - s->port_lo + 1) / s->ntgtsegs : want;
+	k = Min(want, Max(room, 1));
+	k = Min(k, list_length(s->rels));
+	k = Max(k, 1);
+
+	s->lanes = palloc0(sizeof(LrSync *) * k);
+	s->nlanes = k;
+	s->lanes[0] = s;
+	s->handout = list_head(s->rels);
+	for (int i = 1; i < k; i++)
+		s->lanes[i] = sync_lane_open(s);
+
+	if (k > 1)
+		elog(LOG, "mpp apply worker: subscription %u: copying %d table(s), %d at a time",
+			 s->cfg->subid, list_length(s->rels), k);
+
+	for (;;)
+	{
+		bool		any = false;
+		bool		all_free = true;
+
+		for (int i = 0; i < s->nlanes; i++)
+		{
+			bool		adv;
+
+			if (!sync_lane_step(s->lanes[i], &adv))
+				all_free = false;
+			any |= adv;
+		}
+		if (all_free)
+			break;
+		ms = any ? LR_SYNC_POLL_FIRST_MS : sync_backoff(ms);
 		sync_wait(s, ms);
-	copy_send(s, r);
-	for (ms = LR_SYNC_POLL_FIRST_MS; !copy_poll_done(s, r); ms = sync_backoff(ms))
-		sync_wait(s, ms);
+	}
+
+	for (int i = 1; i < s->nlanes; i++)
+	{
+		sync_disconnect(s->lanes[i]);
+		pfree(s->lanes[i]);
+		s->lanes[i] = NULL;
+	}
+	s->nlanes = 0;
 }
 
 
