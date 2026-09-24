@@ -822,6 +822,8 @@ LrReaderProcessMessage(LrReaderState *st, const char *data, int len,
 				int			bodylen = s.len - s.cursor;
 				Oid			relid = pq_getmsgint(&s, 4);	/* the body starts with it */
 
+				if (type != LOGICAL_REP_MSG_INSERT)
+					txn->has_rowlock = true;
 				txn_note_subxact(st, txn, subxid);
 				txn_describe_rel(st, txn, relid);
 				txn_append(st, txn, type, relid, body, bodylen);
@@ -1448,7 +1450,14 @@ LrReaderFillReport(LrReaderState *st, LrTxn *txn, int seg, LrReport *rpt)
 												 lrel->rel->relname)
 								 : pstrdup("?"));
 	}
-	rpt->lockmode = txn->has_truncate ? AccessExclusiveLock : RowExclusiveLock;
+	/*
+	 * The lock this transaction would need of a session that had no global
+	 * deadlock detector to fall back on -- which is what the coordinator
+	 * decides from, since whether there is one is its cluster's business and
+	 * not this stream's.  See lock_for_policy() in mpp_apply_worker.c.
+	 */
+	rpt->lockmode = txn->has_truncate ? AccessExclusiveLock :
+		txn->has_rowlock ? ExclusiveLock : RowExclusiveLock;
 	rpt->nrows = txn->nchanges;
 	rpt->nbytes = txn->nbytes;
 }

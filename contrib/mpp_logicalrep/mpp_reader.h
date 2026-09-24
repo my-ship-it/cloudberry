@@ -79,6 +79,9 @@ typedef struct LrTxn
 	int64		nbytes;			/* bytes of all records */
 	List	   *relids;			/* remote relids touched (Oid list) */
 	bool		has_truncate;
+	bool		has_rowlock;	/* an UPDATE or a DELETE: locks rows, which is
+								 * what decides the table lock the apply takes
+								 * when there is no global deadlock detector */
 	bool		streamed;		/* arrived through the streaming protocol */
 	bool		reported;		/* handed to the coordinator as ready */
 	struct LrChangeLog *changes;

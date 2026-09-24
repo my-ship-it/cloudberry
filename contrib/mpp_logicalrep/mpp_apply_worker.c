@@ -36,6 +36,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_subscription.h"
+#include "cdb/cdbvars.h"
 #include "commands/dbcommands.h"
 #include "libpq/pqsignal.h"
 #include "postmaster/bgworker.h"
@@ -1882,12 +1883,40 @@ split_relname(const char *qualified, char **nspname, char **relname)
 }
 
 /*
+ * The table lock an apply unit takes, as this cluster's rules have it.
+ *
+ * Cloudberry upgrades an UPDATE or a DELETE from RowExclusiveLock to
+ * ExclusiveLock when gp_enable_global_deadlock_detector is off
+ * (CdbTryOpenTable, access/table/table.c), because without a detector a
+ * cycle of row waits spread over the segments is one nobody breaks: each
+ * segment sees no local cycle and waits for ever.  The apply takes its locks
+ * with LOCK TABLE, which is LockTableCommand and takes exactly what it is
+ * asked for, so nothing upgrades them on its behalf -- and an apply holding
+ * RowExclusiveLock while every ordinary session on the same table holds
+ * ExclusiveLock is exactly the hole the rule exists to close.
+ *
+ * The readers report the level as if there were no detector; this decides
+ * whether there is one.  Not covered: with a detector on, the same rule
+ * upgrades for an AO or AOCO target, and the target's access method is not
+ * something this knows.
+ */
+static int
+lock_for_policy(int lockmode)
+{
+	if (lockmode == ExclusiveLock && gp_enable_global_deadlock_detector)
+		return RowExclusiveLock;
+	return lockmode;
+}
+
+/*
  * Add "nsp.rel" to the relations of the unit being built, keeping the
  * strongest lock anything in the unit needs on it.
  */
 static void
 unit_add_rel(LrDriver *d, const char *qualified, int lockmode)
 {
+	lockmode = lock_for_policy(lockmode);
+
 	LogicalRepUnit *u = &d->unit;
 	char	   *nsp,
 			   *rel;
