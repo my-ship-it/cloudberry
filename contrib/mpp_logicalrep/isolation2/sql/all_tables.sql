@@ -11,8 +11,10 @@
 --   1  FOR ALL TABLES synchronises what the publisher has
 --   2  a table created afterwards is in the publication, and is copied on
 --      the next REFRESH -- without it, it is not
---   3  a table the target has not got stops the apply and says which one,
---      rather than applying the rest and leaving a hole
+--   3  the other order -- created on the publisher and written to before
+--      the subscriber has it -- stops the apply, which names the relation
+--      and disables the subscription rather than applying the rest and
+--      leaving a hole
 --   4  the way out is to create it on the target.  Dropping it on the
 --      publisher is not: by then the change is in the stream, and a worker
 --      that starts again starts from before it and meets it again
@@ -46,10 +48,15 @@ CREATE DATABASE mpp_lr_at;
 -- ------------------------------------------------------------------
 -- 2. a table created afterwards is in the publication already
 -- ------------------------------------------------------------------
+-- The target first.  With FOR ALL TABLES the publisher's first write to a
+-- new table is on the stream whether or not the subscriber has the table,
+-- and a subscriber that has not got it stops there (3 below) -- so creating
+-- it on the publisher and then hurrying to create it here is a race, and
+-- the order that is not a race is this one.
+1:@db_name mpp_lr_at: CREATE TABLE at_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 2:@db_name mpp_lr_at_src: CREATE TABLE at_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 2:@db_name mpp_lr_at_src: INSERT INTO at_c SELECT g, 'made later' FROM generate_series(1, 200) g;
 2:@db_name mpp_lr_at_src: SELECT count(*) = 3 AS three_in_the_publication FROM pg_publication_tables WHERE pubname = 'at_pub';
-1:@db_name mpp_lr_at: CREATE TABLE at_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 
 -- the publication carries it, but nothing has told the subscription yet
 1:@db_name mpp_lr_at: SELECT lr_ready() AS before_refresh;
@@ -64,12 +71,15 @@ CREATE DATABASE mpp_lr_at;
 1:@db_name mpp_lr_at: SELECT lr_wait('SELECT count(*) = 420 FROM at_a') AS a_still_streams;
 
 -- ------------------------------------------------------------------
--- 3. a table the target has not got
+-- 3. the other order: the publisher first
 -- ------------------------------------------------------------------
-2:@db_name mpp_lr_at_src: CREATE TABLE at_missing (id int, v text) DISTRIBUTED BY (id);
-2:@db_name mpp_lr_at_src: INSERT INTO at_missing VALUES (1, 'nowhere to go');
+-- Nothing here creates at_late on the target.  Its first write is on the
+-- stream all the same -- FOR ALL TABLES put it in the publication the
+-- moment it existed -- and the apply has nowhere to put it.
+2:@db_name mpp_lr_at_src: CREATE TABLE at_late (id int, v text) DISTRIBUTED BY (id);
+2:@db_name mpp_lr_at_src: INSERT INTO at_late VALUES (1, 'written before the target had it');
 1:@db_name mpp_lr_at: ALTER SUBSCRIPTION at_sub REFRESH PUBLICATION;
-1:@db_name mpp_lr_at: SELECT lr_wait($$SELECT disable_reason LIKE '%at_missing%' FROM gp_stat_mpp_subscription WHERE subname = 'at_sub'$$) AS it_says_which_one;
+1:@db_name mpp_lr_at: SELECT lr_wait($$SELECT disable_reason LIKE '%at_late%' FROM gp_stat_mpp_subscription WHERE subname = 'at_sub'$$) AS it_says_which_one;
 1:@db_name mpp_lr_at: SELECT enabled FROM gp_stat_mpp_subscription WHERE subname = 'at_sub';
 -- the tables that were already streaming kept what they had
 1:@db_name mpp_lr_at: SELECT count(*) AS a_intact FROM at_a;
@@ -77,16 +87,19 @@ CREATE DATABASE mpp_lr_at;
 -- ------------------------------------------------------------------
 -- 4. creating it on the target is the way out
 -- ------------------------------------------------------------------
--- The REFRESH above failed too, so the subscription never heard of it; what
--- stopped the apply is the stream, which carries the row whether or not the
--- subscription tracks the table.  Dropping it on the publisher would not
--- help: the change is already in the WAL the slot holds, and a worker that
--- starts again starts from before it.
-1:@db_name mpp_lr_at: CREATE TABLE at_missing (id int, v text) DISTRIBUTED BY (id);
+-- The REFRESH above failed too, so the subscription never heard of it;
+-- what stopped the apply is the stream, which carries the row whether or
+-- not the subscription tracks the table.  Dropping it on the publisher
+-- would not help: the change is already in the WAL the slot holds, and a
+-- worker that starts again starts from before it and meets it again.
+--
+-- The copy that follows truncates first, so the row arrives exactly once
+-- however much of it the stream had already tried to apply.
+1:@db_name mpp_lr_at: CREATE TABLE at_late (id int, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_at: ALTER SUBSCRIPTION at_sub REFRESH PUBLICATION;
 1:@db_name mpp_lr_at: ALTER SUBSCRIPTION at_sub ENABLE;
-1:@db_name mpp_lr_at: SELECT lr_wait($$SELECT lr_ready() = 'at_a=r at_b=r at_c=r at_missing=r'$$) AS four_ready;
-1:@db_name mpp_lr_at: SELECT lr_wait('SELECT count(*) = 1 FROM at_missing') AS it_arrived_once;
+1:@db_name mpp_lr_at: SELECT lr_wait($$SELECT lr_ready() = 'at_a=r at_b=r at_c=r at_late=r'$$) AS four_ready;
+1:@db_name mpp_lr_at: SELECT lr_wait('SELECT count(*) = 1 FROM at_late') AS it_arrived_once;
 2:@db_name mpp_lr_at_src: INSERT INTO at_a SELECT 2000 + g, 'after the trouble' FROM generate_series(1, 10) g;
 1:@db_name mpp_lr_at: SELECT lr_wait('SELECT count(*) = 430 FROM at_a') AS streaming_again;
 1:@db_name mpp_lr_at: SELECT lr_wait($$SELECT phase = 'streaming' FROM gp_stat_mpp_subscription WHERE subname = 'at_sub'$$) AS streaming;
@@ -95,7 +108,7 @@ CREATE DATABASE mpp_lr_at;
 1:@db_name mpp_lr_at: DROP SUBSCRIPTION at_sub;
 1:@db_name mpp_lr_at: SELECT lr_worker_gone() AS worker_gone;
 1q:
-2:@db_name mpp_lr_at_src: DROP TABLE at_missing;
+2:@db_name mpp_lr_at_src: DROP TABLE at_late;
 2:@db_name mpp_lr_at_src: SELECT gp_drop_replication_slot('at_slot');
 2:@db_name mpp_lr_at_src: DROP PUBLICATION at_pub;
 2q:

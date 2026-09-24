@@ -440,7 +440,17 @@ had it.
 
 A publication FOR ALL TABLES is a standing order, so a table created on
 the publisher afterwards is in it already; the subscriber copies it at
-the next ALTER SUBSCRIPTION ... REFRESH PUBLICATION and not before.  It
+the next ALTER SUBSCRIPTION ... REFRESH PUBLICATION and not before.
+
+Create such a table on the subscriber first.  The publisher's first write
+to it is on the stream whether or not the subscriber has the table and
+whether or not the subscription tracks it yet, so a subscriber that has
+not got it stops there -- measured: created on the publisher, a hundred
+rows written, and fifteen seconds later the subscription was disabled
+with "target relation \"public\".\"t2\" does not exist".  Creating it on
+the publisher and then hurrying to create it here is a race, and losing
+it costs an operator round trip; creating it here first cannot lose.
+The REFRESH may follow at leisure.  It
 also takes the publisher's word for what exists, with no ADD TABLE to
 think twice at, so a table the target has not got is in the publication
 too.  The first write to such a table stops the apply -- it names the
