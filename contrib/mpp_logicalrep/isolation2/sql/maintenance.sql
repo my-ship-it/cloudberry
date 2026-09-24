@@ -26,6 +26,7 @@ CREATE TABLE mt_fn (step text, fn bigint) DISTRIBUTED BY (step);
 1:@db_name mpp_lr_mt: CREATE TABLE mt_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_mt: CREATE TABLE mt_mark (id int PRIMARY KEY) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_mt: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_mt: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 
 1:@db_name mpp_lr_mt: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION mt_sub CONNECTION %L PUBLICATION mt_pub WITH (slot_name = ''mt_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 1:@db_name mpp_lr_mt: SELECT lr_wait($$SELECT count(*) = 2 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'mt_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
@@ -80,6 +81,7 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM mt_t;
 1:@db_name mpp_lr_mt: SELECT phase, enabled, stuck_errors, recoveries FROM gp_stat_mpp_subscription WHERE subname = 'mt_sub';
 
 1:@db_name mpp_lr_mt: DROP SUBSCRIPTION mt_sub;
+1:@db_name mpp_lr_mt: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('mt_slot');
 DROP PUBLICATION mt_pub;

@@ -34,6 +34,7 @@ CREATE PUBLICATION dc_pub FOR TABLE dc_same, dc_narrow;
 1:@db_name mpp_lr_dc: CREATE TABLE dc_same (id int, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_dc: CREATE TABLE dc_narrow (id int, k int, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_dc: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_dc: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 
 -- Which statement each table was loaded with, caught while it runs.  Reads
 -- pg_stat_activity only, so it holds no lock on the tables being copied.
@@ -68,6 +69,7 @@ INSERT INTO dc_narrow VALUES (900002, 7, 'after');
 1:@db_name mpp_lr_dc: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'dc_sub';
 
 1:@db_name mpp_lr_dc: DROP SUBSCRIPTION dc_sub;
+1:@db_name mpp_lr_dc: SELECT lr_worker_gone() AS worker_gone;
 1q:
 2q:
 SELECT gp_drop_replication_slot('dc_slot');

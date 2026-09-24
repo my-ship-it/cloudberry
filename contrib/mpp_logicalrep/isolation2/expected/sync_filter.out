@@ -127,6 +127,11 @@ ALTER
 
 1:@db_name mpp_lr_sf: DROP SUBSCRIPTION sf_sub;
 DROP
+1:@db_name mpp_lr_sf: SELECT lr_worker_gone() AS worker_gone;
+ worker_gone 
+-------------
+ t           
+(1 row)
 1q: ... <quitting>
 SELECT gp_drop_replication_slot('sf_slot');
  gp_drop_replication_slot 

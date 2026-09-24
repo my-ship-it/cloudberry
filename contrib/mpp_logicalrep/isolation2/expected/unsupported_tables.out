@@ -34,6 +34,8 @@ CREATE
 -- committed, and a plain statement outside the function can count them.
 1:@db_name mpp_lr_a1: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1200 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 CREATE
+1:@db_name mpp_lr_a1: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
 
 -- 1. the default refuses, and says which table and which access method
 1:@db_name mpp_lr_a1: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION a1_sub CONNECTION %L PUBLICATION a1_pub WITH (slot_name = ''a1_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
@@ -156,6 +158,11 @@ INSERT 11
 
 1:@db_name mpp_lr_a1: DROP SUBSCRIPTION a1_sub;
 DROP
+1:@db_name mpp_lr_a1: SELECT lr_worker_gone() AS worker_gone;
+ worker_gone 
+-------------
+ t           
+(1 row)
 1q: ... <quitting>
 SELECT gp_drop_replication_slot('a1_slot');
  gp_drop_replication_slot 

@@ -20,6 +20,7 @@ SELECT count(*) > 0 AS slots FROM gp_create_logical_replication_slot('ddl_slot',
 
 1:@db_name mpp_lr_ddl: CREATE TABLE ddl_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_ddl: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_ddl: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 -- one worker per enabled registry row, once it has settled: subscription DDL
 -- invalidates the syscache for every worker of the database, so each stops
 -- and is started again, and only the settled count means anything
@@ -72,6 +73,7 @@ DELETE FROM ddl_t WHERE id = 9;
 1:@db_name mpp_lr_ddl: DROP SUBSCRIPTION ddl_off;
 
 1:@db_name mpp_lr_ddl: DROP SUBSCRIPTION ddl_sub;
+1:@db_name mpp_lr_ddl: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('ddl_slot');
 DROP PUBLICATION ddl_pub;

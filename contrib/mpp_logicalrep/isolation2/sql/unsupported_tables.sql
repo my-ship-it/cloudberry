@@ -21,6 +21,7 @@ SELECT count(*) > 0 AS slots FROM gp_create_logical_replication_slot('a1_slot', 
 -- as long as it waits.  Once a table's state is settled its rows are already
 -- committed, and a plain statement outside the function can count them.
 1:@db_name mpp_lr_a1: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1200 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_a1: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 
 -- 1. the default refuses, and says which table and which access method
 1:@db_name mpp_lr_a1: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION a1_sub CONNECTION %L PUBLICATION a1_pub WITH (slot_name = ''a1_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
@@ -65,6 +66,7 @@ INSERT INTO a1_h SELECT g, 'last' FROM generate_series(200, 210) g;
 1:@db_name mpp_lr_a1: SELECT lr_wait('SELECT count(*) = 161 FROM a1_h') AS heap_still_following;
 
 1:@db_name mpp_lr_a1: DROP SUBSCRIPTION a1_sub;
+1:@db_name mpp_lr_a1: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('a1_slot');
 DROP PUBLICATION a1_pub;

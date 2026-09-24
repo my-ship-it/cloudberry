@@ -109,6 +109,8 @@ CREATE
 
 1:@db_name mpp_lr_dk: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 CREATE
+1:@db_name mpp_lr_dk: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
 1:@db_name mpp_lr_dk: CREATE FUNCTION dk_sub(t text) RETURNS void AS $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION dk_s_%s CONNECTION %L PUBLICATION dk_p_%s WITH (slot_name = ''dk_sl_%s'')', t, 'dbname=mpp_lr_source port=' || current_setting('port'), t, t); END $$ LANGUAGE plpgsql;
 CREATE
 -- what became of each one: the row arrived, or it stopped and said why
@@ -227,6 +229,11 @@ DROP
 DROP
 1:@db_name mpp_lr_dk: DROP SUBSCRIPTION dk_s_nouniq;
 DROP
+1:@db_name mpp_lr_dk: SELECT lr_worker_gone() AS worker_gone;
+ worker_gone 
+-------------
+ t           
+(1 row)
 1q: ... <quitting>
 SELECT gp_drop_replication_slot('dk_sl_same');
  gp_drop_replication_slot 

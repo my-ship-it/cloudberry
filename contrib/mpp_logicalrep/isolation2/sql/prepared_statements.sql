@@ -16,6 +16,7 @@ CREATE PUBLICATION ps_pub FOR TABLE ps_t;
 
 1:@db_name mpp_lr_ps: CREATE TABLE ps_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_ps: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_ps: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_ps: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION ps_sub CONNECTION %L PUBLICATION ps_pub WITH (slot_name = ''ps_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 1:@db_name mpp_lr_ps: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'ps_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
 1:@db_name mpp_lr_ps: SELECT count(*) AS copied FROM ps_t;
@@ -90,6 +91,7 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM ps_t;
 1:@db_name mpp_lr_ps: SELECT phase, stuck_errors, recoveries FROM gp_stat_mpp_subscription WHERE subname = 'ps_sub';
 
 1:@db_name mpp_lr_ps: DROP SUBSCRIPTION ps_sub;
+1:@db_name mpp_lr_ps: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('ps_slot');
 DROP PUBLICATION ps_pub;

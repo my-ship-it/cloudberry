@@ -26,6 +26,7 @@ ALTER DATABASE mpp_lr_source SET logical_decoding_work_mem = '64kB';
 
 1:@db_name mpp_lr_st: CREATE TABLE st_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_st: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_st: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_st: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION st_sub CONNECTION %L PUBLICATION st_pub WITH (slot_name = ''st_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 1:@db_name mpp_lr_st: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'st_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
 1:@db_name mpp_lr_st: SELECT count(*) AS copied FROM st_t;
@@ -67,6 +68,7 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM st_t;
 1:@db_name mpp_lr_st: SELECT phase, enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'st_sub';
 
 1:@db_name mpp_lr_st: DROP SUBSCRIPTION st_sub;
+1:@db_name mpp_lr_st: SELECT lr_worker_gone() AS worker_gone;
 1q:
 ALTER DATABASE mpp_lr_source RESET logical_decoding_work_mem;
 SELECT gp_drop_replication_slot('st_slot');

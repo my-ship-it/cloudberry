@@ -24,6 +24,7 @@ CREATE PROCEDURE cr_churn() AS $$ BEGIN FOR r IN 1 .. 60 LOOP INSERT INTO cr_t S
 
 1:@db_name mpp_lr_cr: CREATE TABLE cr_t (id int, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_cr: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_cr: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 -- Kills the worker, its reader and writer gang QEs, and the session it drives
 -- them from, round after round.  It reads pg_stat_activity only, so it holds
 -- no lock on the table being applied to.
@@ -48,6 +49,7 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM cr_t;
 1:@db_name mpp_lr_cr: SELECT phase, enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'cr_sub';
 
 1:@db_name mpp_lr_cr: DROP SUBSCRIPTION cr_sub;
+1:@db_name mpp_lr_cr: SELECT lr_worker_gone() AS worker_gone;
 1q:
 -- the worker is gone, but the walsender it left on the source takes a moment
 -- to notice and let the slot go

@@ -24,6 +24,7 @@ CREATE PROCEDURE rp_churn() AS $$ BEGIN FOR b IN 6 .. 85 LOOP INSERT INTO rp_a S
 
 1:@db_name mpp_lr_rp: CREATE TABLE rp_a (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_rp: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_rp: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_rp: CREATE FUNCTION lr_ready(sub text) RETURNS text AS $$ SELECT coalesce(string_agg(c.relname || '=' || cast(r.state as text), ' ' ORDER BY c.relname), 'none') FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid JOIN pg_class c ON c.oid = r.relid WHERE s.subname = $1 $$ LANGUAGE sql;
 
 -- Watch rp_b through its state row alone, and sample rp_a -- which is not
@@ -87,6 +88,7 @@ ALTER PUBLICATION rp_pub DROP TABLE rp_b;
 1:@db_name mpp_lr_rp: SELECT lr_ready('rp_sub') AS states_left;
 
 1:@db_name mpp_lr_rp: DROP SUBSCRIPTION rp_sub;
+1:@db_name mpp_lr_rp: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('rp_slot');
 DROP PUBLICATION rp_pub;

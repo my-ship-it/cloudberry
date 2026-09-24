@@ -29,6 +29,7 @@ CREATE PUBLICATION tl_pub FOR TABLE tl_t, tl_a, tl_b;
 1:@db_name mpp_lr_tl: CREATE TABLE tl_a (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_tl: CREATE TABLE tl_b (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_tl: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_tl: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 -- is the apply waiting for this table exclusively?  pg_locks reads the lock
 -- manager itself, so a loop over it sees the present state rather than a
 -- snapshot taken when the enclosing statement began
@@ -81,6 +82,7 @@ COMMIT;
 
 2q:
 1:@db_name mpp_lr_tl: DROP SUBSCRIPTION tl_sub;
+1:@db_name mpp_lr_tl: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('tl_slot');
 DROP PUBLICATION tl_pub;

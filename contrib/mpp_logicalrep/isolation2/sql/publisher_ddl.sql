@@ -26,6 +26,7 @@ CREATE PUBLICATION dd_pub FOR TABLE dd_t;
 
 1:@db_name mpp_lr_dd: CREATE TABLE dd_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_dd: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_dd: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_dd: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION dd_sub CONNECTION %L PUBLICATION dd_pub WITH (slot_name = ''dd_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 1:@db_name mpp_lr_dd: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'dd_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
 
@@ -70,6 +71,7 @@ INSERT INTO dd_t VALUES (103, 'after the drop', 'still here');
 1:@db_name mpp_lr_dd: SELECT phase, enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'dd_sub';
 
 1:@db_name mpp_lr_dd: DROP SUBSCRIPTION dd_sub;
+1:@db_name mpp_lr_dd: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('dd_slot');
 DROP PUBLICATION dd_pub;

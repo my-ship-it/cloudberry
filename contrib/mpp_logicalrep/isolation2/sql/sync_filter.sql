@@ -72,6 +72,7 @@ INSERT INTO sf_t VALUES (504, 'committed after the cut point');
 1:@db_name mpp_lr_sf: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'sf_sub';
 
 1:@db_name mpp_lr_sf: DROP SUBSCRIPTION sf_sub;
+1:@db_name mpp_lr_sf: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('sf_slot');
 DROP PUBLICATION sf_pub;

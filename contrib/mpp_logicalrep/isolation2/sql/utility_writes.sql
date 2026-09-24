@@ -61,6 +61,7 @@ SELECT count(*) AS on_the_source FROM uw_t WHERE v = 'written straight to a segm
 1:@db_name mpp_lr_uw: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'uw_sub';
 
 1:@db_name mpp_lr_uw: DROP SUBSCRIPTION uw_sub;
+1:@db_name mpp_lr_uw: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('uw_slot');
 DROP PUBLICATION uw_pub;

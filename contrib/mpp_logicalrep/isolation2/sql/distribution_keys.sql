@@ -72,6 +72,7 @@ CREATE PUBLICATION dk_p_nouniq FOR TABLE dk_nouniq;
 1:@db_name mpp_lr_dk: CREATE TABLE dk_nouniq (id int, v text) DISTRIBUTED BY (id);
 
 1:@db_name mpp_lr_dk: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_dk: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_dk: CREATE FUNCTION dk_sub(t text) RETURNS void AS $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION dk_s_%s CONNECTION %L PUBLICATION dk_p_%s WITH (slot_name = ''dk_sl_%s'')', t, 'dbname=mpp_lr_source port=' || current_setting('port'), t, t); END $$ LANGUAGE plpgsql;
 -- what became of each one: the row arrived, or it stopped and said why
 1:@db_name mpp_lr_dk: CREATE FUNCTION dk_verdict(t text) RETURNS text AS $$ DECLARE en bool; why text; n bigint; BEGIN FOR i IN 1 .. 1800 LOOP SELECT enabled, disable_reason INTO en, why FROM gp_mpp_subscription WHERE subname = 'dk_s_' || t; IF NOT en THEN RETURN 'refused - ' || coalesce(substring(why from 'logical replication[^"]*'), left(coalesce(why, 'no reason recorded'), 80)); END IF; EXECUTE format('SELECT count(*) FROM %I', 'dk_' || t) INTO n; IF n = 1 THEN RETURN 'replicated'; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN 'neither, after 180 s'; END $$ LANGUAGE plpgsql;
@@ -112,6 +113,7 @@ CREATE PUBLICATION dk_p_nouniq FOR TABLE dk_nouniq;
 1:@db_name mpp_lr_dk: DROP SUBSCRIPTION dk_s_randsrc;
 1:@db_name mpp_lr_dk: DROP SUBSCRIPTION dk_s_randtgt;
 1:@db_name mpp_lr_dk: DROP SUBSCRIPTION dk_s_nouniq;
+1:@db_name mpp_lr_dk: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('dk_sl_same');
 SELECT gp_drop_replication_slot('dk_sl_narrow');

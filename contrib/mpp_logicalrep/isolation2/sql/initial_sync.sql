@@ -27,6 +27,7 @@ CREATE PROCEDURE is_churn() AS $$ BEGIN FOR b IN 6 .. 45 LOOP INSERT INTO is_a S
 1:@db_name mpp_lr_is: CREATE TABLE is_a (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_is: CREATE TABLE is_b (id int PRIMARY KEY, v text, w int) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_is: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_is: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_is: CREATE FUNCTION lr_ready(sub text) RETURNS text AS $$ SELECT coalesce(string_agg(c.relname || '=' || cast(r.state as text), ' ' ORDER BY c.relname), 'none') FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid JOIN pg_class c ON c.oid = r.relid WHERE s.subname = $1 $$ LANGUAGE sql;
 
 -- ------------------------------------------------------------------
@@ -123,6 +124,7 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM is_big2;
 
 1:@db_name mpp_lr_is: DROP SUBSCRIPTION is_sub;
 1:@db_name mpp_lr_is: DROP SUBSCRIPTION is_sub2;
+1:@db_name mpp_lr_is: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('is_slot');
 SELECT gp_drop_replication_slot('is_slot2');

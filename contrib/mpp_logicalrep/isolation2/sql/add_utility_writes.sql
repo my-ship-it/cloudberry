@@ -94,6 +94,7 @@ SELECT count(*) AS on_the_source FROM aw_c WHERE v = 'before the cut point';
 1:@db_name mpp_lr_aw: SELECT stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'aw_sub';
 
 1:@db_name mpp_lr_aw: DROP SUBSCRIPTION aw_sub;
+1:@db_name mpp_lr_aw: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('aw_slot');
 DROP PUBLICATION aw_pub;

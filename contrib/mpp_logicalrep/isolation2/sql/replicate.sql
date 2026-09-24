@@ -17,6 +17,7 @@ SELECT count(*) > 0 AS slots_created
 
 -- wait for a condition rather than sleep for a guess
 1:@db_name mpp_lr_target: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1200 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_target: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 
 -- the publisher is this same cluster, so it is reached on the same port
 1:@db_name mpp_lr_target: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION lr_sub CONNECTION %L PUBLICATION lr_pub WITH (slot_name = ''lr_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
@@ -42,6 +43,7 @@ SELECT count(*) AS on_the_publisher FROM lr_t;
 
 -- and away
 1:@db_name mpp_lr_target: DROP SUBSCRIPTION lr_sub;
+1:@db_name mpp_lr_target: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('lr_slot');
 DROP PUBLICATION lr_pub;

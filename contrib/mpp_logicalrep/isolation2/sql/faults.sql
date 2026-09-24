@@ -18,6 +18,7 @@ CREATE PROCEDURE fa_churn() AS $$ BEGIN FOR b IN 1001 .. 1060 LOOP INSERT INTO f
 
 1:@db_name mpp_lr_fa: CREATE TABLE fa_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_fa: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_fa: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 
 -- The chaos: it touches nothing but pg_stat_activity, so it holds no lock on
 -- the table being replicated.  Reports how many of the four kills found
@@ -46,6 +47,7 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM fa_t;
 1:@db_name mpp_lr_fa: SELECT phase, enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'fa_sub';
 
 1:@db_name mpp_lr_fa: DROP SUBSCRIPTION fa_sub;
+1:@db_name mpp_lr_fa: SELECT lr_worker_gone() AS worker_gone;
 1q:
 SELECT gp_drop_replication_slot('fa_slot');
 DROP PUBLICATION fa_pub;
