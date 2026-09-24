@@ -690,8 +690,19 @@ drain_one(LrSourceState *state, LrReaderState *st, int64 gxid, int wait_ms,
 		}
 	}
 
-	/* 2. read the stream */
-	if (gxid != 0)
+	/*
+	 * 2. read the stream -- unless the coordinator is holding it back.  It
+	 * does that when a reader has buffered more than it may (P0.5): not
+	 * reading fills this socket, which closes the window on the source, which
+	 * leaves the transactions in its WAL instead of in this segment's
+	 * temporary files.  Everything else this function does still happens, and
+	 * step 3 above all: a source that hears nothing for wal_sender_timeout
+	 * kills the walsender, and the reconnection would re-deliver exactly the
+	 * transactions that are already held.
+	 */
+	if (wait_ms < 0)
+		res = LR_RECV_HELD;
+	else if (gxid != 0)
 		res = LrReaderReceive(st, gxid, participant ? wait_ms : 0, false);
 	else
 		res = LrReaderReceive(st, 0, wait_ms, true);
@@ -724,7 +735,7 @@ drain_one(LrSourceState *state, LrReaderState *st, int64 gxid, int wait_ms,
 	rpt.seg_lsn = stats.pos;
 	rpt.gxid = (int64) stats.flush;
 	rpt.nrows = stats.ntxns;
-	rpt.nbytes = stats.mem_bytes + stats.spill_bytes;
+	rpt.nbytes = stats.held_bytes;
 	queue_report(state, &rpt);
 
 	if (res == LR_RECV_EOF)
@@ -784,7 +795,7 @@ do_drain(LrSourceState *state)
 		 * reader that serves several source segments may not multiply the
 		 * coordinator's grace period by how many it happens to hold.
 		 */
-		if (waited)
+		if (waited && wait_ms > 0)
 			budget = Max(0, wait_ms -
 						 (int) TimestampDifferenceMilliseconds(started,
 															   GetCurrentTimestamp()));

@@ -321,7 +321,26 @@ mpp_logicalrep.idle_drain_ms (integer, default 2s)
 
 mpp_logicalrep.reader_mem (integer, default 64MB)
     Memory a reader may use to buffer changes before spilling to disk,
-    per subscription.
+    per subscription.  This is where the buffer moves to disk, not a
+    ceiling on it; hold_max below is the ceiling.
+
+mpp_logicalrep.hold_max (integer, default 1GB)
+    How much one reader may hold -- completed transactions the driver
+    has not released, in memory and spilled together -- before the
+    coordinator stops reading the source altogether.  Per source
+    segment, and judged by the fullest of them: it is one segment's
+    disk that fills.  0 turns the limit off.
+
+    Changes to a table whose copy is still running are withheld, and the
+    transactions carrying them are held until the copy finishes and the
+    catch-up replays them; how much that is depends on how long the copy
+    takes and how fast the source is written.  Past the limit the
+    readers release, report and reply as usual but read nothing, which
+    fills the socket and leaves those transactions in the source's WAL
+    instead -- bounded there by max_slot_wal_keep_size, and a slot lost
+    that way is handled like any other (slot_loss_action).  The whole
+    subscription stops moving while that lasts; it is a safety valve,
+    not a throttle, and the log says when it opens and closes.
 
 mpp_logicalrep.apply_max_retries (integer, default 10)
 mpp_logicalrep.apply_error_action (enum, default disable)

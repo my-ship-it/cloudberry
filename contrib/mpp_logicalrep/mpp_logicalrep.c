@@ -187,6 +187,13 @@ define_gucs(void)
 							65536, 64, MAX_KILOBYTES,
 							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
 
+	DefineCustomIntVariable("mpp_logicalrep.hold_max",
+							"How much one reader may buffer before the coordinator stops reading the source.",
+							"Per source segment, memory and spill together.  0 disables the limit.",
+							&gp_lr_hold_max,
+							1048576, 0, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
+
 	DefineCustomIntVariable("mpp_logicalrep.copy_port_lo",
 							"Initial sync: low end of the TCP port range the copy helper listens on.",
 							NULL,

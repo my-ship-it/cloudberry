@@ -23,3 +23,4 @@ test: shutdown
 test: sync_filter
 test: utility_writes
 test: add_utility_writes
+test: backpressure

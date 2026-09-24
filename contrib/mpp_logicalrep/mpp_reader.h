@@ -117,6 +117,7 @@ typedef enum LrReceiveResult
 	LR_RECV_TARGET_READY,		/* the requested gxid is ready (or applied) */
 	LR_RECV_DRAINED,			/* nothing more buffered on the socket */
 	LR_RECV_TIMEOUT,			/* wait_ms elapsed */
+	LR_RECV_HELD,				/* not read: the coordinator held the stream back */
 	LR_RECV_EOF,				/* connection lost */
 } LrReceiveResult;
 
@@ -138,6 +139,8 @@ typedef struct LrReaderStats
 	int			nrels;
 	int64		mem_bytes;
 	int64		spill_bytes;
+	int64		held_bytes;		/* of completed transactions only: what the
+								 * coordinator could release if it chose to */
 	int64		nmsgs;
 	XLogRecPtr	pos;			/* read position */
 	XLogRecPtr	flush;			/* safe confirmed_flush */

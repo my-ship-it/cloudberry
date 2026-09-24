@@ -76,6 +76,7 @@ int			gp_lr_batch_max_bytes = 65536;
 int			gp_lr_batch_max_latency_ms = 200;
 int			gp_lr_event_wait_ms = 1000;
 int			gp_lr_idle_drain_ms = 2000;
+int			gp_lr_hold_max = 1048576;	/* kB, per source segment */
 int			gp_lr_apply_error_action = LR_APPLY_ERROR_DISABLE;
 int			gp_lr_apply_max_retries = 10;
 
@@ -223,6 +224,7 @@ typedef struct LrDriver
 	int			sync_nlocal;	/* the local half of the same cut point */
 	LrLocalSnap *sync_local;
 	bool		catchup_mode;	/* the copy is done: drain the held ones */
+	bool		reading_held;	/* the readers are not consuming the source */
 	int			stuck_errors;	/* errors in a row that committed nothing */
 
 	/* the unit handed to the sink, rebuilt for each one */
@@ -246,6 +248,7 @@ static void driver_disconnect_source(LrDriver *d);
 static bool driver_pump_source(LrDriver *d, int timeout_ms);
 static void driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 								const int16 *segs, bool exact);
+static bool stream_applied_through(LrDriver *d, int64 lsn);
 static void driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs,
 						 int wait_ms);
 static bool driver_batch_ready(LrDriver *d);
@@ -1397,6 +1400,101 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 	return true;
 }
 
+/* the driver's own sleep; the readers do the waiting when they are reading */
+static void
+driver_wait(int ms)
+{
+	(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					 ms, WAIT_EVENT_LOGICAL_APPLY_MAIN);
+	ResetLatch(MyLatch);
+}
+
+/*
+ * Should the readers stop consuming the source?
+ *
+ * What a reader holds is what the driver has not released: transactions not
+ * yet applied, and transactions held back for a table whose copy is still
+ * running.  That grows with how long the copy takes and how fast the source
+ * is written, and past gp_lr_reader_mem it grows on disk rather than in
+ * memory -- that GUC is where the buffer moves to disk, not a ceiling.  The
+ * ceiling is the segment's disk, and filling it has no knob and no recovery.
+ *
+ * So there is one: stop reading, and the transactions stay in the source's
+ * WAL instead, where max_slot_wal_keep_size bounds them and a lost slot is
+ * something this module already knows how to recover from (O1).
+ *
+ * The verdict is the fattest reader rather than the sum, because it is one
+ * segment's disk that fills; and it applies to every reader at once, because
+ * a distributed transaction is ready only once all of its segments have
+ * reported it -- holding one stream back while the others ran on would
+ * buffer parts of transactions that could never complete.
+ *
+ * Hysteresis: resume at half the limit, so that one released transaction at
+ * the threshold does not open and close the source's window every poll.
+ */
+static bool
+driver_backpressure(LrDriver *d)
+{
+	int64		limit = (int64) gp_lr_hold_max * 1024;
+	int64		held = 0;
+	int			fattest = 0;
+
+	if (limit <= 0)
+		return false;			/* switched off */
+
+	/*
+	 * What is counted is only what a reader could be told to let go of: a
+	 * transaction still arriving is not held, and stopping the reading its
+	 * own COMMIT is waiting for would wedge the subscription for good.
+	 */
+
+	/*
+	 * Not while a synchronisation is still waiting for the stream to reach
+	 * its cut point.  Its tables may not go live until the applied position
+	 * has passed that point (see driver_sync_progress), and the only way to
+	 * pass it is to read forward: holding the source back there would hold
+	 * back the catch-up that is the only thing which can release what is
+	 * held.  That is a deadlock, not a slow recovery.
+	 *
+	 * What this gives up is bounded.  The cut point is fixed when the job
+	 * starts, so reaching it costs the backlog the stream had at that moment
+	 * -- not the copy's whole duration, which is the part that grows without
+	 * limit and which is still held back once the point is passed.
+	 */
+	if (d->sync != NULL && !d->catchup_mode &&
+		!stream_applied_through(d, LrSyncAddCutLsn(d->sync)))
+		return false;
+
+	/*
+	 * Readers of segments past LR_STAT_MAX_SEGS report no size, so a source
+	 * with more segments than that is judged by the first ones alone.
+	 */
+	for (int seg = 0; seg < d->nsrcsegs && seg < LR_STAT_MAX_SEGS; seg++)
+		if (d->rep.seg_buffered_bytes[seg] > held)
+		{
+			held = d->rep.seg_buffered_bytes[seg];
+			fattest = seg;
+		}
+
+	if (!d->reading_held && held >= limit)
+	{
+		d->reading_held = true;
+		ereport(LOG,
+				(errmsg("mpp apply worker: subscription %u: holding the source back: the reader of segment %d has " INT64_FORMAT " kB buffered, over mpp_logicalrep.hold_max",
+						d->cfg->subid, fattest, held / 1024),
+				 errdetail("%d transaction(s) are held for a table that is still being copied.",
+						   list_length(d->deferred_txns))));
+	}
+	else if (d->reading_held && held < limit / 2)
+	{
+		d->reading_held = false;
+		ereport(LOG,
+				(errmsg("mpp apply worker: subscription %u: reading the source again: " INT64_FORMAT " kB buffered",
+						d->cfg->subid, held / 1024)));
+	}
+	return d->reading_held;
+}
+
 /*
  * gp_lr_drain: release the last batch, read the streams, absorb the
  * reports.  gxid 0 = idle poll.
@@ -1415,6 +1513,17 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 	PGresult   *res;
 	ListCell   *lc;
 	MemoryContext oldcxt;
+	int			held_ms = 0;
+
+	/*
+	 * Over the limit: tell the readers to release, report and reply, but to
+	 * read nothing.  The wait is then ours to do -- see below.
+	 */
+	if (driver_backpressure(d))
+	{
+		held_ms = wait_ms;
+		wait_ms = -1;
+	}
 
 	snprintf(subid, sizeof(subid), "%u", d->cfg->subid);
 	snprintf(token, sizeof(token), INT64_FORMAT, d->cfg->token);
@@ -1543,7 +1652,11 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 			case LR_REPORT_STATUS:
 				if (seg_lsn > d->seg_pos[seg])
 					d->seg_pos[seg] = seg_lsn;
-				/* what that reader is still holding, for O2 */
+				/*
+				 * What that reader is still holding: completed transactions
+				 * the driver has not released, in memory and spilled
+				 * together.  Feeds the view (O2) and the verdict above.
+				 */
 				if (seg < LR_STAT_MAX_SEGS)
 				{
 					d->rep.seg_buffered_txns[seg] = nrows;
@@ -1591,6 +1704,13 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 		d->locals = NIL;
 		MemoryContextSwitchTo(oldcxt);
 	}
+
+	/*
+	 * A reading DRAIN waits for us, inside LrReaderReceive(); one that reads
+	 * nothing returns at once, and the loop around it would spin.
+	 */
+	if (held_ms > 0)
+		driver_wait(held_ms);
 }
 
 static LrGxidTxn *
@@ -2878,9 +2998,7 @@ assembly_reset(LogicalRepAssembly *self)
 static void
 assembly_wait(LogicalRepAssembly *self, int ms)
 {
-	(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					 ms, WAIT_EVENT_LOGICAL_APPLY_MAIN);
-	ResetLatch(MyLatch);
+	driver_wait(ms);
 }
 
 static bool

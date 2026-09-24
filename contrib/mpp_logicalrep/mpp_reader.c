@@ -1538,10 +1538,21 @@ LrReaderGetStats(LrReaderState *st, LrReaderStats *stats)
 		stats->ntxns++;
 		if (txn->state == LR_TXN_OPEN)
 			stats->nopen++;
-		else if (txn->kind == LR_TXN_LOCAL)
-			stats->nready_local++;
 		else
-			stats->nready_gxid++;
+		{
+			/*
+			 * A transaction still arriving is not held: nothing can release
+			 * it, and the only way to finish it is to read on.  Counting it
+			 * would let a transaction larger than the limit stop the reading
+			 * that its own COMMIT is waiting for, and neither would ever
+			 * come.
+			 */
+			stats->held_bytes += txn->changes->total_len;
+			if (txn->kind == LR_TXN_LOCAL)
+				stats->nready_local++;
+			else
+				stats->nready_gxid++;
+		}
 		if (txn->changes->spilled)
 			stats->nspilled++;
 	}

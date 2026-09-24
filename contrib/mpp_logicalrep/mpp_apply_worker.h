@@ -72,6 +72,7 @@ extern int	gp_lr_batch_max_bytes;	/* kB */
 extern int	gp_lr_batch_max_latency_ms;
 extern int	gp_lr_event_wait_ms;	/* one DRAIN's wait for its target gxid */
 extern int	gp_lr_idle_drain_ms;	/* idle stream: poll readers for local txns */
+extern int	gp_lr_hold_max;		/* one reader's buffer before the source is held back, kB */
 
 typedef struct LrWorkerConfig
 {
