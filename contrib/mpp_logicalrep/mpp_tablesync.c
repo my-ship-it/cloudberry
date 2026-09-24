@@ -228,6 +228,10 @@ typedef struct LrSync
 
 static PGresult *sync_exec(LrSync *s, PGconn *conn, const char *who,
 						   const char *sql, int nparams, const char *const *params);
+static void sync_exec_multi(LrSync *s, PGconn *conn, const char *who,
+							const char *sql, PGresult **out, int nout);
+pg_attribute_noreturn() static void sync_exec_failed(PGconn *conn, const char *who,
+													 const char *sql, PGresult *res);
 static void sync_connect(LrSync *s);
 static void sync_disconnect(LrSync *s);
 static char sync_marker_state(LrSync *s, char **snapshot);
@@ -400,6 +404,69 @@ sync_exec(LrSync *s, PGconn *conn, const char *who, const char *sql,
 	if (res == NULL ||
 		(PQresultStatus(res) != PGRES_TUPLES_OK &&
 		 PQresultStatus(res) != PGRES_COMMAND_OK))
+		sync_exec_failed(conn, who, sql, res);
+	return res;
+}
+
+/*
+ * The same, for a string of statements sent as one.  Three round trips to
+ * take a cut point -- BEGIN, the segments' snapshots, the coordinator's --
+ * are three per table now that every table has a cut point of its own, and
+ * two of them buy nothing: the simple query protocol runs the string in
+ * order and hands back a result apiece, which is all the caller wanted.
+ *
+ * The order is what makes the cut point right (see sync_cut_point), and it
+ * is kept: the statements run left to right, in the transaction the first
+ * of them opens, exactly as they would one at a time.
+ */
+static void
+sync_exec_multi(LrSync *s, PGconn *conn, const char *who, const char *sql,
+				PGresult **out, int nout)
+{
+	PGresult   *r;
+	int			n = 0;
+
+	for (int i = 0; i < nout; i++)
+		out[i] = NULL;
+
+	if (PQsendQuery(conn, sql) == 0)
+		sync_exec_failed(conn, who, sql, NULL);
+
+	while ((r = LrPQGetResult(conn)) != NULL)
+	{
+		if (PQresultStatus(r) != PGRES_TUPLES_OK &&
+			PQresultStatus(r) != PGRES_COMMAND_OK)
+		{
+			/* drain before reporting, so the connection stays usable */
+			PGresult   *rest;
+
+			while ((rest = LrPQGetResult(conn)) != NULL)
+				PQclear(rest);
+			for (int i = 0; i < n; i++)
+				PQclear(out[i]);
+			sync_exec_failed(conn, who, sql, r);
+		}
+		if (n < nout)
+			out[n++] = r;
+		else
+			PQclear(r);
+	}
+	if (n != nout)
+	{
+		for (int i = 0; i < n; i++)
+			PQclear(out[i]);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				 errmsg("initial sync, %s: %d result(s) for %d statement(s)",
+						who, n, nout),
+				 errcontext("statement: %.300s", sql)));
+	}
+}
+
+/* what a failed statement of the synchronisation reports; never returns */
+static void
+sync_exec_failed(PGconn *conn, const char *who, const char *sql, PGresult *res)
+{
 	{
 		char	   *msg = pstrdup(res ? PQresultErrorMessage(res) : PQerrorMessage(conn));
 		const char *state = res ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : NULL;
@@ -422,7 +489,6 @@ sync_exec(LrSync *s, PGconn *conn, const char *who, const char *sql,
 				 errmsg("initial sync, %s: %s", who, msg),
 				 errcontext("statement: %.300s", sql)));
 	}
-	return res;
 }
 
 static PGconn *
@@ -1522,40 +1588,46 @@ sync_cut_point(LrSync *s)
 	PGresult   *res;
 	StringInfoData ds;
 	StringInfoData local;
+	PGresult   *cut[3];
 	char	   *ip;
 
 	s->ds_inprogress = NIL;		/* one cut point per table: start afresh */
-	PQclear(sync_exec(s, s->src, "source", "BEGIN ISOLATION LEVEL REPEATABLE READ", 0, NULL));
 
 	/*
-	 * First, and dispatched.  That statement is what freezes, on every source
-	 * segment, the snapshot every copy below then runs under, and this one
-	 * reports the snapshot it froze -- which is the boundary for transactions
-	 * that have no distributed xid to be judged by.  It has to come before the
-	 * coordinator-only statement that follows: that one freezes nothing out
-	 * there, so leading with it would record snapshots later than the copies'
-	 * own, and a local transaction the copy never saw would then be dropped
-	 * from the stream as already copied.
+	 * One round trip for the three of them, in this order, which is the order
+	 * that makes the cut point right.
+	 *
+	 * The middle statement is the dispatched one.  It is what freezes, on
+	 * every source segment, the snapshot every copy below then runs under,
+	 * and it reports the snapshot it froze -- the boundary for transactions
+	 * that have no distributed xid to be judged by.  It has to come before
+	 * the coordinator-only statement that follows: that one freezes nothing
+	 * out there, so leading with it would record snapshots later than the
+	 * copies' own, and a local transaction the copy never saw would then be
+	 * dropped from the stream as already copied.
 	 */
-	res = sync_exec(s, s->src, "source",
-					"SELECT segid, xmin || ':' || xmax || ':' || "
-					"       coalesce(array_to_string(xip, ','), '') "
-					"FROM pg_catalog.gp_lr_local_snapshot() ORDER BY segid",
-					0, NULL);
+	sync_exec_multi(s, s->src, "source",
+					"BEGIN ISOLATION LEVEL REPEATABLE READ;\n"
+					"SELECT segid, xmin || ':' || xmax || ':' || \n"
+					"       coalesce(array_to_string(xip, ','), '') \n"
+					"FROM pg_catalog.gp_lr_local_snapshot() ORDER BY segid;\n"
+					"SELECT pg_current_wal_lsn()::text, xmax, "
+					"       coalesce(array_to_string(in_progress, ','), '') \n"
+					"FROM gp_current_distributed_snapshot()",
+					cut, lengthof(cut));
+
+	res = cut[1];
 	initStringInfo(&local);
 	for (int i = 0; i < PQntuples(res); i++)
 		appendStringInfo(&local, "%s%s/%s", i ? "|" : "",
 						 PQgetvalue(res, i, 0), PQgetvalue(res, i, 1));
-	PQclear(res);
 
-	res = sync_exec(s, s->src, "source",
-					"SELECT pg_current_wal_lsn()::text, xmax, coalesce(array_to_string(in_progress, ','), '') "
-					"FROM gp_current_distributed_snapshot()",
-					0, NULL);
+	res = cut[2];
 	s->lt = pstrdup(PQgetvalue(res, 0, 0));
 	s->ds_xmax = strtoll(PQgetvalue(res, 0, 1), NULL, 10);
 	ip = pstrdup(PQgetvalue(res, 0, 2));
-	PQclear(res);
+	for (int i = 0; i < lengthof(cut); i++)
+		PQclear(cut[i]);
 
 	if (ip[0] != '\0')
 	{
