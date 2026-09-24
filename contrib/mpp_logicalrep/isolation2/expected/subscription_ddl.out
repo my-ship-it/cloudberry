@@ -35,7 +35,10 @@ CREATE
 -- one worker per enabled registry row, once it has settled: subscription DDL
 -- invalidates the syscache for every worker of the database, so each stops
 -- and is started again, and only the settled count means anything
-1:@db_name mpp_lr_ddl: CREATE FUNCTION ddl_settled() RETURNS bool AS $$ DECLARE want int; got int; BEGIN SELECT count(*) INTO want FROM gp_mpp_subscription WHERE enabled; FOR i IN 1 .. 400 LOOP SELECT count(*) INTO got FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF got = want THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+-- pg_stat_activity is a snapshot taken once per transaction, and a plpgsql
+-- function is one transaction, so a loop that does not clear it reads the
+-- same answer four hundred times and then gives up.
+1:@db_name mpp_lr_ddl: CREATE FUNCTION ddl_settled() RETURNS bool AS $$ DECLARE want int; got int; BEGIN SELECT count(*) INTO want FROM gp_mpp_subscription WHERE enabled; FOR i IN 1 .. 400 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO got FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF got = want THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 CREATE
 
 -- ------------------------------------------------------------------

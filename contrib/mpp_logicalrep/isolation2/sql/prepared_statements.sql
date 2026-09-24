@@ -36,7 +36,10 @@ EXECUTE ps_ins(206, 'prepared');
 EXECUTE ps_ins(207, 'prepared');
 EXECUTE ps_upd(201, 'prepared then updated');
 EXECUTE ps_del(202);
-1:@db_name mpp_lr_ps: SELECT lr_wait('SELECT count(*) = 106 FROM ps_t') AS prepared_dml_arrived;
+-- Not count(*) = 106 alone: the count passes through 106 on the way up, at
+-- the sixth of the seven inserts, and the update and the delete have not
+-- arrived then.  Wait for the end state itself.
+1:@db_name mpp_lr_ps: SELECT lr_wait($$SELECT count(*) = 106 AND count(*) FILTER (WHERE v = 'prepared then updated') = 1 AND count(*) FILTER (WHERE id = 202) = 0 FROM ps_t$$) AS prepared_dml_arrived;
 1:@db_name mpp_lr_ps: SELECT count(*) FILTER (WHERE v = 'prepared then updated') AS updated, count(*) FILTER (WHERE id = 202) AS deleted FROM ps_t;
 
 -- ------------------------------------------------------------------

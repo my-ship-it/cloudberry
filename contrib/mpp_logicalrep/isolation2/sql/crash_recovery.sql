@@ -28,7 +28,10 @@ CREATE PROCEDURE cr_churn() AS $$ BEGIN FOR r IN 1 .. 60 LOOP INSERT INTO cr_t S
 -- Kills the worker, its reader and writer gang QEs, and the session it drives
 -- them from, round after round.  It reads pg_stat_activity only, so it holds
 -- no lock on the table being applied to.
-1:@db_name mpp_lr_cr: CREATE FUNCTION cr_chaos() RETURNS text AS $$ DECLARE hit int DEFAULT 0; n int; BEGIN FOR r IN 1 .. 6 LOOP PERFORM pg_sleep(2); SELECT count(*) INTO n FROM (SELECT pg_terminate_backend(pid) FROM gp_dist_random('pg_stat_activity') WHERE application_name LIKE 'mpp_apply%') a; SELECT hit + least(n, 1) INTO hit; SELECT count(*) INTO n FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND (backend_type = 'mpp apply worker' OR application_name = 'mpp_apply_worker')) b; SELECT hit + least(n, 1) INTO hit; END LOOP; RETURN 'something_was_killed=' || (hit > 0); END $$ LANGUAGE plpgsql;
+-- Six rounds of killing, and each round has to look again: pg_stat_activity
+-- is a snapshot taken once per transaction, so without clearing it every
+-- round would terminate the same pid the first one already did.
+1:@db_name mpp_lr_cr: CREATE FUNCTION cr_chaos() RETURNS text AS $$ DECLARE hit int DEFAULT 0; n int; BEGIN FOR r IN 1 .. 6 LOOP PERFORM pg_sleep(2); PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM (SELECT pg_terminate_backend(pid) FROM gp_dist_random('pg_stat_activity') WHERE application_name LIKE 'mpp_apply%') a; SELECT hit + least(n, 1) INTO hit; SELECT count(*) INTO n FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND (backend_type = 'mpp apply worker' OR application_name = 'mpp_apply_worker')) b; SELECT hit + least(n, 1) INTO hit; END LOOP; RETURN 'something_was_killed=' || (hit > 0); END $$ LANGUAGE plpgsql;
 
 1:@db_name mpp_lr_cr: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION cr_sub CONNECTION %L PUBLICATION cr_pub WITH (slot_name = ''cr_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 1:@db_name mpp_lr_cr: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'cr_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
@@ -46,7 +49,10 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM cr_t;
 1:@db_name mpp_lr_cr: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM cr_t;
 -- every round is there in full: none half-applied
 1:@db_name mpp_lr_cr: SELECT count(*) AS rounds_not_of_twenty FROM (SELECT v, count(*) AS n FROM cr_t WHERE v LIKE 'round %' GROUP BY v) r WHERE n <> 20;
-1:@db_name mpp_lr_cr: SELECT phase, enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'cr_sub';
+-- the phase is waited for, not sampled: the last kill can land after the rows
+-- have caught up, and the launcher takes a moment to start the worker again
+1:@db_name mpp_lr_cr: SELECT lr_wait($$SELECT phase = 'streaming' FROM gp_stat_mpp_subscription WHERE subname = 'cr_sub'$$) AS streaming_again;
+1:@db_name mpp_lr_cr: SELECT enabled, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'cr_sub';
 
 1:@db_name mpp_lr_cr: DROP SUBSCRIPTION cr_sub;
 1:@db_name mpp_lr_cr: SELECT lr_worker_gone() AS worker_gone;
