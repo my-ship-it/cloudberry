@@ -438,6 +438,18 @@ for the catch-up like a distributed one, and the catch-up replays it
 unless that segment's snapshot at that cut point says the copy already
 had it.
 
+A publication FOR ALL TABLES is a standing order, so a table created on
+the publisher afterwards is in it already; the subscriber copies it at
+the next ALTER SUBSCRIPTION ... REFRESH PUBLICATION and not before.  It
+also takes the publisher's word for what exists, with no ADD TABLE to
+think twice at, so a table the target has not got is in the publication
+too.  The first write to such a table stops the apply -- it names the
+relation and disables the subscription after
+mpp_logicalrep.apply_max_retries attempts -- and the way out is to create
+that table on the target.  Dropping it on the publisher is not: by then
+the change is in the WAL the slot holds, and a worker that starts again
+starts from before it and meets it again.
+
 Partitioned tables are not supported as target tables.
 
 gpexpand renumbers segments on either side, and the subscription has to

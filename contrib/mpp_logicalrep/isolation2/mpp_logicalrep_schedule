@@ -15,6 +15,7 @@ test: streaming
 test: direct_copy
 test: initial_sync
 test: refresh_publication
+test: all_tables
 test: large_batches
 test: monitoring
 test: faults
