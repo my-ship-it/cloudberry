@@ -53,8 +53,10 @@ INSERT INTO sf_t VALUES (503, 'committed before it as well');
 -- the cut point, as the synchronisation would have recorded it.  gxids are
 -- cluster-wide, so this session sees the one the source is holding open even
 -- though it is connected to the other database.
-1:@db_name mpp_lr_sf: UPDATE gp_subscription_rel SET sync_snapshot = (SELECT 'xmax=' || xmax || ';inprogress=' || coalesce(array_to_string(in_progress, ','), '') FROM gp_current_distributed_snapshot()) WHERE relid = 0;
-1:@db_name mpp_lr_sf: SELECT sync_snapshot LIKE '%inprogress=_%' AS it_caught_one_in_flight FROM gp_subscription_rel WHERE relid = 0;
+-- every row, which is what one table's synchronisation writes: the cut point
+-- is kept per table now, and the marker row keeps the earliest of them
+1:@db_name mpp_lr_sf: UPDATE gp_subscription_rel SET sync_snapshot = (SELECT 'xmax=' || xmax || ';inprogress=' || coalesce(array_to_string(in_progress, ','), '') FROM gp_current_distributed_snapshot());
+1:@db_name mpp_lr_sf: SELECT count(DISTINCT sync_snapshot) = 1 AS one_cut_point, min(sync_snapshot) LIKE '%inprogress=_%' AS it_caught_one_in_flight FROM gp_subscription_rel;
 
 2: COMMIT;
 2q:

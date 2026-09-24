@@ -76,10 +76,22 @@ honest: each segment recomputes where every row belongs and refuses one
 that is not its own, so a wrong decision fails the copy instead of
 misplacing rows.  mpp_logicalrep.direct_copy turns it off.
 
-The copy is taken under a cut point: a target LSN and a distributed
-snapshot of the source.  A decoded transaction whose gxid is visible
-under that snapshot is already in the copy and is dropped rather than
-applied, which is what makes the copy and the stream meet exactly once.
+Each table's copy is taken under a cut point of its own: a target LSN and
+a distributed snapshot of the source, taken when that table's copy
+starts.  A decoded transaction whose gxid is visible under that snapshot
+is already in that table's copy and is not applied to it, which is what
+makes the copy and the stream meet exactly once.
+
+Per table rather than once for the set, because one transaction held open
+over every copy holds the source's xmin back for as long as the slowest
+of them -- long enough to stall an unrelated subscription's barrier.  The
+consequence is that "already copied" belongs to a transaction and a table
+together: one transaction can be inside one table's copy and not
+another's, and is then applied for the tables that have not got it and
+skipped for the ones that have.  Within a table the target is still a
+consistent point of the source's history; across tables, during the
+synchronisation, it is each table's own -- the same guarantee PostgreSQL
+gives, whose tablesync workers likewise copy a table at a time.
 
 ALTER SUBSCRIPTION ... REFRESH PUBLICATION adds tables to a running
 subscription the same way: their changes are held aside, the tables are

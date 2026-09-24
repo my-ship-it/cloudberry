@@ -74,6 +74,32 @@ extern int	gp_lr_event_wait_ms;	/* one DRAIN's wait for its target gxid */
 extern int	gp_lr_idle_drain_ms;	/* idle stream: poll readers for local txns */
 extern int	gp_lr_hold_max;		/* one reader's buffer before the source is held back, kB */
 
+/*
+ * One source segment's local snapshot at a cut point, as
+ * gp_lr_local_snapshot() froze it.  A local transaction visible under it
+ * committed before the copy started reading, so the copy has its rows.
+ */
+typedef struct LrLocalSnap
+{
+	TransactionId xmin;
+	TransactionId xmax;			/* InvalidTransactionId = no snapshot */
+	int			nxip;
+	TransactionId *xip;
+} LrLocalSnap;
+
+/* one table's cut point, as the streaming filter reads it */
+typedef struct LrSyncCut
+{
+	const char *relname;		/* "nsp.rel"; NULL applies to every relation */
+	int64		ds_xmax;		/* 0 = no cut point, nothing is covered */
+	int			nds_inprogress;
+	const int64 *ds_inprogress;
+
+	/* and the half a transaction with no gxid is judged by, per segment */
+	int			nlocal;
+	LrLocalSnap *local;
+} LrSyncCut;
+
 typedef struct LrWorkerConfig
 {
 	Oid			subid;
@@ -91,17 +117,19 @@ typedef struct LrWorkerConfig
 	List	   *publications;	/* String list */
 
 	/*
-	 * Initial-sync deduplication: a distributed snapshot
-	 * cut point.  When sync_ds_xmax != 0, a ready gxid G that is visible under
-	 * this snapshot (G < sync_ds_xmax and G not in sync_ds_inprogress) was
-	 * already captured by the table COPY taken at the cut point, so it is
-	 * dropped instead of applied.  Self-limiting: every gxid committed after
-	 * the cut point is >= sync_ds_xmax, so the filter only ever drops the
-	 * pre-COPY transactions and becomes inert afterwards.
+	 * Initial-sync deduplication.  A ready gxid G that is visible under a
+	 * table's cut point (G < ds_xmax and G not in ds_inprogress) was already
+	 * captured by that table's COPY, so its changes to that table are dropped
+	 * instead of applied; a transaction all of whose tables say so is dropped
+	 * whole.  Self-limiting: every gxid that commits after a cut point is
+	 * >= its ds_xmax, so a cut only ever drops the transactions its own COPY
+	 * predates and goes inert afterwards.
+	 *
+	 * One entry per table, since each table's COPY has its own cut point; an
+	 * entry naming no relation applies to every one of them.
 	 */
-	int64		sync_ds_xmax;
-	int			nsync_ds_inprogress;
-	const int64 *sync_ds_inprogress;
+	int			nsync_cuts;
+	const struct LrSyncCut *sync_cuts;
 
 	/*
 	 * And the other half of the same cut point: each source segment's own
@@ -151,6 +179,9 @@ extern void LrApplyWorkerRun(const LrWorkerConfig *cfg, LrWorkerStats *stats);
 #define LR_CONNECT_TIMEOUT_S	60
 extern bool LrWorkerStopRequested(void);
 extern bool LrPostmasterStopping(void);
+
+/* "xmin:xmax:xip,..." as gp_lr_local_snapshot() states it */
+extern void LrParseLocalSnap(const char *value, LrLocalSnap *snap);
 extern struct pg_conn *LrPQConnect(const char *conninfo);
 extern struct pg_result *LrPQGetResult(struct pg_conn *conn);
 extern void LrPQWaitIO(struct pg_conn *conn, int io_flag);

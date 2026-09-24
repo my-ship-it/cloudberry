@@ -102,6 +102,18 @@ typedef struct AssembledTxn
 	int			nparticipants;
 	int		   *participant_segidx;
 	XLogRecPtr *participant_pos;
+
+	/*
+	 * Relations of this transaction alone that must not be applied, because
+	 * whatever holds them already has its rows -- a table copy taken after
+	 * this transaction committed, say.  Unlike the unit-wide sets in the
+	 * transport's own spec, this one belongs to the transaction: two in the
+	 * same unit can disagree about the same relation, which is what happens
+	 * when each table's copy has its own cut point.  Remote relids, empty
+	 * when there is nothing to skip.
+	 */
+	int			nskip;
+	Oid		   *skip;
 } AssembledTxn;
 
 /*

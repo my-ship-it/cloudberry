@@ -164,20 +164,6 @@ typedef struct LrLocalTxn
 	int64		nbytes;
 } LrLocalTxn;
 
-/*
- * One source segment's local snapshot at a cut point, as
- * gp_lr_local_snapshot() froze it.  A local transaction visible under it
- * committed before the copy started reading, so the copy already contains
- * its rows.
- */
-typedef struct LrLocalSnap
-{
-	TransactionId xmin;
-	TransactionId xmax;			/* InvalidTransactionId = no snapshot */
-	int			nxip;
-	TransactionId *xip;
-} LrLocalSnap;
-
 typedef struct LrDriver
 {
 	const LrWorkerConfig *cfg;
@@ -271,7 +257,6 @@ static bool split_relname(const char *qualified, char **nspname, char **relname)
 static LrGxidTxn *registry_get(LrDriver *d, int64 gxid, bool create);
 static void registry_remove(LrDriver *d, LrGxidTxn *t);
 static bool txn_complete(LrDriver *d, LrGxidTxn *t);
-static bool gxid_covered_by_sync(LrDriver *d, int64 gxid);
 static void driver_collect_ready(LrDriver *d);
 static void driver_check_pending(LrDriver *d, bool force);
 static bool driver_sync_progress(LrDriver *d);
@@ -1210,19 +1195,127 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs, const int16 *
  * about once (it predates the segment slots, or a segment is far behind).
  */
 /*
- * Initial-sync filter: is gxid already in the COPY taken at the cut point?
+ * Initial-sync filter.  Each table's COPY has its own cut point, so what a
+ * transaction may still write is decided per relation:
  * visible(G, DS_t) = G < xmax AND G not in in_progress.
  */
-static bool
-gxid_covered_by_sync(LrDriver *d, int64 gxid)
+
+/* the cut point that governs this relation, or NULL when none does */
+static const LrSyncCut *
+sync_cut_for(LrDriver *d, const char *relname)
 {
-	if (d->cfg->sync_ds_xmax == 0 || gxid == 0 || gxid >= d->cfg->sync_ds_xmax)
+	const LrSyncCut *any = NULL;
+
+	for (int i = 0; i < d->cfg->nsync_cuts; i++)
+	{
+		const LrSyncCut *c = &d->cfg->sync_cuts[i];
+
+		if (c->relname == NULL)
+			any = c;			/* the catch-all, if there is one */
+		else if (strcmp(c->relname, relname) == 0)
+			return c;
+	}
+	return any;
+}
+
+/* was this transaction already inside the COPY taken at that cut point? */
+static bool
+cut_covers(const LrSyncCut *cut, int64 gxid)
+{
+	if (cut == NULL || cut->ds_xmax == 0 || gxid == 0 || gxid >= cut->ds_xmax)
 		return false;
-	for (int i = 0; i < d->cfg->nsync_ds_inprogress; i++)
-		if (d->cfg->sync_ds_inprogress[i] == gxid)
+	for (int i = 0; i < cut->nds_inprogress; i++)
+		if (cut->ds_inprogress[i] == gxid)
 			return false;		/* in progress at the cut => not yet copied */
 	return true;
 }
+
+/*
+ * The same question for a utility write, which has no gxid: that segment
+ * froze a snapshot at the cut point, and a transaction visible under it had
+ * committed before the copy read the table.
+ */
+static bool
+cut_covers_local(const LrSyncCut *cut, int seg, int64 xid64)
+{
+	TransactionId xid = (TransactionId) xid64;
+	const LrLocalSnap *snap;
+
+	if (cut == NULL || seg < 0 || seg >= cut->nlocal)
+		return false;
+	snap = &cut->local[seg];
+	if (!TransactionIdIsValid(snap->xmax) || !TransactionIdIsValid(xid))
+		return false;
+	if (!TransactionIdPrecedes(xid, snap->xmax))
+		return false;			/* started after the cut => not copied */
+	if (TransactionIdPrecedes(xid, snap->xmin))
+		return true;
+	for (int i = 0; i < snap->nxip; i++)
+		if (TransactionIdEquals(xid, snap->xip[i]))
+			return false;		/* in flight at the cut => not copied */
+	return true;
+}
+
+/* which of the two tests this transaction is judged by */
+static bool
+cut_covers_txn(const LrSyncCut *cut, int64 gxid, int seg, int64 xid)
+{
+	return gxid != 0 ? cut_covers(cut, gxid) : cut_covers_local(cut, seg, xid);
+}
+
+/*
+ * Every relation this transaction touched already holds it, so there is
+ * nothing left to apply and the whole transaction can be dropped.  A
+ * transaction that touched nothing is not covered by anything.
+ */
+static bool
+txn_fully_covered(LrDriver *d, List *rel_names, int64 gxid)
+{
+	ListCell   *lc;
+
+	if (d->cfg->nsync_cuts == 0 || rel_names == NIL)
+		return false;
+	foreach(lc, rel_names)
+		if (!cut_covers(sync_cut_for(d, (char *) lfirst(lc)), gxid))
+			return false;
+	return true;
+}
+
+/* the relids a transaction may not write, the readers' names for them */
+static Oid *
+covered_relids(LrDriver *d, List *rel_names, int64 gxid, int seg, int64 xid,
+			   int *nskip)
+{
+	ListCell   *lc;
+	Oid		   *skip = NULL;
+	int			n = 0;
+
+	*nskip = 0;
+	if (d->cfg->nsync_cuts == 0 || rel_names == NIL)
+		return NULL;
+	foreach(lc, rel_names)
+	{
+		char	   *name = (char *) lfirst(lc);
+		ListCell   *rc;
+
+		if (!cut_covers_txn(sync_cut_for(d, name), gxid, seg, xid))
+			continue;
+		foreach(rc, d->relnames)
+		{
+			LrRelName  *rn = (LrRelName *) lfirst(rc);
+
+			if (strcmp(rn->name, name) != 0)
+				continue;
+			if (skip == NULL)
+				skip = palloc(sizeof(Oid) * list_length(rel_names));
+			skip[n++] = rn->relid;
+			break;
+		}
+	}
+	*nskip = n;
+	return n > 0 ? skip : NULL;
+}
+
 
 static void
 driver_collect_ready(LrDriver *d)
@@ -1300,7 +1393,7 @@ driver_collect_ready(LrDriver *d)
 			 * is preserved because a dropped no-op cannot depend on or be
 			 * depended upon by later transactions.
 			 */
-			if (gxid_covered_by_sync(d, t->gxid))
+			if (txn_fully_covered(d, t->rel_names, t->gxid))
 			{
 				MemoryContextSwitchTo(d->cxt);
 				if (t->event_lsn > d->coord_committed)
@@ -2014,8 +2107,8 @@ stream_applied_through(LrDriver *d, int64 lsn)
  * as long as the filter matters (it stops matching a wraparound away, and
  * stops mattering long before that).
  */
-static void
-parse_local_snap(const char *value, LrLocalSnap *snap)
+void
+LrParseLocalSnap(const char *value, LrLocalSnap *snap)
 {
 	char	   *copy;
 	char	   *save = NULL;
@@ -2079,7 +2172,7 @@ driver_take_add_snapshot(LrDriver *d)
 	d->sync_local = (LrLocalSnap *) palloc0(sizeof(LrLocalSnap) * ntext);
 	d->sync_nlocal = ntext;
 	for (int seg = 0; seg < ntext; seg++)
-		parse_local_snap(text[seg], &d->sync_local[seg]);
+		LrParseLocalSnap(text[seg], &d->sync_local[seg]);
 }
 
 /*
@@ -2269,6 +2362,14 @@ unit_build_from_batch(LrDriver *d)
 			np++;
 		}
 		at->nparticipants = np;
+
+		/*
+		 * Relations this one already holds from their own COPY.  Not every
+		 * relation of it, or driver_collect_ready() would have dropped the
+		 * transaction whole; the rest it still has to write.
+		 */
+		at->skip = covered_relids(d, t->rel_names, t->gxid, 0, 0, &at->nskip);
+
 		maxrels += list_length(t->rel_names);
 	}
 
@@ -2289,6 +2390,15 @@ unit_build_from_batch(LrDriver *d)
 		at->participant_pos = palloc(sizeof(XLogRecPtr));
 		at->participant_segidx[0] = l->seg;
 		at->participant_pos[0] = (XLogRecPtr) l->seg_lsn;
+
+		/*
+		 * A utility write the readers did not drop outright can still be
+		 * inside some tables' copies: they drop by the earliest cut point
+		 * alone, which is every table or none.
+		 */
+		at->skip = covered_relids(d, l->rel_names, 0, l->seg, l->xid,
+								  &at->nskip);
+
 		maxrels += list_length(l->rel_names);
 	}
 	u->ntxns = n;

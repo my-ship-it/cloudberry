@@ -83,6 +83,8 @@ typedef struct LrSyncRel
 {
 	Oid			relid;			/* target relation */
 	char	   *qualified;		/* quoted "nsp"."rel" (same on both sides) */
+	char	   *lt;				/* this table's own cut point: the source */
+	char	   *ds_text;		/* coordinator's LSN, and the snapshot */
 	char	   *collist;		/* quoted column names, target order */
 	char	   *coldefs;		/* column definition list for the SRF */
 	bool		replicated;		/* the SOURCE table is DISTRIBUTED REPLICATED:
@@ -182,8 +184,7 @@ static void sync_mark_untracked(LrSync *s);
 static void sync_check_keys(LrSync *s, LrSyncRel *r);
 static void sync_set_rel_state(LrSync *s, Oid relid, char state, const char *job);
 static void sync_finish(LrSync *s);
-static void sync_apply_snapshot(LrWorkerConfig *cfg, const char *text,
-								MemoryContext cxt);
+static void sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt);
 static int	sync_count_slots(LrSync *s);
 static bool sync_handle_slot_loss(LrSync *s);
 static void sync_wait(LrSync *s, int ms);
@@ -248,9 +249,9 @@ LrInitialSync(LrWorkerConfig *cfg)
 
 		if (marker == 'r')
 		{
-			/* streaming phase: only the cut point matters, for the filter */
+			/* streaming phase: only the cut points matter, for the filter */
 			if (snapshot)
-				sync_apply_snapshot(cfg, snapshot, oldcxt);
+				sync_load_cuts(s, cfg, oldcxt);
 		}
 		else
 		{
@@ -263,12 +264,29 @@ LrInitialSync(LrWorkerConfig *cfg)
 			sync_write_states(s, 'i', restart);
 			sync_ensure_slots(s);
 			sync_barrier(s);
-			sync_cut_point(s);
+
+			/*
+			 * A cut point, and the transaction that holds it, per table.
+			 * One transaction over the whole set would hold the source's
+			 * xmin back for as long as the slowest copy -- long enough,
+			 * measured, to stall another subscription's barrier -- and what
+			 * it buys is a snapshot consistent across the set, which is more
+			 * than the stream that follows preserves anyway.  The price is
+			 * that the streaming filter is per table (LrSyncCut): one
+			 * transaction can be inside one table's copy and not another's.
+			 */
 			foreach(lc, s->rels)
-				sync_copy_table(s, (LrSyncRel *) lfirst(lc));
-			PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
+			{
+				LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+				sync_cut_point(s);
+				r->lt = s->lt;
+				r->ds_text = s->ds_text;
+				sync_copy_table(s, r);
+				PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
+			}
 			sync_finish(s);
-			sync_apply_snapshot(cfg, s->ds_text, oldcxt);
+			sync_load_cuts(s, cfg, oldcxt);
 			did_sync = true;
 
 			elog(LOG, "mpp apply worker: subscription %u: initial synchronisation done: %d tables, L_t %s, DS_t xmax " INT64_FORMAT ", %d in progress",
@@ -1167,19 +1185,42 @@ sync_set_rel_state(LrSync *s, Oid relid, char state, const char *job)
 					  4, params));
 }
 
-/* everything -> 'r' with the cut point, in one transaction */
+/*
+ * Everything -> 'r', each table with its own cut point, in one transaction.
+ * The marker row keeps the earliest of them: it is what a restart reads for
+ * the half of the filter that is not per table -- the source segments' own
+ * snapshots, which the readers use to drop a local transaction outright, and
+ * dropping outright is only safe under the cut point that came first.
+ */
 static void
 sync_finish(LrSync *s)
 {
 	char		subid[16];
-	const char *params[3] = {subid, s->lt, s->ds_text};
+	char		relid[16];
+	ListCell   *lc;
+	const char *params[4] = {subid, relid, NULL, NULL};
 
 	snprintf(subid, sizeof(subid), "%u", s->cfg->subid);
 	PQclear(sync_exec(s, s->tgt2, "target", "BEGIN", 0, NULL));
+	foreach(lc, s->rels)
+	{
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+		snprintf(relid, sizeof(relid), "%u", r->relid);
+		params[2] = r->lt;
+		params[3] = r->ds_text;
+		PQclear(sync_exec(s, s->tgt2, "target",
+						  "UPDATE pg_catalog.gp_subscription_rel SET state = 'r', sync_lsn = $3::pg_lsn, "
+						  "sync_snapshot = $4, copy_job = NULL WHERE subid = $1 AND relid = $2",
+						  4, params));
+	}
+	snprintf(relid, sizeof(relid), "%d", LR_SYNC_MARKER_RELID);
+	params[2] = s->rels != NIL ? ((LrSyncRel *) linitial(s->rels))->lt : s->lt;
+	params[3] = s->rels != NIL ? ((LrSyncRel *) linitial(s->rels))->ds_text : s->ds_text;
 	PQclear(sync_exec(s, s->tgt2, "target",
-					  "UPDATE pg_catalog.gp_subscription_rel SET state = 'r', sync_lsn = $2::pg_lsn, "
-					  "sync_snapshot = $3, copy_job = NULL WHERE subid = $1",
-					  3, params));
+					  "UPDATE pg_catalog.gp_subscription_rel SET state = 'r', sync_lsn = $3::pg_lsn, "
+					  "sync_snapshot = $4, copy_job = NULL WHERE subid = $1 AND relid = $2",
+					  4, params));
 	sync_mark_untracked(s);
 	PQclear(sync_exec(s, s->tgt2, "target", "COMMIT", 0, NULL));
 }
@@ -1279,9 +1320,8 @@ sync_handle_slot_loss(LrSync *s)
 						  "DELETE FROM pg_catalog.gp_subscription_rel WHERE subid = $1", 1, params));
 		PQclear(sync_exec(s, s->tgt2, "target", "COMMIT", 0, NULL));
 	}
-	s->cfg->sync_ds_xmax = 0;
-	s->cfg->nsync_ds_inprogress = 0;
-	s->cfg->sync_ds_inprogress = NULL;
+	s->cfg->nsync_cuts = 0;
+	s->cfg->sync_cuts = NULL;
 	s->cfg->nsync_local = 0;
 	s->cfg->sync_local = NULL;
 	return true;
@@ -1378,6 +1418,7 @@ sync_cut_point(LrSync *s)
 	StringInfoData local;
 	char	   *ip;
 
+	s->ds_inprogress = NIL;		/* one cut point per table: start afresh */
 	PQclear(sync_exec(s, s->src, "source", "BEGIN ISOLATION LEVEL REPEATABLE READ", 0, NULL));
 
 	/*
@@ -1506,8 +1547,9 @@ sync_parse_local(const char *text, MemoryContext cxt, int *nlocal, char ***local
 	}
 }
 
+/* "xmax=<n>;inprogress=<a,b,..>" -> one table's cut point */
 static void
-sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
+sync_parse_ds(const char *text, LrSyncCut *cut, MemoryContext cxt)
 {
 	const char *p;
 	char	   *copy;
@@ -1518,15 +1560,7 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 
 	if ((p = strstr(text, "xmax=")) == NULL)
 		return;
-	cfg->sync_ds_xmax = strtoll(p + 5, NULL, 10);
-	cfg->nsync_ds_inprogress = 0;
-	cfg->sync_ds_inprogress = NULL;
-	cfg->nsync_local = 0;
-	cfg->sync_local = NULL;
-
-	/* the per-source-segment snapshots, for the readers' own dedup */
-	sync_parse_local(text, cxt, &cfg->nsync_local, &cfg->sync_local);
-
+	cut->ds_xmax = strtoll(p + 5, NULL, 10);
 	if ((copy = sync_field(text, "inprogress=")) == NULL)
 		return;
 	for (tok = copy; *tok; tok++)
@@ -1537,8 +1571,88 @@ sync_apply_snapshot(LrWorkerConfig *cfg, const char *text, MemoryContext cxt)
 	n = 0;
 	for (tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
 		arr[n++] = strtoll(tok, NULL, 10);
-	cfg->sync_ds_inprogress = arr;
-	cfg->nsync_ds_inprogress = n;
+	cut->ds_inprogress = arr;
+	cut->nds_inprogress = n;
+}
+
+/*
+ * The cut points as the streaming filter needs them: one per table, plus the
+ * earliest one's local half.
+ *
+ * The arrays outlive this synchronisation -- they are read for as long as the
+ * filter is live, which is well after LrInitialSync() has thrown its own
+ * context away -- so they go in cxt, the caller's, which is the one cfg
+ * itself was allocated in.
+ */
+static void
+sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt)
+{
+	PGresult   *res;
+	char		subid[16];
+	const char *params[1] = {subid};
+	int			n;
+
+	snprintf(subid, sizeof(subid), "%u", cfg->subid);
+	cfg->nsync_cuts = 0;
+	cfg->sync_cuts = NULL;
+	cfg->nsync_local = 0;
+	cfg->sync_local = NULL;
+
+	/*
+	 * Named as the readers name them -- nspname.relname, unquoted -- because
+	 * that is the name the filter has to match.
+	 */
+	res = sync_exec(s, s->tgt2, "target",
+					"SELECT n.nspname || '.' || c.relname, r.sync_snapshot\n"
+					"  FROM pg_catalog.gp_subscription_rel r\n"
+					"  JOIN pg_class c ON c.oid = r.relid\n"
+					"  JOIN pg_namespace n ON n.oid = c.relnamespace\n"
+					" WHERE r.subid = $1 AND r.relid <> 0"
+					"   AND r.sync_snapshot IS NOT NULL",
+					1, params);
+	n = PQntuples(res);
+	if (n > 0)
+	{
+		LrSyncCut  *cuts;
+
+		cuts = (LrSyncCut *) MemoryContextAllocZero(cxt, sizeof(LrSyncCut) * n);
+		for (int i = 0; i < n; i++)
+		{
+			char	  **local;
+			int			nlocal;
+
+			cuts[i].relname = MemoryContextStrdup(cxt, PQgetvalue(res, i, 0));
+			sync_parse_ds(PQgetvalue(res, i, 1), &cuts[i], cxt);
+
+			/* and this table's own local half, for transactions with no gxid */
+			sync_parse_local(PQgetvalue(res, i, 1), cxt, &nlocal, &local);
+			if (nlocal > 0)
+			{
+				cuts[i].local = (LrLocalSnap *)
+					MemoryContextAllocZero(cxt, sizeof(LrLocalSnap) * nlocal);
+				cuts[i].nlocal = nlocal;
+				for (int seg = 0; seg < nlocal; seg++)
+					LrParseLocalSnap(local[seg], &cuts[i].local[seg]);
+			}
+		}
+		cfg->sync_cuts = cuts;
+		cfg->nsync_cuts = n;
+	}
+	PQclear(res);
+
+	/*
+	 * The marker row carries the earliest cut point, and its local half is
+	 * what a reader drops a local transaction by -- outright, without asking
+	 * the coordinator, so it may only drop what every table's copy has.
+	 */
+	res = sync_exec(s, s->tgt2, "target",
+					"SELECT sync_snapshot FROM pg_catalog.gp_subscription_rel "
+					"WHERE subid = $1 AND relid = 0 AND sync_snapshot IS NOT NULL",
+					1, params);
+	if (PQntuples(res) == 1)
+		sync_parse_local(PQgetvalue(res, 0, 0), cxt,
+						 &cfg->nsync_local, &cfg->sync_local);
+	PQclear(res);
 }
 
 /* ------------------------------------------------------------------------

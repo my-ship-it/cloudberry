@@ -54,6 +54,8 @@ typedef struct LrSinkItem
 	int			segidx;
 	int64		pos;
 	uint64		gxid;			/* 0 = addressed by position alone */
+	int			nskip;			/* relations this transaction may not write */
+	Oid		   *skip;
 } LrSinkItem;
 
 static int
@@ -307,6 +309,8 @@ cbdb_sink_apply_unit(LogicalRepSink *self, const LogicalRepUnit *unit)
 			items[nitems].segidx = t->participant_segidx[p];
 			items[nitems].pos = (int64) t->participant_pos[p];
 			items[nitems].gxid = t->gxid;
+			items[nitems].nskip = t->nskip;
+			items[nitems].skip = t->skip;
 			nitems++;
 		}
 	}
@@ -318,12 +322,18 @@ cbdb_sink_apply_unit(LogicalRepSink *self, const LogicalRepUnit *unit)
 	{
 		if (txns.len > 1)
 			appendStringInfoChar(&txns, ',');
+		appendStringInfoChar(&txns, '"');
 		if (items[i].gxid != 0)
-			appendStringInfo(&txns, "\"%d:" UINT64_FORMAT "\"", items[i].segidx,
+			appendStringInfo(&txns, "%d:" UINT64_FORMAT, items[i].segidx,
 							 items[i].gxid);
 		else
-			appendStringInfo(&txns, "\"%d:L" INT64_FORMAT "\"", items[i].segidx,
+			appendStringInfo(&txns, "%d:L" INT64_FORMAT, items[i].segidx,
 							 items[i].pos);
+
+		/* ":<relid>.<relid>..." -- what this transaction alone must not write */
+		for (int k = 0; k < items[i].nskip; k++)
+			appendStringInfo(&txns, "%c%u", k ? '.' : ':', items[i].skip[k]);
+		appendStringInfoChar(&txns, '"');
 	}
 	appendStringInfoChar(&txns, '}');
 

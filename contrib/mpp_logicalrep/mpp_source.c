@@ -64,6 +64,8 @@ typedef struct LrApplyItem
 	struct LrReaderState *reader;	/* the stream that holds it */
 	int64		gxid;			/* 0 for a local transaction */
 	XLogRecPtr	local_lsn;
+	int			nskip;			/* relations this transaction may not write */
+	Oid		   *skip;
 } LrApplyItem;
 
 typedef struct LrKV
@@ -107,6 +109,7 @@ typedef struct LrSourceState
 	ListCell   *item_next;
 	LrReaderState *cur_reader;	/* the stream the open transaction is from */
 	LrTxn	   *cur_txn;
+	struct LrApplyItem *cur_item;	/* what the coordinator asked for it */
 	LrChangeCursor cur;
 	bool		cur_open;
 	LrRouter   *router;
@@ -190,6 +193,7 @@ lr_source_begin(CustomScanState *node, EState *estate, int eflags)
 	state->items = NIL;
 	state->item_next = NULL;
 	state->cur_txn = NULL;
+	state->cur_item = NULL;
 	state->cur_open = false;
 	state->router = NULL;
 	state->filter_relids = NULL;
@@ -850,6 +854,32 @@ apply_begin(LrSourceState *state)
 			item->local_lsn = parse_lsn(colon + 2);
 		else
 			item->gxid = strtoll(colon + 1, NULL, 10);
+
+		/*
+		 * ":<relid>.<relid>..." after the identity: relations whose copy
+		 * already holds this transaction's rows, for this transaction alone.
+		 */
+		{
+			char	   *skip = strchr(colon + 1, ':');
+
+			if (skip != NULL && skip[1] != '\0')
+			{
+				char	   *rest = skip + 1;
+				int			n = 1;
+
+				for (char *c = rest; *c; c++)
+					if (*c == '.')
+						n++;
+				item->skip = palloc(sizeof(Oid) * n);
+				for (char *c = rest; c != NULL && *c;)
+				{
+					char	   *dot = strchr(c, '.');
+
+					item->skip[item->nskip++] = (Oid) strtoul(c, NULL, 10);
+					c = dot ? dot + 1 : NULL;
+				}
+			}
+		}
 		state->items = lappend(state->items, item);
 	}
 	state->item_next = list_head(state->items);
@@ -883,6 +913,17 @@ apply_begin(LrSourceState *state)
 static bool
 source_emits_rel(LrSourceState *state, Oid relid)
 {
+	/*
+	 * What the open transaction alone may not write.  This is not the plan's
+	 * filter below but the coordinator's verdict on this one transaction:
+	 * whatever holds the relation has its rows already, which for two
+	 * transactions in the same unit can differ.
+	 */
+	if (state->cur_item != NULL)
+		for (int i = 0; i < state->cur_item->nskip; i++)
+			if (state->cur_item->skip[i] == relid)
+				return false;
+
 	for (int i = 0; i < state->nfilter; i++)
 		if (state->filter_relids[i] == relid)
 			return state->filter_only;
@@ -967,6 +1008,7 @@ apply_fill_queue(LrSourceState *state)
 			state->item_next = lnext(state->items, state->item_next);
 
 			st = state->cur_reader = item->reader;
+			state->cur_item = item;
 			if (item->gxid != 0)
 				state->cur_txn = LrReaderFindGxid(st, item->gxid);
 			else
