@@ -310,8 +310,7 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					distributed_commit_cb_wrapper(ctx, buf->origptr,
 												  parsed.distribXid,
 												  parsed.nparticipants,
-												  parsed.participants,
-												  parsed.participants_exact);
+												  parsed.participants);
 				break;
 			}
 		case XLOG_XACT_DISTRIBUTED_FORGET:
@@ -336,7 +335,7 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					SnapBuildCurrentState(builder) == SNAPBUILD_CONSISTENT &&
 					!SnapBuildXactNeedsSkip(builder, buf->origptr))
 					distributed_commit_cb_wrapper(ctx, buf->origptr, xlrec->gxid,
-												  1, &xlrec->seg, true);
+												  1, &xlrec->seg);
 				break;
 			}
 		case XLOG_XACT_ASSIGNMENT:

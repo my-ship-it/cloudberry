@@ -151,7 +151,7 @@ extern bool filter_prepare_cb_wrapper(LogicalDecodingContext *ctx,
 extern bool filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id);
 extern void distributed_commit_cb_wrapper(LogicalDecodingContext *ctx, XLogRecPtr lsn,
 										  DistributedTransactionId gxid, int nsegs,
-										  const int16 *segs, bool exact);
+										  const int16 *segs);
 extern void ResetLogicalStreamingState(void);
 extern void UpdateDecodingStats(LogicalDecodingContext *ctx);
 

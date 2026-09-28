@@ -102,8 +102,7 @@ typedef void (*LogicalDecodeDistributedCommitCB) (struct LogicalDecodingContext 
 												  XLogRecPtr lsn,
 												  DistributedTransactionId gxid,
 												  int nsegs,
-												  const int16 *segs,
-												  bool exact);
+												  const int16 *segs);
 
 /*
  * Filter changes by origin.

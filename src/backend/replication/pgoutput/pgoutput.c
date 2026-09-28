@@ -47,7 +47,7 @@ static void pgoutput_write_gxid(LogicalDecodingContext *ctx, TransactionId xid,
 								DistributedTransactionId gxid, XLogRecPtr lsn);
 static void pgoutput_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
 										DistributedTransactionId gxid, int nsegs,
-										const int16 *segs, bool exact);
+										const int16 *segs);
 static void pgoutput_commit_txn(LogicalDecodingContext *ctx,
 								ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
 static void pgoutput_change(LogicalDecodingContext *ctx,
@@ -705,16 +705,15 @@ pgoutput_write_gxid(LogicalDecodingContext *ctx, TransactionId xid,
 /*
  * Cloudberry: a distributed commit event of the coordinator's WAL, as a
  * non-transactional message "cbdb.dcommit" when asked to (cbdb_events).
- * Content: "gxid=<n> lsn=<n> segs=<a,b,...> exact=<0|1>", segs "*" when the
- * record does not list the participants and "-" when it says none wrote.
- * exact=1 means the list is the set of segments that actually wrote, so each
- * of them has the transaction in its own stream; exact=0 means it is the set
- * the transaction was dispatched to, some of which may never send it.
+ * Content: "gxid=<n> lsn=<n> segs=<a,b,...>", segs "*" when the record does
+ * not list the participants and "-" when it says none took part.  The list
+ * is the segments the transaction was dispatched to, and each of them
+ * announces it on its own stream whether it wrote anything or not.
  */
 static void
 pgoutput_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
 							DistributedTransactionId gxid, int nsegs,
-							const int16 *segs, bool exact)
+							const int16 *segs)
 {
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
 	StringInfoData buf;
@@ -731,7 +730,6 @@ pgoutput_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
 		appendStringInfoChar(&buf, '-');	/* known: no segment wrote */
 	for (int i = 0; i < nsegs; i++)
 		appendStringInfo(&buf, "%s%d", i ? "," : "", segs[i]);
-	appendStringInfo(&buf, " exact=%d", exact ? 1 : 0);
 
 	OutputPluginPrepareWrite(ctx, true);
 	logicalrep_write_message(ctx->out, InvalidTransactionId, lsn, false,

@@ -97,6 +97,13 @@ int			gp_lr_apply_max_retries = 10;
 #define LR_SYNC_STEP_MAX_MS		100
 #define LR_MAX_SEGS				4096
 
+/*
+ * How many times mpp_logicalrep.event_wait_ms a participant that has gone
+ * quiet without reporting is waited for before the transaction is applied
+ * without it.
+ */
+#define LR_EVENT_GRACE			10
+
 /* one source segment's view of a transaction with a gxid */
 typedef struct LrSegPart
 {
@@ -121,8 +128,6 @@ typedef struct LrGxidTxn
 	int64		event_lsn;		/* coordinator position of the event */
 	int			nsegs_expected; /* from the event; 0 = unknown */
 	int16	   *segs_expected;
-	bool		segs_exact;		/* the list is the set that wrote, so every
-								 * one of them will report the transaction */
 	bool		noop;			/* the event says no segment wrote anything */
 	TimestampTz first_wait;		/* when we first waited for it */
 	bool		in_batch;
@@ -255,7 +260,7 @@ static void driver_connect_source(LrDriver *d);
 static void driver_disconnect_source(LrDriver *d);
 static bool driver_pump_source(LrDriver *d, int timeout_ms);
 static void driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
-								const int16 *segs, bool exact);
+								const int16 *segs);
 static bool stream_applied_through(LrDriver *d, int64 lsn);
 static void driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs,
 						 int wait_ms);
@@ -1042,21 +1047,15 @@ driver_pump_source(LrDriver *d, int timeout_ms)
 							(void) flags;
 							if (strcmp(prefix, LR_DCOMMIT_PREFIX) == 0)
 							{
-								/* gxid=<n> lsn=<n> segs=<a,b,..|*|-> exact=<0|1> */
+								/* gxid=<n> lsn=<n> segs=<a,b,..|*|-> */
 								char	   *text = pnstrdup(content, sz);
 								int64		gxid = 0;
 								int16		segs[LR_MAX_SEGS];
 								int			nsegs = 0;
-								bool		exact = false;
 								char	   *p;
 
 								if ((p = strstr(text, "gxid=")) != NULL)
 									gxid = strtoll(p + 5, NULL, 10);
-								if ((p = strstr(text, "exact=")) != NULL)
-								{
-									exact = (p[6] == '1');
-									*p = '\0';	/* keep it out of the seg list */
-								}
 								if ((p = strstr(text, "segs=")) != NULL && p[5] == '-')
 									nsegs = -1;	/* known: no segment wrote */
 								else if (p != NULL && p[5] != '*')
@@ -1071,7 +1070,7 @@ driver_pump_source(LrDriver *d, int timeout_ms)
 								pfree(text);
 								if (gxid != 0)
 									driver_handle_event(d, gxid, (int64) lsn, nsegs,
-														segs, exact);
+														segs);
 							}
 						}
 						/* the coordinator's own catalog transactions: ignored */
@@ -1135,8 +1134,8 @@ driver_send_feedback(LrDriver *d)
  */
 
 static void
-driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs, const int16 *segs,
-					bool exact)
+driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
+					const int16 *segs)
 {
 	LrGxidTxn  *t;
 	MemoryContext oldcxt;
@@ -1165,7 +1164,6 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs, const int16 *
 	{
 		oldcxt = MemoryContextSwitchTo(d->cxt);
 		t->nsegs_expected = nsegs;
-		t->segs_exact = exact;
 		t->segs_expected = palloc(sizeof(int16) * nsegs);
 		memcpy(t->segs_expected, segs, sizeof(int16) * nsegs);
 		MemoryContextSwitchTo(oldcxt);
@@ -1484,16 +1482,18 @@ seg_moved_past(LrDriver *d, LrGxidTxn *t, int seg)
 /*
  * Is the transaction ready on every participant?
  *
- * The participant list of an exact event (S4b) names the segments that
- * wrote, and each of them does send the transaction, so a participant that
- * has not reported yet is simply behind: wait for it rather than apply half
- * the transaction -- unless its stream is proven to be past it
- * (seg_moved_past), or the wait has become so long that progress matters
- * more than completeness, which is then warned about.
+ * The event names the segments the transaction was dispatched to, and every
+ * one of them announces it on its own stream whether it wrote anything or
+ * not, so a participant that has not reported is behind rather than silent:
+ * wait for it, rather than apply half a transaction.  Without any list we
+ * wait for every segment.
  *
- * A list that is not exact is the set of segments the transaction was
- * dispatched to; those that wrote nothing never report, so there the short
- * grace period decides.  Without any list we wait for every segment.
+ * Two things end the wait short of that.  A stream proven to be past it
+ * (seg_moved_past) will not carry it, which is what a transaction older than
+ * that segment's slot looks like.  And a grace period, for anything else,
+ * which is warned about: it is what is left of the guesswork this used to be
+ * made of, and the cut point ought to account for the one case that reaches
+ * it (a transaction below it is in the initial copy already).
  */
 static bool
 txn_complete(LrDriver *d, LrGxidTxn *t)
@@ -1504,7 +1504,7 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 		return false;
 
 	late = TimestampDifferenceExceeds(t->first_wait, GetCurrentTimestamp(),
-									  (t->segs_exact ? 10 : 1) * gp_lr_event_wait_ms);
+									  LR_EVENT_GRACE * gp_lr_event_wait_ms);
 
 	/* without a participant list, every SOURCE segment has to report */
 	if (t->nsegs_expected <= 0)
@@ -1516,8 +1516,8 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 
 		if (seg < 0 || seg >= d->nsrcsegs || t->parts[seg].ready)
 			continue;
-		if (t->segs_exact && seg_moved_past(d, t, seg))
-			continue;			/* that stream is past it: it wrote nothing we replicate */
+		if (seg_moved_past(d, t, seg))
+			continue;			/* that stream is past it: it will not carry it */
 
 		/*
 		 * That reader is in the middle of something.  The grace period below
@@ -1529,19 +1529,12 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 		 * from the moment the reader goes quiet rather than from when we
 		 * first asked.
 		 *
-		 * Which reader is in the middle of what matters.  That it holds this
-		 * transaction open is proof it is coming, whatever the list is worth.
-		 * That it is merely busy is not proof of anything by itself -- but
-		 * with an exact list this segment did write the transaction, so its
-		 * only reasons not to report it are that it has not got there yet
-		 * (busy) or that what it wrote decodes to nothing (seg_moved_past
-		 * above, and the grace period once it goes quiet).  With a list of
-		 * the segments the transaction was dispatched to, a segment may
-		 * simply have nothing to send, and a busy neighbour must not hold
-		 * everything else up for it.
+		 * Either kind of evidence will do.  That it holds this transaction
+		 * open is proof it is coming; that it is merely busy is proof it has
+		 * not reached whatever comes after what it is reading, and this
+		 * segment did take part, so it is coming too.
 		 */
-		if (t->parts[seg].open ||
-			(t->segs_exact && d->seg_open[seg] > 0))
+		if (t->parts[seg].open || d->seg_open[seg] > 0)
 		{
 			t->first_wait = GetCurrentTimestamp();
 			return false;
@@ -1553,7 +1546,7 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 			t->warned = true;
 			ereport(WARNING,
 					(errmsg("mpp apply worker: gxid " INT64_FORMAT " applied without segment %d, which has not reported it after %d ms (%d of %d participants reported)",
-							t->gxid, seg, (t->segs_exact ? 10 : 1) * gp_lr_event_wait_ms,
+							t->gxid, seg, LR_EVENT_GRACE * gp_lr_event_wait_ms,
 							t->nready, t->nsegs_expected),
 					 t->nready == 0 ?
 					 errdetail("No segment reported it, so it is taken to have written nothing this subscription replicates and is skipped entirely.") : 0,

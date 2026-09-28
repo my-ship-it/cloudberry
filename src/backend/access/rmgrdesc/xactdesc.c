@@ -163,8 +163,6 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 		/* the record lists the participants; none at all = -1 (0 = unknown) */
 		parsed->nparticipants = xl_segs->nsegs > 0 ? xl_segs->nsegs : -1;
 		parsed->participants = xl_segs->segs;
-		parsed->participants_exact =
-			(parsed->xinfo & XACT_XINFO_DISTRIB_SEGS_EXACT) != 0;
 		data += MinSizeOfXactDistribSegs + xl_segs->nsegs * sizeof(int16);
 	}
 }
@@ -462,7 +460,7 @@ xact_desc_distributed_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, 
 	appendStringInfo(buf, " gxid = "UINT64_FORMAT, parsed.distribXid);
 	if (parsed.nparticipants > 0)
 	{
-		appendStringInfo(buf, " segs%s = {", parsed.participants_exact ? "" : "(max)");
+		appendStringInfoString(buf, " segs = {");
 		for (int i = 0; i < parsed.nparticipants; i++)
 			appendStringInfo(buf, "%s%d", i ? "," : "", parsed.participants[i]);
 		appendStringInfoChar(buf, '}');

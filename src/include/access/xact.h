@@ -212,7 +212,6 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_DISTRIB			(1U << 9)
 #define XACT_XINFO_HAS_DELDBS			(1U << 10)
 #define XACT_XINFO_HAS_DISTRIB_SEGS		(1U << 11)	/* participating segments follow xl_xact_distrib */
-#define XACT_XINFO_DISTRIB_SEGS_EXACT	(1U << 12)	/* that list is the segments that wrote, not the ones dispatched to */
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
  * need to occur when emulating transaction effects during recovery.
@@ -477,11 +476,10 @@ typedef struct xl_xact_parsed_commit
 	TimestampTz origin_timestamp;
 
 	DistributedTransactionId        distribXid;
-	int			nparticipants;	/* XACT_XINFO_HAS_DISTRIB_SEGS; 0 = unknown, -1 = none wrote */
+	int			nparticipants;	/* XACT_XINFO_HAS_DISTRIB_SEGS: the segments
+								 * the transaction was dispatched to;
+								 * 0 = the record does not say */
 	int16	   *participants;
-	bool		participants_exact; /* XACT_XINFO_DISTRIB_SEGS_EXACT: every
-									 * listed segment wrote, so each of them
-									 * has the transaction in its stream */
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;

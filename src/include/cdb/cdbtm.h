@@ -257,8 +257,6 @@ typedef struct TMGXACTLOCAL
 	 * reported; goes into the distributed commit record for logical decoding
 	 * (mpp apply needs to wait for exactly the writing segments).
 	 */
-	bool						dtxWriteSegmentsKnown;
-	List						*dtxWriteSegments;
 }	TMGXACTLOCAL;
 
 typedef struct TMGXACTSTATUS
@@ -325,7 +323,6 @@ extern void resetTmGxact(void);
 
 /* mpp logical replication apply: coordinator marker of one-phase commits */
 extern bool gp_lr_onephase_marker;
-extern bool DtxPrepareWrote(void);
 extern void	prepareDtxTransaction(void);
 extern bool isPreparedDtxTransaction(void);
 extern bool notifyCommittedDtxTransactionIsNeeded(void);

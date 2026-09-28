@@ -7111,18 +7111,17 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_distrib.distrib_xid = distrib_xid;
 
 		/*
-		 * The coordinator's distributed commit also lists the participating
-		 * segments, for logical decoding of the coordinator's WAL: the
-		 * segments that reported writes at PREPARE when every prepared
-		 * segment reported (possibly none), else the segments the transaction
-		 * was dispatched to.
+		 * The coordinator's distributed commit also lists the segments the
+		 * transaction was dispatched to, for logical decoding of the
+		 * coordinator's WAL.  Those are the ones that prepared, and every
+		 * one of them announces the transaction on its own stream whether it
+		 * wrote anything or not, so the list is exactly the set a consumer
+		 * has to wait for.
 		 */
 		if (isDtxPrepared && MyTmGxactLocal != NULL &&
-			(MyTmGxactLocal->dtxWriteSegmentsKnown ||
-			 MyTmGxactLocal->dtxSegments != NIL))
+			MyTmGxactLocal->dtxSegments != NIL)
 		{
-			List	   *segs = MyTmGxactLocal->dtxWriteSegmentsKnown ?
-				MyTmGxactLocal->dtxWriteSegments : MyTmGxactLocal->dtxSegments;
+			List	   *segs = MyTmGxactLocal->dtxSegments;
 			int			n = list_length(segs);
 			ListCell   *lc;
 			int			i = 0;
@@ -7132,8 +7131,6 @@ XactLogCommitRecord(TimestampTz commit_time,
 			foreach(lc, segs)
 				xl_segs->segs[i++] = (int16) lfirst_int(lc);
 			xl_xinfo.xinfo |= XACT_XINFO_HAS_DISTRIB_SEGS;
-			if (MyTmGxactLocal->dtxWriteSegmentsKnown)
-				xl_xinfo.xinfo |= XACT_XINFO_DISTRIB_SEGS_EXACT;
 		}
 	}
 

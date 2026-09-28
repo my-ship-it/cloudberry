@@ -1234,7 +1234,7 @@ filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id)
 void
 distributed_commit_cb_wrapper(LogicalDecodingContext *ctx, XLogRecPtr lsn,
 							  DistributedTransactionId gxid, int nsegs,
-							  const int16 *segs, bool exact)
+							  const int16 *segs)
 {
 	LogicalErrorCallbackState state;
 	ErrorContextCallback errcallback;
@@ -1257,7 +1257,7 @@ distributed_commit_cb_wrapper(LogicalDecodingContext *ctx, XLogRecPtr lsn,
 	ctx->write_location = lsn;
 	ctx->end_xact = false;
 
-	ctx->callbacks.distributed_commit_cb(ctx, lsn, gxid, nsegs, segs, exact);
+	ctx->callbacks.distributed_commit_cb(ctx, lsn, gxid, nsegs, segs);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
