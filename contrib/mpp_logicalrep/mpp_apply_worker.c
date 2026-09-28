@@ -1209,6 +1209,19 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
  */
 
 /* the cut point that governs this relation, or NULL when none does */
+/*
+ * The earliest cut point of the lot, which the marker row carries.  Coverage
+ * is monotone in cut-point order, so what it covers every table's copy has.
+ */
+static const LrSyncCut *
+sync_cut_any(LrDriver *d)
+{
+	for (int i = 0; i < d->cfg->nsync_cuts; i++)
+		if (d->cfg->sync_cuts[i].relname == NULL)
+			return &d->cfg->sync_cuts[i];
+	return NULL;
+}
+
 static const LrSyncCut *
 sync_cut_for(LrDriver *d, const char *relname)
 {
@@ -1373,6 +1386,31 @@ driver_collect_ready(LrDriver *d)
 			if (t->event_lsn > d->coord_committed)
 				d->coord_committed = t->event_lsn;
 			d->stats->events_noop++;
+			registry_remove(d, t);
+			MemoryContextSwitchTo(d->batchcxt);
+			continue;
+		}
+		/*
+		 * Already in the initial copy, whatever it touched.  Asked before
+		 * anyone is waited for, because this is the one kind of transaction
+		 * waiting cannot settle: one from before the cut point may have
+		 * parts on segments whose streams begin after it, and those parts
+		 * are never coming.  The earliest cut point is enough to say so for
+		 * every table, so which tables it touched -- which only a segment
+		 * that reported could tell us -- does not have to be known.
+		 */
+		if (cut_covers(sync_cut_any(d), t->gxid))
+		{
+			MemoryContextSwitchTo(d->cxt);
+			if (t->event_lsn > d->coord_committed)
+				d->coord_committed = t->event_lsn;
+			{
+				int64	   *g = palloc(sizeof(int64));
+
+				*g = t->gxid;
+				d->release_gxids = lappend(d->release_gxids, g);
+			}
+			d->stats->events_deduped++;
 			registry_remove(d, t);
 			MemoryContextSwitchTo(d->batchcxt);
 			continue;
