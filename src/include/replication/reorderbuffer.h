@@ -636,15 +636,15 @@ struct ReorderBuffer
 	bool		output_rewrites;
 
 	/*
-	 * Cloudberry: announce a prepared transaction even when nothing was
-	 * decoded for it (pgoutput's cbdb_gxid option).  On a segment every
-	 * prepared transaction is a distributed one -- PrepareTransaction()
-	 * assigns an xid to each, so even a participant that wrote nothing
-	 * leaves a PREPARE record, and its gid is the gxid.  A consumer that
-	 * waits for every participant of a distributed transaction needs to
-	 * hear from those too; without this they are the one kind of
-	 * participant that never reports, and telling them apart from a
-	 * participant that is merely slow is not possible.
+	 * Cloudberry: give a prepared transaction a base snapshot even when
+	 * nothing was decoded for it (pgoutput's cbdb_gxid option), so that it
+	 * is replayed and announced like any other.  On a segment every prepared
+	 * transaction is a distributed one -- PrepareTransaction() assigns an
+	 * xid to each, so even a participant that wrote nothing leaves a PREPARE
+	 * record, and its gid is the gxid.  A consumer that waits for every
+	 * participant of a distributed transaction needs to hear from those too;
+	 * without this they are the one kind of participant that never reports,
+	 * and telling them apart from one that is merely slow is not possible.
 	 */
 	bool		announce_empty_prepared;
 
@@ -757,8 +757,6 @@ extern void ReorderBufferSetDistributedXid(ReorderBuffer *rb, TransactionId xid,
 extern bool ReorderBufferXidHasCatalogChanges(ReorderBuffer *rb, TransactionId xid);
 extern bool ReorderBufferXidHasBaseSnapshot(ReorderBuffer *rb, TransactionId xid);
 
-extern void ReorderBufferEnsureTXN(ReorderBuffer *rb, TransactionId xid,
-								   XLogRecPtr lsn);
 extern bool ReorderBufferRememberPrepareInfo(ReorderBuffer *rb, TransactionId xid,
 											 XLogRecPtr prepare_lsn, XLogRecPtr end_lsn,
 											 TimestampTz prepare_time,

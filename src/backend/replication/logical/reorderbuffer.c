@@ -2723,23 +2723,6 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 }
 
 /*
- * Cloudberry: make sure there is a transaction for xid.
- *
- * A distributed transaction's participant that wrote nothing the decoder
- * sees leaves no trace in the reorder buffer at all -- no change queued, so
- * no ReorderBufferTXN -- and its PREPARE would be passed over before any
- * callback is reached.  It still prepared, and its gid names the distributed
- * transaction a consumer is waiting on every participant of, so give it the
- * transaction it never made for itself.  Existing ones are returned
- * unchanged.
- */
-void
-ReorderBufferEnsureTXN(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn)
-{
-	(void) ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
-}
-
-/*
  * Record the prepare information for a transaction.
  */
 bool
@@ -2810,22 +2793,6 @@ ReorderBufferPrepare(ReorderBuffer *rb, TransactionId xid,
 
 	ReorderBufferReplay(txn, rb, xid, txn->final_lsn, txn->end_lsn,
 						txn->xact_time.prepare_time, txn->origin_id, txn->origin_lsn);
-
-	/*
-	 * Cloudberry: nothing was decoded for it, so ReorderBufferReplay() above
-	 * returned without calling anything, and the transaction would go by
-	 * unmentioned.  A consumer that waits for every participant of a
-	 * distributed transaction has to be told about this one as well -- see
-	 * announce_empty_prepared.  The callbacks are called directly, as the
-	 * concurrent_abort case below already does: with no changes to replay
-	 * there is no snapshot to set up and nothing to iterate.
-	 */
-	if (rb->announce_empty_prepared && txn->base_snapshot == NULL &&
-		!rbtxn_is_streamed(txn) && !txn->concurrent_abort)
-	{
-		rb->begin_prepare(rb, txn);
-		rb->prepare(rb, txn, txn->final_lsn);
-	}
 
 	/*
 	 * We send the prepare for the concurrently aborted xacts so that later

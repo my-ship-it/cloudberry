@@ -854,17 +854,22 @@ DecodePrepare(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 
 	/*
 	 * Cloudberry: a participant of a distributed transaction that wrote
-	 * nothing this slot decodes has no transaction here to remember the
-	 * prepare info in, and would go by in silence.  Give it one, so that the
-	 * rest of this runs as it does for any other prepare and the consumer
-	 * hears from every participant.  The checks this duplicates are the ones
-	 * below, done first because a transaction of another database or one
-	 * from before the snapshot is consistent is not ours to create.
+	 * nothing this slot decodes has no transaction here at all -- nothing
+	 * was queued under its xid, so nothing ever asked for a snapshot for it
+	 * -- and the rest of this would pass it over in silence.  Ask for one
+	 * now, which is what a change would have done, and everything below
+	 * treats it as it treats a participant that wrote: replayed at its
+	 * prepare and announced under the gid that names the distributed
+	 * transaction a consumer is waiting on every participant of.
+	 *
+	 * The checks are the ones below, done first because a transaction of
+	 * another database, or one from before this slot could decode, is not
+	 * ours to take an interest in.
 	 */
 	if (ctx->reorder->announce_empty_prepared &&
 		SnapBuildCurrentState(builder) == SNAPBUILD_CONSISTENT &&
 		!DecodeTXNNeedSkip(ctx, buf, parsed->dbId, origin_id))
-		ReorderBufferEnsureTXN(ctx->reorder, xid, buf->origptr);
+		(void) SnapBuildProcessChange(builder, xid, buf->origptr);
 
 	/*
 	 * Remember the prepare info for a txn so that it can be used later in
