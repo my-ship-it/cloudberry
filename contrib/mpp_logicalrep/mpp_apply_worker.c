@@ -99,17 +99,19 @@ int			gp_lr_apply_max_retries = 10;
 
 /*
  * How many times mpp_logicalrep.event_wait_ms a participant that has gone
- * quiet without reporting is waited for before the transaction is applied
- * without it.
+ * quiet without reporting is waited for before saying so.  It is a warning
+ * and nothing else: the wait itself does not end.
  */
-#define LR_EVENT_GRACE			10
+#define LR_EVENT_QUIET			10
 
 /* one source segment's view of a transaction with a gxid */
 typedef struct LrSegPart
 {
 	bool		ready;
 	bool		open;			/* the reader has begun it and not finished
-								 * it: it is on the wire (LR_REPORT_OPEN) */
+								 * it: it is on the wire (LR_REPORT_OPEN).
+								 * Diagnostic only, so that a wait can say
+								 * whether what it waits for is arriving */
 	int64		seg_lsn;
 	int64		nrows;
 	int64		nbytes;
@@ -131,7 +133,7 @@ typedef struct LrGxidTxn
 	bool		noop;			/* the event says no segment wrote anything */
 	TimestampTz first_wait;		/* when we first waited for it */
 	bool		in_batch;
-	bool		warned;			/* "still incomplete" warning issued */
+	bool		warned;			/* "still waiting" warning issued */
 } LrGxidTxn;
 
 /*
@@ -1142,6 +1144,26 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 
 	d->stats->events++;
 
+	/*
+	 * An event already dealt with, coming round again.  The coordinator's
+	 * stream is re-read from the last position written down, and that is
+	 * only written down when a batch commits, so everything between the two
+	 * arrives twice.
+	 *
+	 * The second time there is nothing left to recognise it by: the readers
+	 * have moved past its segment parts, so the reader that would report it
+	 * cannot send it again and the record of having applied it has been
+	 * trimmed along with the positions it was kept against.  Waiting for it
+	 * would never end.  The coordinator position dealt with is what answers
+	 * it, and it answers it before anything is registered: events arrive in
+	 * position order, so one at or below that mark has been seen before.
+	 */
+	if (lsn != 0 && lsn <= d->coord_committed)
+	{
+		d->stats->events_deduped++;
+		return;
+	}
+
 	t = registry_get(d, gxid, true);
 	if (t->in_batch)
 		return;					/* a replayed event of a batched transaction */
@@ -1172,12 +1194,11 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 		t->first_wait = GetCurrentTimestamp();
 
 	/*
-	 * ② ask the readers.  A writing participant has already COMMIT PREPARED
-	 * before the coordinator wrote this event, so its PREPARE is decodable
-	 * now; a short wait catches it.  A participant that wrote nothing never
-	 * sends the transaction at all (an empty prepared transaction leaves no
-	 * segment stream), so we must not block for it: completion is decided by
-	 * txn_complete() with a grace period, not by waiting here.
+	 * ② ask the readers.  A participant has already COMMIT PREPARED before
+	 * the coordinator wrote this event, so its PREPARE is decodable now; a
+	 * short wait catches it.  Only a short one, though: completion is
+	 * decided by txn_complete() on later drains as well, so blocking the
+	 * whole driver here buys nothing.
 	 */
 	driver_drain(d, gxid, nsegs, segs, Min(gp_lr_event_wait_ms, 500));
 
@@ -1199,8 +1220,8 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
  * Move every transaction that has its event and is ready on all its
  * participants into the batch, in event order.  Earlier events whose
  * segments were slow become complete on later drains; they are picked up
- * here.  One whose segments never report it stays registered and is warned
- * about once (it predates the segment slots, or a segment is far behind).
+ * here.  One whose segments never report it stays registered -- it is never
+ * applied without them -- and says so once it has been quiet for a while.
  */
 /*
  * Initial-sync filter.  Each table's COPY has its own cut point, so what a
@@ -1489,64 +1510,37 @@ driver_collect_ready(LrDriver *d)
 }
 
 /*
- * Has this segment's stream already moved past where the transaction would
- * be?  A later transaction (later in the coordinator's commit order) that
- * the same segment has reported proves it: segment streams arrive in commit
- * order, so anything the transaction wrote there would have come first.
- * That is how a transaction whose segment part predates the segment slot --
- * the transaction that created the slots, say -- is recognised instead of
- * waited for forever.
- */
-static bool
-seg_moved_past(LrDriver *d, LrGxidTxn *t, int seg)
-{
-	HASH_SEQ_STATUS seq;
-	LrGxidTxn  *u;
-
-	hash_seq_init(&seq, d->gxids);
-	while ((u = (LrGxidTxn *) hash_seq_search(&seq)) != NULL)
-	{
-		if (u == t || !u->has_event || u->event_lsn <= t->event_lsn)
-			continue;
-		if (u->parts[seg].ready)
-		{
-			hash_seq_term(&seq);
-			return true;
-		}
-	}
-	return false;
-}
-
-/*
  * Is the transaction ready on every participant?
  *
  * The event names the segments the transaction was dispatched to, and every
  * one of them announces it on its own stream whether it wrote anything or
- * not, so a participant that has not reported is behind rather than silent:
- * wait for it, rather than apply half a transaction.  Without any list we
- * wait for every segment.
+ * not, so a participant that has not reported is behind rather than silent.
+ * The wait is therefore unconditional: half a transaction is never applied,
+ * and nothing is ever guessed about a segment that has not spoken.  Without
+ * any list we wait for every segment.
  *
- * Two things end the wait short of that.  A stream proven to be past it
- * (seg_moved_past) will not carry it, which is what a transaction older than
- * that segment's slot looks like.  And a grace period, for anything else,
- * which is warned about: it is what is left of the guesswork this used to be
- * made of, and the cut point ought to account for the one case that reaches
- * it (a transaction below it is in the initial copy already).
+ * There used to be a grace period here, for the one case where waiting would
+ * never end: a segment whose part of the transaction lies before that
+ * segment's own slot, which its reader will never see.  That case is now
+ * decided rather than guessed at.  Such a transaction was in flight when the
+ * slots were made, the S2 barrier waits for every one of those to finish
+ * before the cut point is taken, so the cut point covers it -- its rows are
+ * in the initial copy -- and driver_collect_ready() drops it on that
+ * evidence before it ever gets here.  Every subscription has a cut point,
+ * copy_data = false included.
+ *
+ * So a wait that does not end means something is wrong rather than merely
+ * slow, and the warning below says so without acting on it.
  */
 static bool
 txn_complete(LrDriver *d, LrGxidTxn *t)
 {
-	bool		late;
-
 	if (!t->has_event)
 		return false;
 
-	late = TimestampDifferenceExceeds(t->first_wait, GetCurrentTimestamp(),
-									  LR_EVENT_GRACE * gp_lr_event_wait_ms);
-
 	/* without a participant list, every SOURCE segment has to report */
 	if (t->nsegs_expected <= 0)
-		return t->nready == d->nsrcsegs || (t->nready > 0 && late);
+		return t->nready == d->nsrcsegs;
 
 	for (int i = 0; i < t->nsegs_expected; i++)
 	{
@@ -1554,43 +1548,28 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 
 		if (seg < 0 || seg >= d->nsrcsegs || t->parts[seg].ready)
 			continue;
-		if (seg_moved_past(d, t, seg))
-			continue;			/* that stream is past it: it will not carry it */
 
 		/*
-		 * That reader is in the middle of something.  The grace period below
-		 * exists for a segment that will never report the transaction, and a
-		 * segment that is still reading is exactly where that guess goes
-		 * wrong: a large transaction takes far longer to stream than any
-		 * period we could sensibly pick, and giving up on it discards every
-		 * row it wrote, silently.  So wait, and measure the grace period
-		 * from the moment the reader goes quiet rather than from when we
-		 * first asked.
-		 *
-		 * Either kind of evidence will do.  That it holds this transaction
-		 * open is proof it is coming; that it is merely busy is proof it has
-		 * not reached whatever comes after what it is reading, and this
-		 * segment did take part, so it is coming too.
+		 * Say so once, when the segment has been quiet for long enough that
+		 * this is worth someone's attention -- a reader in the middle of
+		 * something is not quiet, however long it takes, and a large
+		 * transaction takes as long as it takes.
 		 */
 		if (t->parts[seg].open || d->seg_open[seg] > 0)
-		{
 			t->first_wait = GetCurrentTimestamp();
-			return false;
-		}
-		if (!late)
-			return false;
-		if (!t->warned)
+		else if (!t->warned &&
+				 TimestampDifferenceExceeds(t->first_wait, GetCurrentTimestamp(),
+											LR_EVENT_QUIET * gp_lr_event_wait_ms))
 		{
 			t->warned = true;
 			ereport(WARNING,
-					(errmsg("mpp apply worker: gxid " INT64_FORMAT " applied without segment %d, which has not reported it after %d ms (%d of %d participants reported)",
-							t->gxid, seg, LR_EVENT_GRACE * gp_lr_event_wait_ms,
+					(errmsg("mpp apply worker: still waiting for segment %d to report gxid " INT64_FORMAT ", quiet for %d ms (%d of %d participants reported)",
+							seg, t->gxid, LR_EVENT_QUIET * gp_lr_event_wait_ms,
 							t->nready, t->nsegs_expected),
-					 t->nready == 0 ?
-					 errdetail("No segment reported it, so it is taken to have written nothing this subscription replicates and is skipped entirely.") : 0,
-					 t->nready == 0 ?
-					 errhint("If the transaction did write replicated rows, they are now missing on the target. Raise \"mpp_logicalrep.event_wait_ms\".") : 0));
+					 errdetail("The transaction was dispatched to that segment, so its reader owes an announcement whether the segment wrote anything or not. Nothing after it can be applied until it arrives."),
+					 errhint("Check that the segment's reader is connected and that its replication slot is still valid.")));
 		}
+		return false;
 	}
 	return true;
 }

@@ -1,27 +1,26 @@
--- A transaction whose segment parts take longer to arrive than the grace
--- period the coordinator waits out.
+-- A transaction whose segment parts take far longer to arrive than any wait
+-- the coordinator would be willing to sit out.
 --
 -- The coordinator learns a distributed transaction committed from its own
--- stream, then waits for the segments that wrote it to deliver their parts.
--- A segment that wrote nothing this subscription replicates never delivers
--- anything at all, so the wait cannot be unconditional: it ends after
--- mpp_logicalrep.event_wait_ms and the transaction is applied with whatever
--- arrived -- with nothing at all, if nobody reported it, in which case it is
--- skipped as having written nothing.
+-- stream and then waits for the segments it was dispatched to.  The wait is
+-- unconditional: every one of them announces the transaction on its own
+-- stream whether it wrote anything this subscription replicates or not, so
+-- a participant that has not reported is behind rather than silent.
 --
--- That guess is wrong for exactly one case, and it is the expensive one: a
--- segment still sending the transaction.  A large transaction takes far
--- longer to stream than any period that would be sensible to wait by
--- default, so giving up on it discards every row it wrote, silently.  The
--- readers therefore say what they are in the middle of, and a segment that
--- is still reading is never given up on.
+-- It was not always: the wait used to end after a grace period, on the
+-- guess that a segment which had said nothing for long enough had nothing
+-- to say.  The guess is wrong for exactly one case, and it is the expensive
+-- one -- a segment still sending the transaction.  A large transaction
+-- takes far longer to stream than any period that would be sensible to wait
+-- by default, so giving up on it discarded every row it wrote, silently.
 --
--- The grace period is turned down to a second here so that a transaction
--- that takes a few seconds to arrive is enough to reach past it.
+-- mpp_logicalrep.event_wait_ms is turned down to a tenth of a second here,
+-- so that a transaction taking seconds to arrive is orders of magnitude
+-- past what any such period would have been.
 --
 --   1  the initial copy
---   2  one transaction far too large to arrive within the grace period
---      lands whole, not partly and not at all
+--   2  one transaction far too large to arrive quickly lands whole, not
+--      partly and not at all
 --   3  the stream keeps going afterwards
 
 CREATE DATABASE mpp_lr_sa;
