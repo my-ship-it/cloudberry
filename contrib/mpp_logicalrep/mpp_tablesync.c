@@ -26,9 +26,16 @@
  *
  * State lives in the target's gp_subscription_rel:
  *   relid = 0 is the subscription-level marker: 'd' while a sync is in
- *   progress, 'r' when the streaming phase may run (sync_snapshot holds
- *   DS_t for restarts).  copy_data=false at CREATE SUBSCRIPTION writes the
- *   marker as 'r' at once, so no COPY ever happens.
+ *   progress, 'n' while one that will not copy is, 'r' when the streaming
+ *   phase may run (sync_snapshot holds DS_t for restarts).
+ *   copy_data=false at CREATE SUBSCRIPTION writes the marker as 'n': S1 to
+ *   S3 run as always and only S4 is skipped, because what makes the stream
+ *   safe to start from is the barrier and the cut point, not the copy.  A
+ *   slot begins at a position of its own on each source node, so without
+ *   the barrier a distributed transaction in flight when the slots were
+ *   made is in some segments' streams and not others', and applying the
+ *   half that is there writes part of a transaction; the cut point is what
+ *   the driver then drops it by.
  *   relid > 0 rows track each table: i -> d -> f -> r.  A table the source
  *   cannot decode (anything but heap) ends at 's' instead of 'r' when the
  *   subscription asked for unsupported_tables = 'snapshot': copied once, and
@@ -236,11 +243,13 @@ static void sync_connect(LrSync *s);
 static void sync_disconnect(LrSync *s);
 static char sync_marker_state(LrSync *s, char **snapshot);
 static void sync_fetch_tables(LrSync *s);
-static void sync_write_states(LrSync *s, char rel_state, bool truncate);
+static void sync_write_states(LrSync *s, char marker_state, char rel_state,
+							  bool truncate);
 static void sync_ensure_slots(LrSync *s);
 static void sync_barrier(LrSync *s);
 static void sync_cut_point(LrSync *s);
 static void sync_copy_all(LrSync *s);
+static void sync_cut_only(LrSync *s);
 static void copy_begin(LrSync *s, LrSyncRel *r);
 static bool copy_ports_ready(LrSync *s, LrSyncRel *r);
 static void copy_send(LrSync *s, LrSyncRel *r);
@@ -285,6 +294,7 @@ LrInitialSync(LrWorkerConfig *cfg)
 	char		marker;
 	char	   *snapshot = NULL;
 	bool		did_sync = false;
+	bool		nocopy;
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "LrSync", ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
@@ -297,6 +307,7 @@ LrInitialSync(LrWorkerConfig *cfg)
 		sync_connect(s);
 
 		marker = sync_marker_state(s, &snapshot);
+		nocopy = (marker == 'n');
 
 		/*
 		 * Before streaming, make sure the slots we are about to stream from
@@ -330,13 +341,14 @@ LrInitialSync(LrWorkerConfig *cfg)
 		}
 		else
 		{
-			bool		restart = (marker != '\0');
+			bool		restart = (marker != '\0' && !nocopy);
 
-			elog(LOG, "mpp apply worker: subscription %u: %sinitial synchronisation",
-				 cfg->subid, restart ? "redoing the interrupted " : "");
+			elog(LOG, "mpp apply worker: subscription %u: %sinitial synchronisation%s",
+				 cfg->subid, restart ? "redoing the interrupted " : "",
+				 nocopy ? " without copying" : "");
 
 			sync_fetch_tables(s);
-			sync_write_states(s, 'i', restart);
+			sync_write_states(s, nocopy ? 'n' : 'd', 'i', restart);
 			sync_ensure_slots(s);
 			sync_barrier(s);
 
@@ -350,14 +362,17 @@ LrInitialSync(LrWorkerConfig *cfg)
 			 * that the streaming filter is per table (LrSyncCut): one
 			 * transaction can be inside one table's copy and not another's.
 			 */
-			sync_copy_all(s);
+			if (nocopy)
+				sync_cut_only(s);
+			else
+				sync_copy_all(s);
 			sync_finish(s);
 			sync_load_cuts(s, cfg, oldcxt);
 			did_sync = true;
 
-			elog(LOG, "mpp apply worker: subscription %u: initial synchronisation done: %d tables, L_t %s, DS_t xmax " INT64_FORMAT ", %d in progress",
-				 cfg->subid, list_length(s->rels), s->lt, s->ds_xmax,
-				 list_length(s->ds_inprogress));
+			elog(LOG, "mpp apply worker: subscription %u: initial synchronisation done: %d tables%s, L_t %s, DS_t xmax " INT64_FORMAT ", %d in progress",
+				 cfg->subid, list_length(s->rels), nocopy ? " (not copied)" : "",
+				 s->lt, s->ds_xmax, list_length(s->ds_inprogress));
 		}
 	}
 	PG_CATCH();
@@ -1281,12 +1296,12 @@ sync_fetch_tables(LrSync *s)
 }
 
 /*
- * marker -> 'd', every table -> rel_state (rows created as needed).  When
- * redoing an interrupted sync the listed tables are truncated first, so the
- * new COPY lands in empty tables.
+ * marker -> marker_state, every table -> rel_state (rows created as needed).
+ * When redoing an interrupted sync the listed tables are truncated first, so
+ * the new COPY lands in empty tables.
  */
 static void
-sync_write_states(LrSync *s, char rel_state, bool truncate)
+sync_write_states(LrSync *s, char marker_state, char rel_state, bool truncate)
 {
 	ListCell   *lc;
 	char		subid[16];
@@ -1310,7 +1325,7 @@ sync_write_states(LrSync *s, char rel_state, bool truncate)
 	}
 	/* marker */
 	snprintf(relid, sizeof(relid), "%d", LR_SYNC_MARKER_RELID);
-	state[0] = 'd';
+	state[0] = marker_state;
 	PQclear(sync_exec(s, s->tgt2, "target",
 					  "INSERT INTO pg_catalog.gp_subscription_rel (subid, relid, state) VALUES ($1, $2, $3) "
 					  "ON CONFLICT (subid, relid) DO UPDATE SET state = EXCLUDED.state, "
@@ -2393,6 +2408,38 @@ sync_copy_all(LrSync *s)
 }
 
 
+/*
+ * copy_data = false: the tables are declared to be in sync already, so there
+ * is nothing to copy -- but there is still something to decide, which is
+ * where the stream may be believed from.  One cut point serves the whole
+ * set, since no copy is holding the source's xmin and the reason each table
+ * has one of its own (a lane inside one table's copy and not another's) does
+ * not arise.
+ *
+ * What it is for here is the transactions the barrier just waited out: they
+ * were in flight when the slots were made, so a segment that committed its
+ * part before its own slot started left that part out of the stream while
+ * another segment's part is in it.  Applying what arrived would write half a
+ * transaction.  Under this cut point the driver drops them whole instead --
+ * they belong to the state the target was declared to already hold.
+ */
+static void
+sync_cut_only(LrSync *s)
+{
+	ListCell   *lc;
+
+	sync_cut_point(s);
+	foreach(lc, s->rels)
+	{
+		LrSyncRel  *r = (LrSyncRel *) lfirst(lc);
+
+		r->lt = s->lt;
+		r->ds_text = s->ds_text;
+	}
+	/* nothing runs in it; it was opened only to read the two of them */
+	PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
+}
+
 /* ------------------------------------------------------------------------
  * Incremental synchronisation of tables added to a running subscription:
  * started and stepped by the apply driver so that the stream of the other
@@ -2717,7 +2764,10 @@ sync_open_state_table(const char *name, LOCKMODE lockmode)
 
 /*
  * copy_data = false: the tables are already in sync; write the marker as
- * 'r' so the worker never copies.
+ * 'n' so the worker runs the synchronisation without the copy -- it still
+ * makes the slots, waits the barrier out and takes a cut point, which is
+ * what decides where the stream may be believed from (see the top of this
+ * file).
  */
 void
 LrSyncMarkNoCopy(Oid subid)
@@ -2732,7 +2782,7 @@ LrSyncMarkNoCopy(Oid subid)
 	memset(nulls, 0, sizeof(nulls));
 	values[0] = ObjectIdGetDatum(subid);
 	values[1] = ObjectIdGetDatum(LR_SYNC_MARKER_RELID);
-	values[2] = CharGetDatum('r');
+	values[2] = CharGetDatum('n');
 	nulls[3] = nulls[4] = nulls[5] = true;
 	tup = heap_form_tuple(desc, values, nulls);
 	CatalogTupleInsert(rel, tup);

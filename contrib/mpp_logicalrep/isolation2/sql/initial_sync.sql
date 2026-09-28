@@ -4,7 +4,8 @@
 --
 --   1  automatic sync of a two-table publication under a concurrent workload
 --   2  DISABLE / ENABLE: the worker comes back without re-synchronising
---   3  copy_data = false: a pre-seeded table and pre-made slots, no COPY
+--   3  copy_data = false: a pre-seeded table and pre-made slots.  No COPY,
+--      but the barrier and the cut point happen all the same
 --   4  a sync interrupted mid-copy is redone from scratch, and DROP takes the
 --      state rows with it
 --
@@ -72,23 +73,34 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v || '|' || w)) AS digest FRO
 1:@db_name mpp_lr_is: SELECT count(*) AS rows, sum(hashtext(id || '|' || v || '|' || w)) AS digest FROM is_b;
 
 -- ------------------------------------------------------------------
--- 3. copy_data = false: the slots are the user's to make, and nothing is copied
+-- 3. copy_data = false: nothing is copied, but the slots, the barrier and
+--    the cut point are taken all the same -- they are what says where the
+--    stream may be believed from, and skipping them leaves a distributed
+--    transaction that was in flight when the slots were made half in the
+--    stream and half not
 -- ------------------------------------------------------------------
 CREATE TABLE is_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 INSERT INTO is_c SELECT g, 'seed' FROM generate_series(1, 300) g;
 CREATE PUBLICATION is_pub2 FOR TABLE is_c;
+-- the slots may also be the user's to make: these are reused, not remade
 SELECT count(*) > 0 AS slots_made FROM gp_create_logical_replication_slot('is_slot2', 'pgoutput', false, true);
 1:@db_name mpp_lr_is: CREATE TABLE is_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
-1:@db_name mpp_lr_is: INSERT INTO is_c SELECT g, 'seed' FROM generate_series(1, 300) g;
+-- the target's own rows say so, so a copy that should not happen is visible
+1:@db_name mpp_lr_is: INSERT INTO is_c SELECT g, 'target' FROM generate_series(1, 300) g;
 1:@db_name mpp_lr_is: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION is_sub2 CONNECTION %L PUBLICATION is_pub2 WITH (slot_name = ''is_slot2'', copy_data = false)', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
--- only the marker row (relid 0), no table to synchronise
-1:@db_name mpp_lr_is: SELECT lr_ready('is_sub2') AS no_table_state;
-1:@db_name mpp_lr_is: SELECT count(*) AS rows_for_sub2 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'is_sub2';
+1:@db_name mpp_lr_is: SELECT lr_wait($$SELECT lr_ready('is_sub2') = 'is_c=r'$$) AS ready;
+-- the table has a state row of its own, and a cut point was recorded for it
+-- and for the marker
+1:@db_name mpp_lr_is: SELECT count(*) AS rows_for_sub2, count(*) FILTER (WHERE r.sync_snapshot IS NOT NULL) AS with_a_cut_point FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'is_sub2';
+-- and nothing was copied: every seeded row is still the target's own
+1:@db_name mpp_lr_is: SELECT count(*) FILTER (WHERE v = 'target') AS still_the_targets, count(*) FILTER (WHERE v = 'seed') AS copied_from_the_source FROM is_c;
 INSERT INTO is_c SELECT g, 'p3' FROM generate_series(1001, 1050) g;
 UPDATE is_c SET v = 'u3' WHERE id = 5;
 1:@db_name mpp_lr_is: SELECT lr_wait('SELECT count(*) = 350 FROM is_c') AS streamed;
-SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM is_c;
-1:@db_name mpp_lr_is: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM is_c;
+-- id 5 was updated on both sides, so the digests match on everything the
+-- stream carried; the seed rows differ by design and are excluded
+SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM is_c WHERE id > 300 OR id = 5;
+1:@db_name mpp_lr_is: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM is_c WHERE id > 300 OR id = 5;
 
 -- ------------------------------------------------------------------
 -- 4. a sync killed mid-copy is redone, and DROP takes the state with it

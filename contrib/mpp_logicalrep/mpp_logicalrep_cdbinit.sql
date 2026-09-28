@@ -65,7 +65,10 @@ CREATE TABLE gp_subscription_rel (
     relid         oid NOT NULL,
     state         "char" NOT NULL,         -- i init, d data copy, f finished copy, c catch-up, r ready,
                                            -- s copied once and not tracked
-                                           -- (see gp_mpp_subscription.unsupported_tables)
+                                           -- (see gp_mpp_subscription.unsupported_tables);
+                                           -- n on the relid = 0 marker only: a
+                                           -- synchronisation that copies nothing
+                                           -- (copy_data = false) has yet to run
     sync_lsn      pg_lsn,
     sync_snapshot text,
     copy_job      text

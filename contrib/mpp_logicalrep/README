@@ -181,6 +181,18 @@ above, which the readers stream from, and nothing can guess it.
 WITH (copy_data = false) declares the tables already in sync, so the
 driver starts streaming without copying, and WITH (enabled = false)
 creates the subscription without starting it.
+
+copy_data = false skips the copy and nothing else.  The slots are still
+made if they are not there, the barrier is still waited out and a cut
+point is still taken, because those are what say where the stream may be
+believed from: a logical slot begins at a position of its own on each
+source node, so a distributed transaction that was in flight when the
+slots were made is in some segments' streams and not in others', and
+applying the half that arrived would write half a transaction.  The
+barrier waits for those to finish and the cut point is what the driver
+then drops them by -- which means they are counted as part of what the
+target was declared to already hold, so declare it when the source is
+quiet.
 WITH (unsupported_tables = 'snapshot') accepts a published table whose
 changes cannot be decoded (below); all three can also be changed later
 with ALTER SUBSCRIPTION ... SET.
