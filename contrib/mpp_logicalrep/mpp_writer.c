@@ -100,6 +100,7 @@ typedef struct LrApplyState
 	List	   *relorder;		/* LrApplyRel *, in open order */
 	List	   *touched;		/* remote relids that received data changes */
 	int			guc_nestlevel;	/* 0 when session_replication_role is not set */
+	bool		snapshot_pushed;	/* the batch's snapshot is on the stack */
 	bool		finished;		/* finish_batch() done */
 } LrApplyState;
 
@@ -117,7 +118,7 @@ static void apply_data_row(LrApplyState *state, char op,
 						   const char *data, int len);
 static LrApplyRel *open_apply_rel(LrApplyState *state, Oid remoteid);
 static void close_apply_rel(LrApplyState *state, LrApplyRel *arel);
-static void begin_step(LrApplyRel *arel);
+static void begin_step(LrApplyState *state, LrApplyRel *arel);
 static void end_step(LrApplyRel *arel);
 static bool find_local_tuple(LrApplyRel *arel);
 static void handle_relation(LrApplyState *state, StringInfo s);
@@ -381,6 +382,11 @@ finish_batch(LrApplyState *state)
 		hash_destroy(state->rels);
 		state->rels = NULL;
 	}
+	if (state->snapshot_pushed)
+	{
+		PopActiveSnapshot();
+		state->snapshot_pushed = false;
+	}
 	/* batchcxt (with rowcxt) goes away with the executor's query context */
 	state->finished = true;
 }
@@ -500,13 +506,39 @@ note_touched(LrApplyState *state, Oid remoteid)
 /*
  * One change = one replication step (worker.c's begin/end_replication_step
  * plus the per-change AFTER trigger query level of create_edata/finish_edata).
+ *
+ * worker.c takes a fresh transaction snapshot for every change, because there
+ * each change is a statement of its own in a read committed transaction.  A
+ * batch here is one distributed transaction, and on a Cloudberry writer a
+ * snapshot is not a cheap thing to take: GetSnapshotData() publishes it for
+ * the segment's readers through a shared memory segment it attaches, writes
+ * and detaches again -- an shm_open, an fstat, an mmap, a close and an munmap
+ * per snapshot, which at one snapshot per row was over a third of the time
+ * the apply spent.
+ *
+ * What a change actually needs of the snapshot is to see what the changes
+ * before it in the same batch did, and that is the command id, not the
+ * snapshot: end_step() advances the command counter and this advances the
+ * snapshot's notion of it.  So the batch takes one snapshot, at its first
+ * step, and finish_batch() drops it.
+ *
+ * What it gives up is seeing a local transaction that commits in the middle
+ * of a batch.  A subscriber's tables are meant to be written by the apply and
+ * nothing else, and a local writer that races it is already a conflict
+ * whichever snapshot is used.
  */
 static void
-begin_step(LrApplyRel *arel)
+begin_step(LrApplyState *state, LrApplyRel *arel)
 {
 	EState	   *estate = arel->estate;
 
-	PushActiveSnapshot(GetTransactionSnapshot());
+	if (!state->snapshot_pushed)
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		state->snapshot_pushed = true;
+	}
+	else
+		UpdateActiveSnapshotCommandId();
 	ResetPerTupleExprContext(estate);
 	estate->es_output_cid = GetCurrentCommandId(true);
 	AfterTriggerBeginQuery();
@@ -518,7 +550,6 @@ end_step(LrApplyRel *arel)
 	AfterTriggerEndQuery(arel->estate);
 	ExecClearTuple(arel->remoteslot);
 	ExecClearTuple(arel->localslot);
-	PopActiveSnapshot();
 	CommandCounterIncrement();
 }
 
@@ -538,12 +569,11 @@ flush_pending_inserts(LrApplyRel *arel)
 
 	/*
 	 * dml_fini also wrote the AM's metadata (aoseg, visimap); the rest of
-	 * this step must see it, so advance the command counter and replace the
-	 * step's snapshot (pushed by begin_step) with a fresh one.
+	 * this step must see it, so advance the command counter and let the
+	 * batch's snapshot (pushed by begin_step) see that far.
 	 */
 	CommandCounterIncrement();
-	PopActiveSnapshot();
-	PushActiveSnapshot(GetTransactionSnapshot());
+	UpdateActiveSnapshotCommandId();
 	arel->estate->es_output_cid = GetCurrentCommandId(true);
 
 	table_dml_init(localrel, CMD_INSERT);
@@ -703,7 +733,7 @@ handle_insert(LrApplyState *state, StringInfo s)
 	remoteid = logicalrep_read_insert(s, &newtup);
 	arel = open_apply_rel(state, remoteid);
 
-	begin_step(arel);
+	begin_step(state, arel);
 
 	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(arel->estate));
 	slot_store_data(arel->remoteslot, arel->rel, &newtup);
@@ -735,7 +765,7 @@ handle_update(LrApplyState *state, StringInfo s)
 	arel = open_apply_rel(state, remoteid);
 	check_relation_updatable(arel->rel);
 
-	begin_step(arel);
+	begin_step(state, arel);
 
 	/* the key to search by: the old tuple when sent, else the new one */
 	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(arel->estate));
@@ -796,7 +826,7 @@ handle_delete(LrApplyState *state, StringInfo s)
 	arel = open_apply_rel(state, remoteid);
 	check_relation_updatable(arel->rel);
 
-	begin_step(arel);
+	begin_step(state, arel);
 
 	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(arel->estate));
 	slot_store_data(arel->remoteslot, arel->rel, &oldtup);
