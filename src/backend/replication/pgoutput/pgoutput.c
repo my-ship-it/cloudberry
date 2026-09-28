@@ -558,6 +558,15 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 		else
 			ctx->twophase_opt_given = true;
 
+		/*
+		 * Cloudberry: a consumer that asked for the gxid of a distributed
+		 * transaction is one that waits for every segment that took part in
+		 * it, so it has to hear about a participant that wrote nothing too.
+		 * On a segment every prepared transaction is a distributed one, and
+		 * its gid is the gxid, so an empty prepare is worth announcing.
+		 */
+		ctx->reorder->announce_empty_prepared = data->cbdb_gxid;
+
 		/* Init publication state. */
 		data->publications = NIL;
 		publications_valid = false;
