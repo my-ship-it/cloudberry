@@ -26,3 +26,4 @@ test: per_table_cut
 test: utility_writes
 test: add_utility_writes
 test: backpressure
+test: slow_arrival

@@ -328,6 +328,14 @@ mpp_logicalrep.batch_max_latency_ms (integer, default 200ms)
 mpp_logicalrep.event_wait_ms (integer, default 1s)
     How long one drain waits for the transaction of a commit event.
 
+    It is also the grace period after which a participant that has not
+    reported the transaction is given up on -- ten times this when the
+    commit event names the segments that wrote rather than the ones it
+    was dispatched to.  A segment that is still receiving the
+    transaction is never given up on however long it takes, so this
+    bounds the wait for a segment that has gone quiet without sending
+    it, which is what an empty prepared transaction leaves behind.
+
 mpp_logicalrep.idle_drain_ms (integer, default 2s)
     How often the readers are polled while the source is idle.
 

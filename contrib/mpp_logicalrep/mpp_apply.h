@@ -97,6 +97,14 @@ typedef struct LrPlanSpec
 								 * position, gxid = flush position, nrows =
 								 * buffered transactions, nbytes = buffered
 								 * bytes (memory + spill) */
+#define LR_REPORT_OPEN		'O' /* DRAIN: this source segment has begun the
+								 * transaction and has not finished it.  It is
+								 * on the wire, so the coordinator must keep
+								 * waiting for it however long that takes;
+								 * without this the grace period in
+								 * txn_complete() cannot tell a segment that
+								 * is still sending a large transaction from
+								 * one that will never send it at all. */
 
 #define LR_OP_TYPE			'Y'
 
@@ -104,7 +112,7 @@ typedef struct LrPlanSpec
 	((op) == LR_REPORT_READY || (op) == LR_REPORT_LOCAL || \
 	 (op) == LR_REPORT_APPLIED || (op) == LR_REPORT_COLD || \
 	 (op) == LR_REPORT_CONNECTED || (op) == LR_REPORT_STATUS || \
-	 (op) == LR_REPORT_DEDUP)
+	 (op) == LR_REPORT_DEDUP || (op) == LR_REPORT_OPEN)
 
 /*
  * Channel contract between LogicalSource (reader) and LogicalApply (writer)

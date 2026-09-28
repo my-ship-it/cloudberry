@@ -1392,6 +1392,42 @@ LrReaderCollectReady(LrReaderState *st)
 	return result;
 }
 
+/*
+ * The gxids this reader has begun and not finished.
+ *
+ * Reporting these is what lets the coordinator tell "this segment is still
+ * sending it" from "this segment is never going to send it": the first has
+ * to be waited for however long it takes, the second must not be.
+ *
+ * A gxid of 0 means the transaction has no name yet, which is the ordinary
+ * case for a large one: the source streams it as it decodes, and the gid
+ * that carries the gxid only arrives with the PREPARE at the end.  It still
+ * says this reader is busy, and a busy reader has not reached whatever
+ * comes after what it is reading.
+ *
+ * Returns a palloc'd list of int64 *, in the caller's context.
+ */
+List *
+LrReaderOpenGxids(LrReaderState *st)
+{
+	HASH_SEQ_STATUS seq;
+	LrTxn	   *txn;
+	List	   *result = NIL;
+
+	hash_seq_init(&seq, st->xids);
+	while ((txn = (LrTxn *) hash_seq_search(&seq)) != NULL)
+	{
+		int64	   *g;
+
+		if (txn->state != LR_TXN_OPEN)
+			continue;
+		g = palloc(sizeof(int64));
+		*g = txn->gxid;			/* 0 until the gid names it */
+		result = lappend(result, g);
+	}
+	return result;
+}
+
 LrTxn *
 LrReaderFindGxid(LrReaderState *st, int64 gxid)
 {

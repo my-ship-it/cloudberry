@@ -101,6 +101,8 @@ int			gp_lr_apply_max_retries = 10;
 typedef struct LrSegPart
 {
 	bool		ready;
+	bool		open;			/* the reader has begun it and not finished
+								 * it: it is on the wire (LR_REPORT_OPEN) */
 	int64		seg_lsn;
 	int64		nrows;
 	int64		nbytes;
@@ -191,6 +193,13 @@ typedef struct LrDriver
 	/* progress (per target segment) */
 	int64	   *seg_pos;
 	int64	   *seg_flush;
+
+	/*
+	 * How many transactions each reader had in flight at the last drain.  A
+	 * reader in the middle of one has not reached whatever comes after it,
+	 * so its silence about a transaction says nothing yet.
+	 */
+	int		   *seg_open;
 
 	/* registry of ready / awaited transactions */
 	HTAB	   *gxids;
@@ -1382,6 +1391,22 @@ driver_collect_ready(LrDriver *d)
 				MemoryContextSwitchTo(d->cxt);
 				if (t->event_lsn > d->coord_committed)
 					d->coord_committed = t->event_lsn;
+
+				/*
+				 * Say so anyway.  Nobody reported it, so by rights no reader
+				 * holds anything for it -- but if one does (it completed
+				 * between the last drain and now) this is the only moment we
+				 * will ever mention this gxid again, and a buffer nobody
+				 * asks about again is a buffer held until the worker
+				 * restarts.  A reader that has nothing under that gxid
+				 * ignores the request.
+				 */
+				{
+					int64	   *g = palloc(sizeof(int64));
+
+					*g = t->gxid;
+					d->release_gxids = lappend(d->release_gxids, g);
+				}
 				d->stats->events_deduped++;
 				registry_remove(d, t);
 				MemoryContextSwitchTo(d->batchcxt);
@@ -1493,14 +1518,47 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 			continue;
 		if (t->segs_exact && seg_moved_past(d, t, seg))
 			continue;			/* that stream is past it: it wrote nothing we replicate */
+
+		/*
+		 * That reader is in the middle of something.  The grace period below
+		 * exists for a segment that will never report the transaction, and a
+		 * segment that is still reading is exactly where that guess goes
+		 * wrong: a large transaction takes far longer to stream than any
+		 * period we could sensibly pick, and giving up on it discards every
+		 * row it wrote, silently.  So wait, and measure the grace period
+		 * from the moment the reader goes quiet rather than from when we
+		 * first asked.
+		 *
+		 * Which reader is in the middle of what matters.  That it holds this
+		 * transaction open is proof it is coming, whatever the list is worth.
+		 * That it is merely busy is not proof of anything by itself -- but
+		 * with an exact list this segment did write the transaction, so its
+		 * only reasons not to report it are that it has not got there yet
+		 * (busy) or that what it wrote decodes to nothing (seg_moved_past
+		 * above, and the grace period once it goes quiet).  With a list of
+		 * the segments the transaction was dispatched to, a segment may
+		 * simply have nothing to send, and a busy neighbour must not hold
+		 * everything else up for it.
+		 */
+		if (t->parts[seg].open ||
+			(t->segs_exact && d->seg_open[seg] > 0))
+		{
+			t->first_wait = GetCurrentTimestamp();
+			return false;
+		}
 		if (!late)
 			return false;
 		if (!t->warned)
 		{
 			t->warned = true;
-			elog(WARNING, "mpp apply worker: gxid " INT64_FORMAT " applied without segment %d, which has not reported it after %d ms (%d of %d participants reported)",
-				 t->gxid, seg, (t->segs_exact ? 10 : 1) * gp_lr_event_wait_ms,
-				 t->nready, t->nsegs_expected);
+			ereport(WARNING,
+					(errmsg("mpp apply worker: gxid " INT64_FORMAT " applied without segment %d, which has not reported it after %d ms (%d of %d participants reported)",
+							t->gxid, seg, (t->segs_exact ? 10 : 1) * gp_lr_event_wait_ms,
+							t->nready, t->nsegs_expected),
+					 t->nready == 0 ?
+					 errdetail("No segment reported it, so it is taken to have written nothing this subscription replicates and is skipped entirely.") : 0,
+					 t->nready == 0 ?
+					 errhint("If the transaction did write replicated rows, they are now missing on the target. Raise \"mpp_logicalrep.event_wait_ms\".") : 0));
 		}
 	}
 	return true;
@@ -1679,6 +1737,40 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 	d->release_locals = NIL;
 	d->last_drain = GetCurrentTimestamp();
 
+	/*
+	 * What each reader says is still on the wire is a statement about this
+	 * drain only, so the previous drain's answer is dropped first.  Every
+	 * reader that answered at all sent a STATUS row, which is what makes its
+	 * silence about a gxid mean "not open here" rather than "did not say".
+	 */
+	{
+		bool	   *answered = palloc0(sizeof(bool) * d->nsrcsegs);
+		HASH_SEQ_STATUS seq;
+		LrGxidTxn  *t;
+		bool		any = false;
+
+		for (int i = 0; i < PQntuples(res); i++)
+		{
+			int			seg = atoi(PQgetvalue(res, i, 0));
+
+			if (PQgetvalue(res, i, 1)[0] == LR_REPORT_STATUS &&
+				seg >= 0 && seg < d->nsrcsegs)
+				answered[seg] = any = true;
+		}
+		if (any)
+		{
+			for (int seg = 0; seg < d->nsrcsegs; seg++)
+				if (answered[seg])
+					d->seg_open[seg] = 0;
+			hash_seq_init(&seq, d->gxids);
+			while ((t = (LrGxidTxn *) hash_seq_search(&seq)) != NULL)
+				for (int seg = 0; seg < d->nsrcsegs; seg++)
+					if (answered[seg])
+						t->parts[seg].open = false;
+		}
+		pfree(answered);
+	}
+
 	oldcxt = MemoryContextSwitchTo(d->cxt);
 	for (int i = 0; i < PQntuples(res); i++)
 	{
@@ -1724,6 +1816,7 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 						t->parts[seg].ready = true;
 						t->nready++;
 					}
+					t->parts[seg].open = false;
 					t->parts[seg].seg_lsn = seg_lsn;
 					t->parts[seg].nrows = nrows;
 					t->parts[seg].nbytes = nbytes;
@@ -1769,6 +1862,24 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 					d->rep.seg_buffered_bytes[seg] = nbytes;
 				}
 				break;
+			case LR_REPORT_OPEN:
+				{
+					/* rgxid 0: open, not named yet -- busy is all it says */
+					LrGxidTxn  *t = rgxid != 0 ?
+						registry_get(d, rgxid, false) : NULL;
+
+					/*
+					 * Only for a transaction we are already waiting for.  A
+					 * gxid we have no event for is one we have no opinion
+					 * about yet, and registering it here would fill the
+					 * registry with transactions this subscription may never
+					 * have to apply.
+					 */
+					d->seg_open[seg]++;
+					if (t != NULL && !t->parts[seg].ready)
+						t->parts[seg].open = true;
+					break;
+				}
 			case LR_REPORT_DEDUP:
 				{
 					LrGxidTxn  *t = registry_get(d, rgxid, false);
@@ -2625,6 +2736,7 @@ assembly_take_progress(LrDriver *d, const ProgressPos *from)
 {
 	d->seg_pos = palloc0(sizeof(int64) * d->nsrcsegs);
 	d->seg_flush = palloc0(sizeof(int64) * d->nsrcsegs);
+	d->seg_open = palloc0(sizeof(int) * d->nsrcsegs);
 	d->coord_committed = (int64) from->commit_order_pos;
 	for (int seg = 0; seg < d->nsrcsegs && seg < from->nsegs; seg++)
 	{

@@ -186,6 +186,7 @@ extern XLogRecPtr LrReaderReadPosition(LrReaderState *st);
 /* transactions */
 extern LrGxidStatus LrReaderGxidStatus(LrReaderState *st, int64 gxid);
 extern List *LrReaderCollectReady(LrReaderState *st);
+extern List *LrReaderOpenGxids(LrReaderState *st);
 extern LrTxn *LrReaderFindGxid(LrReaderState *st, int64 gxid);
 extern LrTxn *LrReaderFindLocal(LrReaderState *st, XLogRecPtr commit_lsn);
 extern void LrReaderRelease(LrReaderState *st, LrTxn *txn);

@@ -665,7 +665,13 @@ drain_one(LrSourceState *state, LrReaderState *st, int64 gxid, int wait_ms,
 	{
 		LrTxn	   *txn = LrReaderFindGxid(st, *(int64 *) lfirst(lc));
 
-		if (txn)				/* absent on segments that did not take part */
+		/*
+		 * Absent on segments that did not take part.  Still open means it is
+		 * being received: freeing it now would leave the rest of its stream
+		 * with nowhere to go, so leave it and let it be released once it is
+		 * complete.
+		 */
+		if (txn && txn->state != LR_TXN_OPEN)
 			LrReaderRelease(st, txn);
 	}
 	if ((v = kv_get(state->kv, "release_local")) != NULL)
@@ -720,6 +726,28 @@ drain_one(LrSourceState *state, LrReaderState *st, int64 gxid, int wait_ms,
 	{
 		LrReaderFillReport(st, (LrTxn *) lfirst(lc), seg, &rpt);
 		queue_report(state, &rpt);
+	}
+
+	/*
+	 * What is still on the wire.  A transaction the coordinator is waiting
+	 * for may be arriving right now -- a large one takes far longer to
+	 * stream than any grace period the coordinator could sensibly pick --
+	 * and the coordinator cannot see that from here.  Say so, so that it
+	 * waits for the transaction instead of concluding that this segment
+	 * wrote nothing.
+	 */
+	{
+		List	   *open = LrReaderOpenGxids(st);
+
+		foreach(lc, open)
+		{
+			memset(&rpt, 0, sizeof(rpt));
+			rpt.seg = seg;
+			rpt.kind = LR_REPORT_OPEN;
+			rpt.gxid = *(int64 *) lfirst(lc);
+			queue_report(state, &rpt);
+		}
+		list_free_deep(open);
 	}
 
 	/* the target was applied before (replay after a restart): say so */
