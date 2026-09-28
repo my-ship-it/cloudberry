@@ -322,12 +322,18 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 				/*
 				 * Cloudberry: the coordinator's marker of a one-phase commit,
 				 * written after the one participating segment committed.  The
-				 * same event as a distributed commit, with one participant.
+				 * same event as a distributed commit, with one participant,
+				 * and only interesting in its own database for the same
+				 * reason (above): the segment streams of this slot cannot
+				 * contain a transaction that committed in another one, so an
+				 * apply driver told about it would wait for parts that never
+				 * arrive.
 				 */
 				xl_xact_distributed_onephase *xlrec;
 
 				xlrec = (xl_xact_distributed_onephase *) XLogRecGetData(r);
-				if (SnapBuildCurrentState(builder) == SNAPBUILD_CONSISTENT &&
+				if (xlrec->dbId == ctx->slot->data.database &&
+					SnapBuildCurrentState(builder) == SNAPBUILD_CONSISTENT &&
 					!SnapBuildXactNeedsSkip(builder, buf->origptr))
 					distributed_commit_cb_wrapper(ctx, buf->origptr, xlrec->gxid,
 												  1, &xlrec->seg, true);

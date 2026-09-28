@@ -1906,6 +1906,7 @@ RecordDistributedOnePhaseCommit(DistributedTransactionId gxid, int16 seg)
 	xl_xact_distributed_onephase xlrec;
 
 	xlrec.gxid = gxid;
+	xlrec.dbId = MyDatabaseId;
 	xlrec.seg = seg;
 
 	XLogBeginInsert();

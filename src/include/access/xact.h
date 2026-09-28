@@ -528,10 +528,17 @@ typedef struct xl_xact_distributed_forget
  * is marked complete, only when wal_level is logical.  Not flushed, ignored
  * by redo: it exists so that logical decoding of the coordinator's WAL sees
  * every distributed commit in commit order (mpp logical replication apply).
+ *
+ * The database is part of it because a slot must not be told about commits
+ * in another one.  A two-phase commit is a commit record and carries the
+ * database already; this record is all there is of a one-phase one, so it
+ * has to say.  A reader told about a transaction whose segment parts are in
+ * a database its stream does not cover waits for parts that cannot arrive.
  */
 typedef struct xl_xact_distributed_onephase
 {
 	DistributedTransactionId gxid;
+	Oid			dbId;			/* the database it committed in */
 	int16		seg;			/* content id of the participating segment */
 } xl_xact_distributed_onephase;
 

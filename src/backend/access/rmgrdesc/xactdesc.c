@@ -619,8 +619,8 @@ xact_desc(StringInfo buf, XLogReaderState *record)
 	{
 		xl_xact_distributed_onephase *xlrec = (xl_xact_distributed_onephase *) rec;
 
-		appendStringInfo(buf, "distributed one-phase commit gxid " UINT64_FORMAT " seg %d",
-						 xlrec->gxid, xlrec->seg);
+		appendStringInfo(buf, "distributed one-phase commit gxid " UINT64_FORMAT " dbid %u seg %d",
+						 xlrec->gxid, xlrec->dbId, xlrec->seg);
 	}
 	else if (info == XLOG_XACT_INVALIDATIONS)
 	{

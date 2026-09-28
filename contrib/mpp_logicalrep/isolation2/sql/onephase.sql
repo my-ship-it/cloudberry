@@ -23,6 +23,7 @@ CREATE PUBLICATION op_pub FOR TABLE op_t;
 
 1:@db_name mpp_lr_op: CREATE TABLE op_t (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 1:@db_name mpp_lr_op: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 1800 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_op: CREATE FUNCTION lr_wait_5s(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 50 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_op: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 1:@db_name mpp_lr_op: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION op_sub CONNECTION %L PUBLICATION op_pub WITH (slot_name = ''op_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
 1:@db_name mpp_lr_op: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'op_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
@@ -64,6 +65,35 @@ CALL op_spread();
 1:@db_name mpp_lr_op: SELECT lr_wait('SELECT count(*) = 59 FROM op_t WHERE v LIKE ''%-s''') AS all_of_them_arrived;
 1:@db_name mpp_lr_op: SELECT count(DISTINCT gp_segment_id) = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) AS they_came_from_every_segment FROM op_t WHERE v LIKE '%-s';
 
+-- ------------------------------------------------------------------
+-- 4. a one-phase commit in another database is not this subscription's
+-- ------------------------------------------------------------------
+-- The marker is all there is of a one-phase commit -- there is no commit
+-- record to carry the database -- so it says which database it was, and a
+-- slot ignores the ones that are not its own.  Without that, the driver is
+-- told to wait for a segment part that is in another database and so can
+-- never reach this slot's stream, and every such commit elsewhere in the
+-- cluster costs this subscription a grace period and holds up everything
+-- behind it in commit order.
+--
+-- Measured by the mark that follows it, and with a budget shorter than the
+-- grace period (10 x mpp_logicalrep.event_wait_ms, a second by default): if
+-- the foreign commits were waited for, the mark could not arrive inside it.
+--
+-- Enough of them to land on every segment, because one that shares a segment
+-- with the mark is crossed off as soon as the mark is reported from there
+-- (seg_moved_past) and would be waited for only as long as the mark takes.
+-- The ones on the other segments are the test.
+CREATE DATABASE mpp_lr_op_other;
+2:@db_name mpp_lr_op_other: CREATE TABLE other_t (id int, v text) DISTRIBUTED BY (id);
+-- one single-row write per row, each its own one-phase transaction
+2:@db_name mpp_lr_op_other: CREATE PROCEDURE other_spread() AS $$ BEGIN FOR i IN 1 .. 30 LOOP INSERT INTO other_t VALUES (i, 'not ours'); COMMIT; END LOOP; END $$ LANGUAGE plpgsql;
+2:@db_name mpp_lr_op_other: CALL other_spread();
+2:@db_name mpp_lr_op_other: SELECT count(DISTINCT gp_segment_id) = (SELECT count(*) FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) AS they_covered_every_segment FROM other_t;
+2q:
+INSERT INTO op_t VALUES (900, 'after foreign one-phase commits');
+1:@db_name mpp_lr_op: SELECT lr_wait_5s('SELECT count(*) = 1 FROM op_t WHERE id = 900') AS the_mark_was_not_held_up;
+
 SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM op_t;
 1:@db_name mpp_lr_op: SELECT count(*) AS rows, sum(hashtext(id || '|' || v)) AS digest FROM op_t;
 1:@db_name mpp_lr_op: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'op_sub';
@@ -76,3 +106,4 @@ DROP PUBLICATION op_pub;
 DROP TABLE op_t;
 DROP PROCEDURE op_spread();
 DROP DATABASE mpp_lr_op;
+DROP DATABASE mpp_lr_op_other;
