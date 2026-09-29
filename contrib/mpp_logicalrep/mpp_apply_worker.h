@@ -162,7 +162,6 @@ typedef struct LrWorkerStats
 	int64		txns_applied;	/* gxid transactions applied */
 	int64		local_applied;	/* local transactions applied */
 	int64		events_deduped;	/* events for already applied gxids */
-	int64		events_noop;	/* events whose transaction wrote on no segment */
 	int64		txns_catchup;	/* transactions replayed for an added table */
 	int64		txns_catchup_dropped;	/* held ones the copy already had */
 	int64		recoveries;

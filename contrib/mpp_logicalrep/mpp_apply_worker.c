@@ -130,7 +130,6 @@ typedef struct LrGxidTxn
 	int64		event_lsn;		/* coordinator position of the event */
 	int			nsegs_expected; /* from the event; 0 = unknown */
 	int16	   *segs_expected;
-	bool		noop;			/* the event says no segment wrote anything */
 	TimestampTz first_wait;		/* when we first waited for it */
 	bool		in_batch;
 	bool		warned;			/* "still waiting" warning issued */
@@ -1184,25 +1183,28 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 		return;
 	}
 
+	/*
+	 * Every distributed commit names the segments it was dispatched to.  A
+	 * source writes the list whenever it writes the record -- the two are
+	 * decided by the same condition, and a two-phase transaction has at
+	 * least one participant -- so an event without one did not come from a
+	 * source this version can read, and there is nothing sound to do with
+	 * it: waiting for every segment hangs on the ones never dispatched to,
+	 * and waiting for none applies whatever happens to have arrived.
+	 */
+	if (nsegs <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("distributed commit " INT64_FORMAT " at %X/%X names no participating segments",
+						gxid, LSN_FORMAT_ARGS((XLogRecPtr) lsn)),
+				 errdetail("The list says which segments have to be waited for; without it the transaction can be neither waited for nor applied."),
+				 errhint("Resynchronise the subscription so that it starts past that position.")));
+
 	t = registry_get(d, gxid, true);
 	if (t->in_batch)
 		return;					/* a replayed event of a batched transaction */
 	t->has_event = true;
 	t->event_lsn = lsn;
-	if (nsegs < 0)
-	{
-		/*
-		 * The coordinator knows no segment wrote anything (every prepared
-		 * segment reported read-only): nothing to wait for or to apply.  It
-		 * still takes its place in commit order (driver_collect_ready).
-		 */
-		t->noop = true;
-		if (t->first_wait == 0)
-			t->first_wait = GetCurrentTimestamp();
-		driver_collect_ready(d);
-		return;
-	}
-	if (nsegs > 0)
 	{
 		oldcxt = MemoryContextSwitchTo(d->cxt);
 		t->nsegs_expected = nsegs;
@@ -1420,17 +1422,6 @@ driver_collect_ready(LrDriver *d)
 	for (int i = 0; i < n; i++)
 	{
 		t = arr[i];
-		if (t->noop && t->nready == 0)
-		{
-			/* known no-op: advance past it in order, nothing to release */
-			MemoryContextSwitchTo(d->cxt);
-			if (t->event_lsn > d->coord_committed)
-				d->coord_committed = t->event_lsn;
-			d->stats->events_noop++;
-			registry_remove(d, t);
-			MemoryContextSwitchTo(d->batchcxt);
-			continue;
-		}
 		/*
 		 * Already in the initial copy, whatever it touched.  Asked before
 		 * anyone is waited for, because this is the one kind of transaction
@@ -1557,10 +1548,6 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 {
 	if (!t->has_event)
 		return false;
-
-	/* without a participant list, every SOURCE segment has to report */
-	if (t->nsegs_expected <= 0)
-		return t->nready == d->nsrcsegs;
 
 	for (int i = 0; i < t->nsegs_expected; i++)
 	{
@@ -2845,9 +2832,9 @@ assembly_shutdown(LogicalRepAssembly *self)
 		pfree(buf.data);
 	}
 
-	elog(LOG, "mpp apply worker: subscription %u stopped: " INT64_FORMAT " events, " INT64_FORMAT " batches, " INT64_FORMAT " gxid txns, " INT64_FORMAT " local txns, " INT64_FORMAT " deduped, " INT64_FORMAT " no-op, " INT64_FORMAT " caught up, " INT64_FORMAT " recoveries",
+	elog(LOG, "mpp apply worker: subscription %u stopped: " INT64_FORMAT " events, " INT64_FORMAT " batches, " INT64_FORMAT " gxid txns, " INT64_FORMAT " local txns, " INT64_FORMAT " deduped, " INT64_FORMAT " caught up, " INT64_FORMAT " recoveries",
 		 d->cfg->subid, stats->events, stats->batches, stats->txns_applied,
-		 stats->local_applied, stats->events_deduped, stats->events_noop,
+		 stats->local_applied, stats->events_deduped,
 		 stats->txns_catchup, stats->recoveries);
 }
 
