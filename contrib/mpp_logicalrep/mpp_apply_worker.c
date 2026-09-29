@@ -1180,8 +1180,14 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 	 * it, and it answers it before anything is registered: events arrive in
 	 * position order, so one at or below that mark has been seen before.
 	 */
+	elog(DEBUG1, "mpp apply worker: subscription %u: event for gxid " INT64_FORMAT " at %X/%X, %d segs",
+		 d->cfg->subid, gxid, LSN_FORMAT_ARGS((XLogRecPtr) lsn), nsegs);
+
 	if (lsn != 0 && lsn <= d->coord_committed)
 	{
+		elog(DEBUG1, "mpp apply worker: subscription %u: dropping the replayed event of gxid " INT64_FORMAT " at %X/%X <= committed %X/%X",
+			 d->cfg->subid, gxid, LSN_FORMAT_ARGS((XLogRecPtr) lsn),
+			 LSN_FORMAT_ARGS((XLogRecPtr) d->coord_committed));
 		d->stats->events_deduped++;
 		return;
 	}
@@ -1205,7 +1211,11 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 
 	t = registry_get(d, gxid, true);
 	if (t->in_batch)
+	{
+		elog(DEBUG1, "mpp apply worker: subscription %u: dropping the replayed event of batched gxid " INT64_FORMAT,
+			 d->cfg->subid, gxid);
 		return;					/* a replayed event of a batched transaction */
+	}
 	t->has_event = true;
 	t->event_lsn = lsn;
 	{
@@ -1231,6 +1241,8 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 	t = registry_get(d, gxid, false);
 	if (t == NULL)
 	{
+		elog(DEBUG1, "mpp apply worker: subscription %u: the drain settled gxid " INT64_FORMAT,
+			 d->cfg->subid, gxid);
 		d->stats->events_deduped++;
 		return;
 	}
@@ -1473,6 +1485,8 @@ driver_collect_ready(LrDriver *d)
 		 */
 		if (cut_covers(sync_cut_any(d), t->gxid))
 		{
+			elog(DEBUG1, "mpp apply worker: subscription %u: dropping gxid " INT64_FORMAT " (marker cut)",
+				 d->cfg->subid, t->gxid);
 			MemoryContextSwitchTo(d->cxt);
 			if (t->event_lsn > d->coord_committed)
 				d->coord_committed = t->event_lsn;
@@ -1496,6 +1510,10 @@ driver_collect_ready(LrDriver *d)
 			 */
 			if (t->nready == 0)
 			{
+				elog(DEBUG1, "mpp apply worker: subscription %u: nobody reported gxid " INT64_FORMAT " at %X/%X (%d participants expected)",
+					 d->cfg->subid, t->gxid,
+					 LSN_FORMAT_ARGS((XLogRecPtr) t->event_lsn),
+					 t->nsegs_expected);
 				MemoryContextSwitchTo(d->cxt);
 				if (t->event_lsn > d->coord_committed)
 					d->coord_committed = t->event_lsn;
@@ -1529,6 +1547,24 @@ driver_collect_ready(LrDriver *d)
 			 */
 			if (txn_fully_covered(d, t->rel_names, t->gxid))
 			{
+				StringInfoData why;
+				ListCell   *nc;
+
+				initStringInfo(&why);
+				foreach(nc, t->rel_names)
+				{
+					const LrSyncCut *c = sync_cut_for(d, (char *) lfirst(nc));
+
+					appendStringInfo(&why, "%s%s<%s xmax=" INT64_FORMAT ">",
+									 why.len ? " " : "", (char *) lfirst(nc),
+									 c == NULL ? "none" :
+									 (c->relname ? c->relname : "MARKER"),
+									 c == NULL ? (int64) 0 : c->ds_xmax);
+				}
+				elog(DEBUG1, "mpp apply worker: subscription %u: dropping fully copied gxid " INT64_FORMAT " at %X/%X: %s",
+					 d->cfg->subid, t->gxid,
+					 LSN_FORMAT_ARGS((XLogRecPtr) t->event_lsn), why.data);
+				pfree(why.data);
 				MemoryContextSwitchTo(d->cxt);
 				if (t->event_lsn > d->coord_committed)
 					d->coord_committed = t->event_lsn;
@@ -2567,6 +2603,21 @@ unit_build_from_batch(LrDriver *d)
 		 */
 		at->skip = covered_relids(d, t->rel_names, t->gxid, 0, 0, &at->nskip);
 
+		if (message_level_is_interesting(DEBUG1))
+		{
+			StringInfoData names;
+			ListCell   *nc;
+
+			initStringInfo(&names);
+			foreach(nc, t->rel_names)
+				appendStringInfo(&names, "%s%s", names.len ? "," : "",
+								 (char *) lfirst(nc));
+			elog(DEBUG1, "mpp apply worker: subscription %u: batch takes gxid " INT64_FORMAT ": rels [%s], %d of them already copied, deferred [%s]",
+				 d->cfg->subid, t->gxid, names.data, at->nskip,
+				 d->defer_names == NIL ? "" : (char *) linitial(d->defer_names));
+			pfree(names.data);
+		}
+
 		maxrels += list_length(t->rel_names);
 	}
 
@@ -2708,6 +2759,8 @@ unit_build_catchup(LrDriver *d)
 		{
 			LrDeferredTxn *dt = (LrDeferredTxn *) lfirst(lc);
 
+			elog(DEBUG1, "mpp apply worker: subscription %u: catch-up drops gxid " INT64_FORMAT " (seg %d xid " INT64_FORMAT "): the copy has it",
+				 d->cfg->subid, dt->gxid, dt->seg, dt->xid);
 			deferred_release(d, dt);
 			d->deferred_txns = list_delete_ptr(d->deferred_txns, dt);
 			d->stats->txns_catchup_dropped++;
