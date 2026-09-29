@@ -276,6 +276,7 @@ static LrGxidTxn *registry_get(LrDriver *d, int64 gxid, bool create);
 static void registry_remove(LrDriver *d, LrGxidTxn *t);
 static bool txn_complete(LrDriver *d, LrGxidTxn *t);
 static void driver_collect_ready(LrDriver *d);
+static LrGxidTxn *driver_wait_target(LrDriver *d);
 static void driver_check_pending(LrDriver *d, bool force);
 static bool driver_sync_progress(LrDriver *d);
 static bool name_is_deferred(LrDriver *d, const char *name);
@@ -1236,6 +1237,43 @@ driver_handle_event(LrDriver *d, int64 gxid, int64 lsn, int nsegs,
 		elog(DEBUG1, "mpp apply worker: gxid " INT64_FORMAT " not ready on every participant yet (%d of %d)",
 			 gxid, t->nready, t->nsegs_expected);
 	driver_collect_ready(d);
+}
+
+/*
+ * The oldest transaction whose event is in hand and whose participants have
+ * not all reported, or NULL when nothing is being waited for.  Same test as
+ * txn_complete(), without its warning: this one is asked on every pass.
+ */
+static LrGxidTxn *
+driver_wait_target(LrDriver *d)
+{
+	HASH_SEQ_STATUS seq;
+	LrGxidTxn  *t;
+	LrGxidTxn  *best = NULL;
+
+	hash_seq_init(&seq, d->gxids);
+	while ((t = (LrGxidTxn *) hash_seq_search(&seq)) != NULL)
+	{
+		bool		missing = false;
+
+		if (!t->has_event || t->in_batch)
+			continue;
+		for (int i = 0; i < t->nsegs_expected; i++)
+		{
+			int			seg = t->segs_expected[i];
+
+			if (seg >= 0 && seg < d->nsrcsegs && !t->parts[seg].ready)
+			{
+				missing = true;
+				break;
+			}
+		}
+		if (!missing)
+			continue;
+		if (best == NULL || t->event_lsn < best->event_lsn)
+			best = t;
+	}
+	return best;
 }
 
 /*
@@ -2847,6 +2885,7 @@ assembly_poll(LogicalRepAssembly *self, int timeout_ms)
 {
 	LrDriver   *d = LR_DRIVER(self);
 	int			timeout = gp_lr_batch_max_latency_ms;
+	LrGxidTxn  *waited;
 
 	if (d->batch_gxids != NIL || d->batch_locals != NIL)
 	{
@@ -2866,12 +2905,40 @@ assembly_poll(LogicalRepAssembly *self, int timeout_ms)
 	if (d->sync != NULL)
 		timeout = Min(timeout, d->sync_poll_ms);
 
+	/*
+	 * When an event is in hand whose participants have not all reported,
+	 * what is being waited for is on the readers' sockets and not on the
+	 * coordinator's, so the wait belongs in the drain.  It has to: a reader
+	 * reads only while it is inside one, so a drain that returns at once
+	 * leaves the source blocked on a socket nobody is emptying until the
+	 * next drain comes round.  Measured on one 2,000,000-row transaction,
+	 * that left the readers inside a drain about 5% of the transfer.
+	 */
+	if (driver_wait_target(d) != NULL)
+		timeout = 0;
+
 	if (!driver_pump_source(d, timeout))
 		return false;
 
+	/*
+	 * Asked again: pumping the source is what registers an event, and what
+	 * completes one.
+	 */
+	waited = driver_wait_target(d);
+	if (waited != NULL)
+	{
+		int			budget = gp_lr_event_wait_ms;
+
+		/* a synchronisation job is stepped once a pass; do not starve it */
+		if (d->sync != NULL)
+			budget = Min(budget, d->sync_poll_ms);
+		driver_drain(d, waited->gxid, waited->nsegs_expected,
+					 waited->segs_expected, budget);
+		driver_collect_ready(d);
+	}
 	/* idle: ask the readers for local transactions and their positions */
-	if (TimestampDifferenceExceeds(d->last_drain, GetCurrentTimestamp(),
-								   gp_lr_idle_drain_ms))
+	else if (TimestampDifferenceExceeds(d->last_drain, GetCurrentTimestamp(),
+										gp_lr_idle_drain_ms))
 	{
 		driver_drain(d, 0, 0, NULL, 0);
 		driver_collect_ready(d);
