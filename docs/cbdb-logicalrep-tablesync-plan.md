@@ -886,15 +886,48 @@ apply     ~19   s    t≈29s → 48.7s，期间零传输，行在最后整体出
 **传输与 apply 完全不重叠**，这是目前最大的一块：一笔事务要等最后一个字节到齐、
 参与段全部报到才开始应用。两条可走的路见工作项 DUTY3 / OVERLAP1。
 
-### 未解决：`refresh_publication` 在 release 构建上丢行（**新发现，未修**）
+### CATCHUP1 — 增表 catch-up 提交会扔掉手上那批普通事务 —— **已修**（2026-09-30）
 
-2026-09-30 把测试套跑在 release 集群（:7500）上时，`refresh_publication` 稳定失败：
-`REFRESH PUBLICATION` 加进来的 `rp_a` 只到 **2693 / 2720**，`lr_wait` 200 秒也等不齐；
-`rp_b` 行数对但 digest 不同。
+**症状**：`refresh_publication` 在 **release 构建**上稳定失败（`rp_a` 2693 / 2720），
+cassert 的集群上一直是绿的。少的正好是**三笔完整的 churn 事务**：每笔 −10 条插入、
++1 条本该删掉的行 = −9，×3 = −27;rp_b 每笔丢 1 插入 + 1 删除正好抵消,
+所以行数对得上、digest 对不上。
 
-**不是当天改动引入的**：把 `mpp_source.c` / `mpp_apply_worker.c` / `mpp_logicalrep.c`
-退回 `7045efbcc43` 重编重启，同一个用例、同样的 2693。cassert 的 :7100 上这个用例
-一直是绿的 —— 也就是说这是一个**只在更快的构建上暴露的既有竞态**，优先级不低。
+**根因**：`unit_committed()` 的 catch-up 分支调 `MemoryContextReset(d->batchcxt)`，
+但不像正常路径那样先清空并应用 `d->batch_gxids` / `d->batch_locals`。而：
+
+- `driver_collect_ready()` 把事务放进 `d->batch_gxids` 时，链表单元就在 `batchcxt` 里，
+  同时给事务打上 `in_batch = true`；`driver_drain()` 把 `d->locals` 搬进
+  `d->batch_locals` 也一样；
+- 增表拷贝结束切到 catch-up 时，**驱动仍在读源**（`assembly_poll` 照跑），所以
+  catch-up 期间到达的提交事件照样被收进批次；
+- 那一批从未被应用就随 reset 一起没了，`d->batch_gxids` 变成悬垂指针（日志里
+  "batch N committed: **0** gxid txns" 就是它读成空的样子），而事务在注册表里的
+  `in_batch` 仍是 true —— `driver_collect_ready()` 此后**永远跳过它们**；
+- `coord_committed` 随后继续前进越过它们，再无翻案余地。
+
+**取证过程**（值得记下来，这类"无声丢行"只能这么查）：给驱动里每一条能让事务消失的
+路径都加上 `DEBUG1` 日志——事件到达、五种丢弃、批次纳入、catch-up 丢弃——然后对着
+gxid 序列看。结论是 `EVENT gxid 42922 / 42925 / 42926` 都到达且**没有任何一条丢弃日志**，
+却从未进过批次，紧接着就是那个 0 笔事务的空批次。这些日志已按 `DEBUG1` 留在代码里。
+
+**改法**（把设计里本就写着的不变式立住：catch-up 期间只发放被延迟的事务）：
+
+1. `driver_collect_ready()` 在 `catchup_mode` 下直接返回，不收批次；
+2. `driver_drain()` 在 `catchup_mode` 下不把 `d->locals` 搬进批次（它们分配在驱动的
+   长生命期上下文里，留着下一批再走）；
+3. `driver_sync_progress()` 手上还有未提交批次时不进入 catch-up（批次自己会按延迟收口，
+   代价是一轮循环）；
+4. catch-up 分支的 reset 改成"两个列表都空才 reset"+ `Assert` —— 万一将来又破了不变式，
+   泄漏一个上下文也好过无声丢数据。
+
+**验证**：修复前 6/6 复现；修复后 9/9 全过（6 次带 LOG 诊断、3 次诊断降到 DEBUG1 即
+原始时序）；只撤掉这三处保护的 A/B 3 次里 2 次复现。
+
+**为什么 cassert 看不见**：窗口只有十几毫秒，事件要正好落在里面。试过三种想让它确定化的
+办法（紧循环 workload、`batch_max_latency_ms` 调大让批次常开、`batch_max_txns=1` 把
+catch-up 拉成多次提交）**都不复现**，所以没有新增合成用例——回归靠 `refresh_publication`
+本身，它在 release 上是必现的。**含义：只跑 cassert 的 CI 挡不住这一类问题。**
 
 ### WORKER1 — 一个订阅起了两个 worker —— **已修**（`7045efbcc43`，2026-09-30）
 
