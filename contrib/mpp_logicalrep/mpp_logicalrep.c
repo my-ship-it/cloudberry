@@ -169,9 +169,11 @@ define_gucs(void)
 
 	DefineCustomIntVariable("mpp_logicalrep.event_wait_ms",
 							"How long one drain waits for the transaction of a commit event.",
-							NULL,
+							"A reader reads only inside a drain, so this is also how long it "
+							"reads for before the driver is given the floor again; a reader "
+							"that holds several source streams splits it between them.",
 							&gp_lr_event_wait_ms,
-							1000, 0, 3600000,
+							100, 0, 3600000,
 							PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("mpp_logicalrep.idle_drain_ms",

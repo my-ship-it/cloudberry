@@ -649,15 +649,10 @@ do_connect(LrSourceState *state)
  * because a cold reader has no stream to speak of.
  */
 static void
-drain_one(LrSourceState *state, LrReaderState *st, int64 gxid, int wait_ms,
-		  bool participant)
+drain_release_one(LrSourceState *state, LrReaderState *st)
 {
 	List	   *lst;
 	ListCell   *lc;
-	LrReceiveResult res;
-	List	   *ready;
-	LrReport	rpt;
-	LrReaderStats stats;
 	int			seg = LrReaderSourceSeg(st);
 	const char *v;
 
@@ -702,24 +697,45 @@ drain_one(LrSourceState *state, LrReaderState *st, int64 gxid, int wait_ms,
 		}
 	}
 
-	/*
-	 * 2. read the stream -- unless the coordinator is holding it back.  It
-	 * does that when a reader has buffered more than it may (P0.5): not
-	 * reading fills this socket, which closes the window on the source, which
-	 * leaves the transactions in its WAL instead of in this segment's
-	 * temporary files.  Everything else this function does still happens, and
-	 * step 3 above all: a source that hears nothing for wal_sender_timeout
-	 * kills the walsender, and the reconnection would re-deliver exactly the
-	 * transactions that are already held.
-	 */
-	if (wait_ms < 0)
-		res = LR_RECV_HELD;
-	else if (gxid != 0)
-		res = LrReaderReceive(st, gxid, participant ? wait_ms : 0, false);
-	else
-		res = LrReaderReceive(st, 0, wait_ms, true);
+}
 
-	/* 3. feedback: what we received, what is safely applied */
+/*
+ * 2. read one stream -- unless the coordinator is holding it back.  It does
+ * that when a reader has buffered more than it may (P0.5): not reading fills
+ * this socket, which closes the window on the source, which leaves the
+ * transactions in its WAL instead of in this segment's temporary files.
+ * Everything else a DRAIN does still happens, and the feedback above all: a
+ * source that hears nothing for wal_sender_timeout kills the walsender, and
+ * the reconnection would re-deliver exactly the transactions that are
+ * already held.
+ */
+static LrReceiveResult
+drain_receive_one(LrReaderState *st, int64 gxid, int wait_ms, bool participant)
+{
+	if (wait_ms < 0)
+		return LR_RECV_HELD;
+	if (gxid != 0)
+		return LrReaderReceive(st, gxid, participant ? wait_ms : 0, false);
+	return LrReaderReceive(st, 0, wait_ms, true);
+}
+
+/*
+ * 3. what this stream has to say, once the reading of every stream is done.
+ * Reporting is separate from reading because a reader that holds several
+ * streams reads them in rounds: one report per stream per DRAIN, whatever
+ * the rounds did.
+ */
+static void
+drain_report_one(LrSourceState *state, LrReaderState *st, int64 gxid,
+				 LrReceiveResult res)
+{
+	ListCell   *lc;
+	List	   *ready;
+	LrReport	rpt;
+	LrReaderStats stats;
+	int			seg = LrReaderSourceSeg(st);
+
+	/* feedback: what we received, what is safely applied */
 	LrReaderSendFeedback(st);
 
 	/* 4. reports */
@@ -785,7 +801,11 @@ do_drain(LrSourceState *state)
 	List	   *parts = NIL;
 	ListCell   *lc;
 	TimestampTz started;
-	bool		waited = false;
+	LrReceiveResult *res;
+	bool	   *part;
+	int			nstreams;
+	int			round;
+	int			i;
 
 	if (!reader_is_warm(state))
 	{
@@ -801,12 +821,97 @@ do_drain(LrSourceState *state)
 		parts = parse_int64_list(v);	/* SOURCE content ids */
 
 	started = GetCurrentTimestamp();
+
+	/*
+	 * The wait is a budget for the whole DRAIN, not for each stream: a reader
+	 * that serves several source segments may not multiply the coordinator's
+	 * grace period by how many it happens to hold.  Spending it in order,
+	 * though, is the same thing as starving every stream but the first: the
+	 * first takes the whole budget and the rest are left with nothing to wait
+	 * with, so they only ever take what the socket already holds.  With a
+	 * three-segment source and a two-segment target that is one stream in
+	 * three, permanently, and it showed: its source sat at two thirds of the
+	 * others' CPU and finished last.
+	 *
+	 * So read in rounds instead.  The first round waits for nothing and takes
+	 * what every stream already has; later rounds split what is left of the
+	 * budget between the streams still worth waiting on, so each waits on its
+	 * own socket for a share.  Reports come after, one per stream.
+	 */
+	nstreams = 0;
+	foreach(lc, state->readers)
+		if (LrReaderHasSource((LrReaderState *) lfirst(lc)))
+			nstreams++;
+
+	res = palloc(sizeof(LrReceiveResult) * Max(1, list_length(state->readers)));
+	part = palloc(sizeof(bool) * Max(1, list_length(state->readers)));
+	i = 0;
 	foreach(lc, state->readers)
 	{
 		LrReaderState *st = (LrReaderState *) lfirst(lc);
-		bool		participant = (parts == NIL);
-		int			budget = wait_ms;
 		ListCell   *pc;
+
+		part[i] = (parts == NIL);
+		foreach(pc, parts)
+			if (*(int64 *) lfirst(pc) == LrReaderSourceSeg(st))
+				part[i] = true;
+		res[i] = LR_RECV_DRAINED;
+		if (LrReaderHasSource(st))
+			drain_release_one(state, st);
+		i++;
+	}
+
+	for (round = 0; nstreams > 0; round++)
+	{
+		int			share;
+		bool		all_ready = true;
+
+		if (wait_ms <= 0)
+			share = wait_ms;	/* held (-1), or asked not to wait at all */
+		else if (round == 0)
+			share = 0;			/* take what is there before anyone waits */
+		else
+		{
+			int			left = Max(0, wait_ms -
+									  (int) TimestampDifferenceMilliseconds(started,
+																			GetCurrentTimestamp()));
+
+			if (left <= 0)
+				break;
+			share = Max(1, left / nstreams);
+		}
+
+		i = 0;
+		foreach(lc, state->readers)
+		{
+			LrReaderState *st = (LrReaderState *) lfirst(lc);
+
+			if (LrReaderHasSource(st))
+			{
+				res[i] = drain_receive_one(st, gxid, share, part[i]);
+
+				/*
+				 * DRAINED is "the socket is empty just now", not "there is
+				 * nothing to wait for": only what this DRAIN was asked for
+				 * -- the target, or anything at all on a long poll -- ends
+				 * the rounds early.
+				 */
+				if (part[i] &&
+					res[i] != LR_RECV_TARGET_READY &&
+					res[i] != LR_RECV_EOF &&
+					res[i] != LR_RECV_HELD)
+					all_ready = false;
+			}
+			i++;
+		}
+		if (wait_ms <= 0 || all_ready)
+			break;
+	}
+
+	i = 0;
+	foreach(lc, state->readers)
+	{
+		LrReaderState *st = (LrReaderState *) lfirst(lc);
 
 		/* no source segment: nothing to release, read or report but the state */
 		if (!LrReaderHasSource(st))
@@ -817,27 +922,13 @@ do_drain(LrSourceState *state)
 			rpt.seg = -1;
 			rpt.kind = LR_REPORT_STATUS;
 			queue_report(state, &rpt);
-			continue;
 		}
-
-		foreach(pc, parts)
-			if (*(int64 *) lfirst(pc) == LrReaderSourceSeg(st))
-				participant = true;
-
-		/*
-		 * The wait is a budget for the whole DRAIN, not for each stream: a
-		 * reader that serves several source segments may not multiply the
-		 * coordinator's grace period by how many it happens to hold.
-		 */
-		if (waited && wait_ms > 0)
-			budget = Max(0, wait_ms -
-						 (int) TimestampDifferenceMilliseconds(started,
-															   GetCurrentTimestamp()));
-		if (budget > 0)
-			waited = true;
-
-		drain_one(state, st, gxid, budget, participant);
+		else
+			drain_report_one(state, st, gxid, res[i]);
+		i++;
 	}
+	pfree(res);
+	pfree(part);
 }
 
 static void

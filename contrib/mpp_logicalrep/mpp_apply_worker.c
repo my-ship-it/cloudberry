@@ -75,7 +75,7 @@
 int			gp_lr_batch_max_txns = 64;
 int			gp_lr_batch_max_bytes = 65536;
 int			gp_lr_batch_max_latency_ms = 200;
-int			gp_lr_event_wait_ms = 1000;
+int			gp_lr_event_wait_ms = 100;
 int			gp_lr_idle_drain_ms = 2000;
 int			gp_lr_hold_max = 1048576;	/* kB, per source segment */
 int			gp_lr_apply_error_action = LR_APPLY_ERROR_DISABLE;
@@ -98,11 +98,13 @@ int			gp_lr_apply_max_retries = 10;
 #define LR_MAX_SEGS				4096
 
 /*
- * How many times mpp_logicalrep.event_wait_ms a participant that has gone
- * quiet without reporting is waited for before saying so.  It is a warning
- * and nothing else: the wait itself does not end.
+ * How long a participant that has gone quiet without reporting is waited for
+ * before saying so.  It is a warning and nothing else: the wait itself does
+ * not end.  It used to be a multiple of mpp_logicalrep.event_wait_ms, which
+ * stopped making sense once that became the slice one drain reads for: a
+ * tenth of a second of silence is not worth anyone's attention.
  */
-#define LR_EVENT_QUIET			10
+#define LR_EVENT_QUIET_MS		10000
 
 /* one source segment's view of a transaction with a gxid */
 typedef struct LrSegPart
@@ -1604,12 +1606,12 @@ txn_complete(LrDriver *d, LrGxidTxn *t)
 			t->first_wait = GetCurrentTimestamp();
 		else if (!t->warned &&
 				 TimestampDifferenceExceeds(t->first_wait, GetCurrentTimestamp(),
-											LR_EVENT_QUIET * gp_lr_event_wait_ms))
+											LR_EVENT_QUIET_MS))
 		{
 			t->warned = true;
 			ereport(WARNING,
 					(errmsg("mpp apply worker: still waiting for segment %d to report gxid " INT64_FORMAT ", quiet for %d ms (%d of %d participants reported)",
-							seg, t->gxid, LR_EVENT_QUIET * gp_lr_event_wait_ms,
+							seg, t->gxid, LR_EVENT_QUIET_MS,
 							t->nready, t->nsegs_expected),
 					 errdetail("The transaction was dispatched to that segment, so its reader owes an announcement whether the segment wrote anything or not. Nothing after it can be applied until it arrives."),
 					 errhint("Check that the segment's reader is connected and that its replication slot is still valid.")));
