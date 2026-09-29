@@ -1930,24 +1930,44 @@ $$ LANGUAGE SQL;
 --
 -- NB: replication slots are non-transactional, so a failure partway through leaves
 -- slots created on the segments processed so far; re-run drop to clean up.
+-- The segments first and the coordinator last, which is not a preference but
+-- what makes the pair usable.  Creating a slot does not return until that node
+-- has a consistent decoding start point, and a node reaches one only once every
+-- transaction that was running there has ended.  So a distributed transaction
+-- still running on a segment when that segment's slot was made holds that
+-- segment's start point back past its own end, and the segment's stream cannot
+-- carry it.  With the coordinator's slot made afterwards, its start point is
+-- later still, so that transaction's commit record falls before it and the
+-- coordinator's stream does not carry it either: a consumer is never told about
+-- a transaction no segment can give it.  Made the other way round the
+-- coordinator can announce exactly such a transaction, and the rows are not in
+-- a copy taken afterwards either -- it had not finished, so no snapshot of that
+-- moment contains it -- leaving nowhere to get them from.
 CREATE FUNCTION gp_create_logical_replication_slot(
     IN p_slot_name name, IN p_plugin name,
     IN p_temporary boolean DEFAULT false, IN p_twophase boolean DEFAULT false,
     OUT gp_segment_id integer, OUT slot_name name, OUT lsn pg_lsn)
 RETURNS SETOF record AS
 $$
-    -- Coordinator (gp_segment_id = -1): function-in-FROM is evaluated exactly once.
-    SELECT -1, r.slot_name, r.lsn
-      FROM pg_catalog.pg_create_logical_replication_slot($1, $2, $3, $4) r
-    UNION ALL
     -- Each primary segment: putting the call in the target list of a scan over
     -- gp_dist_random('gp_id') pushes execution down to the segments (LATERAL would
     -- instead be pulled back to the coordinator).  The record is expanded in the
     -- outer query so the volatile function is called only once per segment.
-    SELECT x.seg, (x.r).slot_name, (x.r).lsn
-      FROM (SELECT gp_execution_segment() AS seg,
-                   pg_catalog.pg_create_logical_replication_slot($1, $2, $3, $4) AS r
-              FROM gp_dist_random('gp_id')) x;
+    -- MATERIALIZED so that it is one scan, computed where it stands.
+    WITH segs AS MATERIALIZED (
+        SELECT x.seg AS seg, (x.r).slot_name AS slot_name, (x.r).lsn AS lsn
+          FROM (SELECT gp_execution_segment() AS seg,
+                       pg_catalog.pg_create_logical_replication_slot($1, $2, $3, $4) AS r
+                  FROM gp_dist_random('gp_id')) x
+    )
+    SELECT seg, slot_name, lsn FROM segs
+    UNION ALL
+    -- Coordinator (gp_segment_id = -1), after them: it reads segs, so it cannot
+    -- be evaluated until every segment has answered.  SQL orders nothing by
+    -- itself, so the order has to be a dependency to be an order at all.
+    SELECT -1, (y.r).slot_name, (y.r).lsn
+      FROM (SELECT pg_catalog.pg_create_logical_replication_slot($1, $2, $3, $4) AS r
+              FROM (SELECT count(*) FROM segs) done) y;
 $$ LANGUAGE SQL;
 
 -- Drop a cluster-wide replication slot.  Idempotent on purpose: it drops the
