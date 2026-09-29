@@ -143,6 +143,7 @@ static const char *kv_get(List *kv, const char *key);
 static const char *kv_get_seg(List *kv, const char *key, int seg);
 static List *parse_int64_list(const char *value);
 static void parse_local_snapshot(const char *value, LrReaderStartPoint *start);
+static void parse_ds_cut(const char *value, LrReaderStartPoint *start);
 static XLogRecPtr parse_lsn(const char *value);
 
 const CustomScanMethods LrSourceScanMethods = {
@@ -580,6 +581,7 @@ do_connect(LrSourceState *state)
 		if ((v = kv_get_seg(state->kv, "pos", srcseg)) != NULL)
 			start.seg_pos = parse_lsn(v);
 		parse_local_snapshot(kv_get_seg(state->kv, "localsnap", srcseg), &start);
+		parse_ds_cut(kv_get(state->kv, "dscut"), &start);
 		applied = parse_int64_list(kv_get_seg(state->kv, "applied", srcseg));
 		start.napplied = list_length(applied);
 		if (start.napplied > 0)
@@ -1282,6 +1284,54 @@ kv_get_seg(List *kv, const char *key, int seg)
  * which is right for as long as the filter matters (it stops matching a
  * wraparound away, and stops mattering long before that).
  */
+/*
+ * "xmax:g1,g2,..." -- the distributed half of the cut point, the same for
+ * every source segment.  The in-progress list is short: it holds only the
+ * distributed transactions that were still running at the cut, and it stops
+ * mattering shortly after the synchronisation ends, when everything arriving
+ * is at or above xmax and falls out on the first test.
+ */
+static void
+parse_ds_cut(const char *value, LrReaderStartPoint *start)
+{
+	char	   *copy,
+			   *saveptr = NULL,
+			   *tok,
+			   *rest;
+	List	   *gxids = NIL;
+	ListCell   *lc;
+	int64	   *arr;
+	int			i = 0;
+
+	if (value == NULL || *value == '\0')
+		return;
+	copy = pstrdup(value);
+	tok = strtok_r(copy, ":", &saveptr);
+	if (tok == NULL)
+		return;
+	start->ds_xmax = strtoll(tok, NULL, 10);
+	if (start->ds_xmax == 0)
+		return;
+
+	rest = strtok_r(NULL, ":", &saveptr);
+	for (tok = rest ? strtok_r(rest, ",", &saveptr) : NULL; tok != NULL;
+		 tok = strtok_r(NULL, ",", &saveptr))
+	{
+		int64	   *v = palloc(sizeof(int64));
+
+		*v = strtoll(tok, NULL, 10);
+		gxids = lappend(gxids, v);
+	}
+	start->nds_inprogress = list_length(gxids);
+	if (start->nds_inprogress > 0)
+	{
+		arr = palloc(sizeof(int64) * start->nds_inprogress);
+		foreach(lc, gxids)
+			arr[i++] = *(int64 *) lfirst(lc);
+		start->ds_inprogress = arr;
+	}
+}
+
 static void
 parse_local_snapshot(const char *value, LrReaderStartPoint *start)
 {

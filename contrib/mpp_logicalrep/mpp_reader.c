@@ -139,6 +139,11 @@ struct LrReaderState
 	TransactionId sync_xmax;
 	int			nsync_xip;
 	TransactionId *sync_xip;
+
+	/* the distributed half of the same cut point (LrReaderStartPoint) */
+	int64		ds_xmax;
+	int			nds_inprogress;
+	int64	   *ds_inprogress;
 	List	   *pending;		/* LrTxn*: ready, not yet reported */
 	List	   *local_ready;	/* LrTxn*: local, committed, in stream order */
 
@@ -194,6 +199,7 @@ static void txn_abort_subxact(LrReaderState *st, LrTxn *txn,
 							  TransactionId subxid);
 static bool parse_gid(const char *gid, int64 *gxid);
 static bool txn_covered_by_sync(LrReaderState *st, TransactionId xid);
+static bool gxid_covered_by_sync(LrReaderState *st, int64 gxid);
 static void maybe_spill(LrReaderState *st);
 static void changelog_init(LrChangeLog *log);
 static void changelog_append(LrReaderState *st, LrChangeLog *log,
@@ -262,6 +268,14 @@ LrReaderCreate(Oid subid, int srcseg, int64 token, const LrReaderStartPoint *sta
 		st->replay_seg_pos = start->seg_pos;
 		st->sync_xmin = start->sync_xmin;
 		st->sync_xmax = start->sync_xmax;
+		st->ds_xmax = start->ds_xmax;
+		st->nds_inprogress = start->nds_inprogress;
+		if (start->nds_inprogress > 0)
+		{
+			st->ds_inprogress = palloc(sizeof(int64) * start->nds_inprogress);
+			memcpy(st->ds_inprogress, start->ds_inprogress,
+				   sizeof(int64) * start->nds_inprogress);
+		}
 		st->nsync_xip = start->nsync_xip;
 		if (start->nsync_xip > 0)
 		{
@@ -1135,16 +1149,21 @@ txn_finish(LrReaderState *st, LrTxn *txn, LrTxnState state,
 		txn->kind = LR_TXN_LOCAL;
 
 	/*
-	 * Replay dedup, and for a local transaction the initial copy's as well.
-	 * A transaction with a gxid is judged by the driver against the
-	 * distributed snapshot of the cut point; one without has no gxid to judge
-	 * and is judged here instead, against this segment's own snapshot at the
-	 * same cut point.  Both answer the one question: is it in the copy
-	 * already?
+	 * Replay dedup, and the initial copy's as well.  Both kinds are judged
+	 * here against the cut point: one with a gxid by the distributed snapshot
+	 * taken there, one without by this segment's own snapshot taken at the
+	 * same moment.  Both answer the one question: is it in the copy already?
+	 *
+	 * The driver asks the same of a transaction with a gxid, and drops it in
+	 * commit order -- but only when the source coordinator's stream has told
+	 * it the transaction exists, and that stream begins at a point of its own.
+	 * What it never hears of it never releases, so the question is settled
+	 * here too rather than left to it.
 	 */
 	if (txn->gxid != 0)
 	{
-		if (hash_search(st->applied, &txn->gxid, HASH_FIND, NULL) != NULL)
+		if (hash_search(st->applied, &txn->gxid, HASH_FIND, NULL) != NULL ||
+			gxid_covered_by_sync(st, txn->gxid))
 		{
 			txn_drop(st, txn);
 			return;
@@ -1189,6 +1208,28 @@ txn_covered_by_sync(LrReaderState *st, TransactionId xid)
 		return true;			/* long finished by then */
 	for (int i = 0; i < st->nsync_xip; i++)
 		if (TransactionIdEquals(xid, st->sync_xip[i]))
+			return false;		/* in flight at the cut point: not copied */
+	return true;
+}
+
+/*
+ * Was this distributed transaction already in the initial copy?
+ *
+ * The same question txn_covered_by_sync() asks of a local transaction, put to
+ * the distributed snapshot of the same cut point rather than to this
+ * segment's own.  The driver asks it too, but only of transactions the source
+ * coordinator's stream told it about, and that stream need not carry one this
+ * segment's stream does -- the two slots do not begin at the same point.  A
+ * transaction nobody asks about is a transaction nobody releases, so it is
+ * answered here as well.  Self-limiting for the same reason as the local one.
+ */
+static bool
+gxid_covered_by_sync(LrReaderState *st, int64 gxid)
+{
+	if (st->ds_xmax == 0 || gxid == 0 || gxid >= st->ds_xmax)
+		return false;
+	for (int i = 0; i < st->nds_inprogress; i++)
+		if (st->ds_inprogress[i] == gxid)
 			return false;		/* in flight at the cut point: not copied */
 	return true;
 }

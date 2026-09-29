@@ -113,6 +113,20 @@ typedef struct LrReaderStartPoint
 	TransactionId sync_xmax;
 	int			nsync_xip;
 	const TransactionId *sync_xip;
+
+	/*
+	 * The distributed half of the same cut point, which is the whole cluster's
+	 * and not this segment's: a transaction with a gxid below xmax and not in
+	 * progress at it is in the copy already.  The driver asks the same
+	 * question, but only of transactions it has been told about, and it is
+	 * told by the source coordinator's stream -- which need not carry a
+	 * transaction this segment's stream does.  Nothing would ever release
+	 * those, so they are answered here as well.  xmax 0 = no copy, or none
+	 * recorded.
+	 */
+	int64		ds_xmax;
+	int			nds_inprogress;
+	const int64 *ds_inprogress;
 } LrReaderStartPoint;
 
 typedef enum LrReceiveResult

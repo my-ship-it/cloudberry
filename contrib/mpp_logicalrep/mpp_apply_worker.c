@@ -256,6 +256,8 @@ typedef struct LrDriver
 	LrWorkerReport rep;
 } LrDriver;
 
+static const LrSyncCut *sync_cut_any(LrDriver *d);
+
 static void driver_load_source_segments(LrDriver *d);
 static void driver_connect_readers(LrDriver *d);
 static void driver_connect_source(LrDriver *d);
@@ -900,6 +902,24 @@ driver_connect_readers(LrDriver *d)
 						 s, d->seg_flush[s], s, d->seg_pos[s]);
 		if (s < d->cfg->nsync_local && d->cfg->sync_local[s] != NULL)
 			appendStringInfo(&spec, "localsnap.%d=%s\n", s, d->cfg->sync_local[s]);
+	}
+
+	/*
+	 * The distributed half of the cut point, one for the whole cluster.  The
+	 * earliest of them, which is the marker's: a reader drops by it without
+	 * asking anyone, so it may only drop what every table's copy has.
+	 */
+	{
+		const LrSyncCut *any = sync_cut_any(d);
+
+		if (any != NULL && any->ds_xmax != 0)
+		{
+			appendStringInfo(&spec, "dscut=" INT64_FORMAT ":", any->ds_xmax);
+			for (int i = 0; i < any->nds_inprogress; i++)
+				appendStringInfo(&spec, "%s" INT64_FORMAT,
+								 i ? "," : "", any->ds_inprogress[i]);
+			appendStringInfoChar(&spec, '\n');
+		}
 	}
 
 	/* applied gxids above seg_flush, per segment */
