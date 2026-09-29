@@ -1815,9 +1815,11 @@ static void
 sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt)
 {
 	PGresult   *res;
+	PGresult   *mres;
 	char		subid[16];
 	const char *params[1] = {subid};
 	int			n;
+	int			nmarker;
 
 	snprintf(subid, sizeof(subid), "%u", cfg->subid);
 	cfg->nsync_cuts = 0;
@@ -1838,21 +1840,41 @@ sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt)
 					"   AND r.sync_snapshot IS NOT NULL",
 					1, params);
 	n = PQntuples(res);
-	if (n > 0)
+
+	/*
+	 * The marker row carries the earliest cut point of the lot.  It is kept
+	 * as a cut of its own with no relation name: the catch-all that
+	 * sync_cut_for() falls back to, and the only thing that can answer for a
+	 * transaction no segment reported -- one from before the cut may have
+	 * parts on segments whose streams begin after it, so its table names are
+	 * never going to arrive.  Coverage is monotone in cut-point order, so
+	 * what the earliest covers every table's copy has.
+	 */
+	mres = sync_exec(s, s->tgt2, "target",
+					 "SELECT sync_snapshot FROM pg_catalog.gp_subscription_rel "
+					 "WHERE subid = $1 AND relid = 0 AND sync_snapshot IS NOT NULL",
+					 1, params);
+	nmarker = PQntuples(mres) == 1 ? 1 : 0;
+
+	if (n + nmarker > 0)
 	{
 		LrSyncCut  *cuts;
 
-		cuts = (LrSyncCut *) MemoryContextAllocZero(cxt, sizeof(LrSyncCut) * n);
-		for (int i = 0; i < n; i++)
+		cuts = (LrSyncCut *) MemoryContextAllocZero(cxt,
+													sizeof(LrSyncCut) * (n + nmarker));
+		for (int i = 0; i < n + nmarker; i++)
 		{
+			const char *ds = i < n ? PQgetvalue(res, i, 1) : PQgetvalue(mres, 0, 0);
 			char	  **local;
 			int			nlocal;
 
-			cuts[i].relname = MemoryContextStrdup(cxt, PQgetvalue(res, i, 0));
-			sync_parse_ds(PQgetvalue(res, i, 1), &cuts[i], cxt);
+			/* the marker's entry keeps relname NULL: that is what marks it */
+			if (i < n)
+				cuts[i].relname = MemoryContextStrdup(cxt, PQgetvalue(res, i, 0));
+			sync_parse_ds(ds, &cuts[i], cxt);
 
 			/* and this table's own local half, for transactions with no gxid */
-			sync_parse_local(PQgetvalue(res, i, 1), cxt, &nlocal, &local);
+			sync_parse_local(ds, cxt, &nlocal, &local);
 			if (nlocal > 0)
 			{
 				cuts[i].local = (LrLocalSnap *)
@@ -1863,23 +1885,19 @@ sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt)
 			}
 		}
 		cfg->sync_cuts = cuts;
-		cfg->nsync_cuts = n;
+		cfg->nsync_cuts = n + nmarker;
 	}
-	PQclear(res);
 
 	/*
-	 * The marker row carries the earliest cut point, and its local half is
-	 * what a reader drops a local transaction by -- outright, without asking
-	 * the coordinator, so it may only drop what every table's copy has.
+	 * The marker's local half again, on its own: it is what a reader drops a
+	 * local transaction by -- outright, without asking the coordinator, so it
+	 * may only drop what every table's copy has.
 	 */
-	res = sync_exec(s, s->tgt2, "target",
-					"SELECT sync_snapshot FROM pg_catalog.gp_subscription_rel "
-					"WHERE subid = $1 AND relid = 0 AND sync_snapshot IS NOT NULL",
-					1, params);
-	if (PQntuples(res) == 1)
-		sync_parse_local(PQgetvalue(res, 0, 0), cxt,
+	if (nmarker)
+		sync_parse_local(PQgetvalue(mres, 0, 0), cxt,
 						 &cfg->nsync_local, &cfg->sync_local);
 	PQclear(res);
+	PQclear(mres);
 }
 
 /* ------------------------------------------------------------------------
