@@ -22,6 +22,7 @@ test: faults
 test: crash_recovery
 test: shutdown
 test: sync_filter
+test: reader_cut_filter
 test: per_table_cut
 test: utility_writes
 test: add_utility_writes

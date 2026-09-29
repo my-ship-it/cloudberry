@@ -1,0 +1,151 @@
+-- What a reader drops on its own, and what it must not.
+--
+-- The cut point has two halves.  The local one -- each source segment's own
+-- snapshot, frozen there -- has always gone to the readers, and a
+-- transaction with no gxid is dropped by it there and then.  A transaction
+-- with a gxid was left to the driver, which judges it against the
+-- distributed half.
+--
+-- The driver only judges what it has been told exists, and it is told by the
+-- source coordinator's stream.  That stream begins at a point of its own,
+-- not the segment's, so it need not carry a transaction the segment's stream
+-- does -- and nothing releases a transaction nobody asks about.  So the
+-- distributed half goes to the readers as well, and this pins that it is
+-- used and that it is not used for too much.
+--
+-- Both are arranged rather than raced for: the subscription is stopped, the
+-- source is given the transactions that tell the answers apart, the cut
+-- point is written by hand, and the coordinator position is moved past them
+-- so that the driver is never told about them at all.  Then:
+--
+--   601, 602, 603  below the cut, no event   -> the reader drops them itself,
+--                                               and holds nothing afterwards
+--   604            above the cut, with event -> applied, which is what says
+--                                               the filter is not simply
+--                                               dropping everything
+
+CREATE DATABASE mpp_lr_rcf;
+CREATE
+
+CREATE TABLE rcf_t (id int, v text) DISTRIBUTED BY (id);
+CREATE
+INSERT INTO rcf_t SELECT g, 'seed' FROM generate_series(1, 50) g;
+INSERT 50
+CREATE PUBLICATION rcf_pub FOR TABLE rcf_t;
+CREATE
+
+1:@db_name mpp_lr_rcf: CREATE TABLE rcf_t (id int, v text) DISTRIBUTED BY (id);
+CREATE
+1:@db_name mpp_lr_rcf: CREATE FUNCTION lr_wait(cond text) RETURNS bool AS $$ DECLARE ok bool; BEGIN FOR i IN 1 .. 600 LOOP EXECUTE cond INTO ok; IF ok THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+1:@db_name mpp_lr_rcf: CREATE FUNCTION lr_worker_gone() RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 300 LOOP PERFORM pg_stat_clear_snapshot(); SELECT count(*) INTO n FROM pg_stat_activity WHERE backend_type = 'mpp apply worker' AND datname = current_database(); IF n = 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+CREATE
+
+1:@db_name mpp_lr_rcf: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION rcf_sub CONNECTION %L PUBLICATION rcf_pub WITH (slot_name = ''rcf_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
+DO
+1:@db_name mpp_lr_rcf: SELECT lr_wait($$SELECT count(*) = 1 FROM gp_subscription_rel r JOIN pg_subscription s ON s.oid = r.subid WHERE s.subname = 'rcf_sub' AND r.relid <> 0 AND r.state = 'r'$$) AS synced;
+ synced 
+--------
+ t      
+(1 row)
+
+-- stop it, so that nothing moves until both halves have been installed
+1:@db_name mpp_lr_rcf: ALTER SUBSCRIPTION rcf_sub DISABLE;
+ALTER
+1:@db_name mpp_lr_rcf: SELECT lr_worker_gone() AS stopped;
+ stopped 
+---------
+ t       
+(1 row)
+
+-- three the readers will see and the driver will not hear of, one per key so
+-- that they do not all land on the same segment
+INSERT INTO rcf_t VALUES (601, 'below the cut');
+INSERT 1
+INSERT INTO rcf_t VALUES (602, 'below the cut');
+INSERT 1
+INSERT INTO rcf_t VALUES (603, 'below the cut');
+INSERT 1
+
+-- the cut point, as a synchronisation would have recorded it: taken now, so
+-- all three are below it.  gxids are cluster-wide, so this session's snapshot
+-- is the source's even though it is connected to the other database.
+1:@db_name mpp_lr_rcf: UPDATE gp_subscription_rel SET sync_snapshot = (SELECT 'xmax=' || xmax || ';inprogress=' || coalesce(array_to_string(in_progress, ','), '') FROM gp_current_distributed_snapshot());
+UPDATE 2
+1:@db_name mpp_lr_rcf: SELECT count(*) > 0 AS cut_written FROM gp_subscription_rel WHERE sync_snapshot LIKE 'xmax=%';
+ cut_written 
+-------------
+ t           
+(1 row)
+
+-- and the coordinator position past them, so no event for them ever arrives.
+-- One cluster, one coordinator WAL, so this is the source's position too.
+-- The segments' positions are left alone: the readers still read all three.
+-- Written rather than updated: nothing has committed a batch yet, so there is
+-- no row to update, and an UPDATE of none would leave the driver starting
+-- from the slot -- where it would be told about all three after all.
+1:@db_name mpp_lr_rcf: INSERT INTO gp_subscription_progress (subid, coordinator_lsn, seg_pos, seg_flush) SELECT s.oid, pg_current_wal_lsn(), z.a, z.a FROM pg_subscription s, (SELECT array_agg(cast(0 as int8)) AS a FROM gp_segment_configuration WHERE role = 'p' AND content >= 0) z WHERE s.subname = 'rcf_sub';
+INSERT 1
+1:@db_name mpp_lr_rcf: SELECT coordinator_lsn > cast('0/0' as pg_lsn) AS coord_moved, seg_flush AS readers_start_from_the_slot FROM gp_subscription_progress;
+ coord_moved | readers_start_from_the_slot 
+-------------+-----------------------------
+ t           | [0, 0, 0]                   
+(1 row)
+
+-- one above the cut, which the driver does hear about
+INSERT INTO rcf_t VALUES (604, 'above the cut');
+INSERT 1
+
+1:@db_name mpp_lr_rcf: ALTER SUBSCRIPTION rcf_sub ENABLE;
+ALTER
+1:@db_name mpp_lr_rcf: SELECT lr_wait('SELECT count(*) = 1 FROM rcf_t WHERE id = 604') AS the_stream_caught_up;
+ the_stream_caught_up 
+----------------------
+ t                    
+(1 row)
+
+-- the three below the cut were dropped, 604 was applied
+1:@db_name mpp_lr_rcf: SELECT count(*) AS below_the_cut_applied FROM rcf_t WHERE id IN (601, 602, 603);
+ below_the_cut_applied 
+-----------------------
+ 0                     
+(1 row)
+1:@db_name mpp_lr_rcf: SELECT count(*) AS above_the_cut_applied FROM rcf_t WHERE id = 604;
+ above_the_cut_applied 
+-----------------------
+ 1                     
+(1 row)
+
+-- and nothing is left holding them.  This is the whole point: without the
+-- distributed half a reader keeps a transaction the driver never asks for,
+-- for as long as it lives and again after every restart.
+1:@db_name mpp_lr_rcf: SELECT lr_wait($$SELECT coalesce(sum(buffered_txns), 0) = 0 FROM gp_stat_mpp_subscription_segments WHERE subname = 'rcf_sub'$$) AS readers_hold_nothing;
+ readers_hold_nothing 
+----------------------
+ t                    
+(1 row)
+1:@db_name mpp_lr_rcf: SELECT phase, stuck_errors FROM gp_stat_mpp_subscription WHERE subname = 'rcf_sub';
+ phase     | stuck_errors 
+-----------+--------------
+ streaming | 0            
+(1 row)
+
+1:@db_name mpp_lr_rcf: DROP SUBSCRIPTION rcf_sub;
+DROP
+1:@db_name mpp_lr_rcf: SELECT lr_worker_gone() AS worker_gone;
+ worker_gone 
+-------------
+ t           
+(1 row)
+1q: ... <quitting>
+SELECT gp_drop_replication_slot('rcf_slot');
+ gp_drop_replication_slot 
+--------------------------
+                          
+(1 row)
+DROP PUBLICATION rcf_pub;
+DROP
+DROP TABLE rcf_t;
+DROP
+DROP DATABASE mpp_lr_rcf;
+DROP
