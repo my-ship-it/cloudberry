@@ -1,11 +1,11 @@
 -- The initial synchronisation the module drives itself (mpp_tablesync.c):
--- slots -> barrier -> cut point -> segment-to-segment COPY -> streaming with
--- the DS_t filter.
+-- slots -> cut point -> segment-to-segment COPY -> streaming with the DS_t
+-- filter.
 --
 --   1  automatic sync of a two-table publication under a concurrent workload
 --   2  DISABLE / ENABLE: the worker comes back without re-synchronising
 --   3  copy_data = false: a pre-seeded table and pre-made slots.  No COPY,
---      but the barrier and the cut point happen all the same
+--      but the cut point is taken all the same
 --   4  a sync interrupted mid-copy is redone from scratch, and DROP takes the
 --      state rows with it
 --
@@ -150,11 +150,10 @@ SELECT count(*) AS rows, sum(hashtext(id || '|' || v || '|' || w)) AS digest FRO
 (1 row)
 
 -- ------------------------------------------------------------------
--- 3. copy_data = false: nothing is copied, but the slots, the barrier and
---    the cut point are taken all the same -- they are what says where the
---    stream may be believed from, and skipping them leaves a distributed
---    transaction that was in flight when the slots were made half in the
---    stream and half not
+-- 3. copy_data = false: nothing is copied, but the slots and the cut point
+--    are made all the same -- they are what says where the stream may be
+--    believed from, and skipping them leaves a distributed transaction that
+--    was in flight when the slots were made half in the stream and half not
 -- ------------------------------------------------------------------
 CREATE TABLE is_c (id int PRIMARY KEY, v text) DISTRIBUTED BY (id);
 CREATE

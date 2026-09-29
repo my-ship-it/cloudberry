@@ -8,7 +8,7 @@
 -- transactions its own says were already copied.
 --
 -- The window to hit is "after the slots are consistent, before the cut
--- point".  Rather than race the barrier for it, this arranges it exactly: a
+-- point".  Rather than race for it, this arranges it exactly: a
 -- subscription that has already synchronised has consistent slots retaining
 -- WAL, so a write made while it is stopped is certainly in the stream, and a
 -- copy redone afterwards certainly contains it.

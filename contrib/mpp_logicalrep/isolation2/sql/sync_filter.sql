@@ -8,7 +8,8 @@
 -- synchronisation that made it -- which is the part worth pinning.
 --
 -- Catching a real transaction in flight at a real cut point is a race (the
--- barrier exists to make the window small), so the cut point here is
+-- window is small: creating the slots has just waited every one of them
+-- out), so the cut point here is
 -- synthesised: the subscription is stopped, the source is given exactly the
 -- transactions that tell the two answers apart, and sync_snapshot is written
 -- by hand from a snapshot taken while one of them is still open.  The filter

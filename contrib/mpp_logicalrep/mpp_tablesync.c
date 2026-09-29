@@ -9,33 +9,50 @@
  *
  *   S1  slots       cluster-wide logical slots on the source (coordinator +
  *                   every segment, two_phase) if they do not exist yet
- *   S2  barrier     DS_pre := distributed snapshot; wait until the current
- *                   snapshot's xmin >= DS_pre.xmax, so every distributed
- *                   transaction in flight when the slots were created has
- *                   completed on all segments
- *   S3  cut point   BEGIN REPEATABLE READ on the source; in one statement
+ *   S2  cut point   BEGIN REPEATABLE READ on the source; in one statement
  *                   read L_t = pg_current_wal_lsn() and
  *                   DS_t = gp_current_distributed_snapshot()
- *   S4  copy        per table, inside that transaction: the target runs
+ *   S3  copy        per table, inside that transaction: the target runs
  *                   INSERT INTO t SELECT * FROM gp_lr_copy_recv(...) and the
  *                   source runs COPY (SELECT ...) TO PROGRAM
  *                   'cbdb_lr_copyhelper send ...' ON SEGMENT; data
  *                   goes segment to segment, the target's Motion redistributes
- *   S5  catch-up    the driver streams from the slots and drops every gxid
+ *   S4  catch-up    the driver streams from the slots and drops every gxid
  *                   visible under DS_t (already in the COPY); self-limiting
+ *
+ * What makes the cut point safe to believe is that S1 does not return until
+ * every node's slot has reached a consistent point, and a node reaches one
+ * only once every transaction that was running when its slot was made has
+ * ended there (pg_create_logical_replication_slot asks for the start point,
+ * DecodingContextFindStartpoint waits for it, SnapBuildFindSnapshot decides
+ * it).  A prepared transaction counts as running, so a distributed
+ * transaction that had prepared on a segment before that segment's slot
+ * began -- the one shape that can be in some segments' streams and not in
+ * others' -- has finished everywhere before S1 returns, and is therefore
+ * below the cut point taken in S2, where the driver recognises it as already
+ * in the copy and drops it whole.
+ *
+ * There is no barrier of our own between the two.  There was, and it was
+ * measured against the distributed snapshot's xmax, which cannot see the
+ * transactions it was meant to wait for: xmax is latestCompletedGxid + 1 and
+ * CreateDistributedSnapshot() leaves out every gxid at or above it, so with
+ * one transaction in flight the snapshot reads xmin = xmax = that gxid and
+ * the wait ended where it began.  Measured against the source's next
+ * distributed xid instead it would have worked -- and waited for nothing,
+ * every time, because S1 had already waited.
  *
  * State lives in the target's gp_subscription_rel:
  *   relid = 0 is the subscription-level marker: 'd' while a sync is in
  *   progress, 'n' while one that will not copy is, 'r' when the streaming
  *   phase may run (sync_snapshot holds DS_t for restarts).
- *   copy_data=false at CREATE SUBSCRIPTION writes the marker as 'n': S1 to
- *   S3 run as always and only S4 is skipped, because what makes the stream
- *   safe to start from is the barrier and the cut point, not the copy.  A
- *   slot begins at a position of its own on each source node, so without
- *   the barrier a distributed transaction in flight when the slots were
- *   made is in some segments' streams and not others', and applying the
- *   half that is there writes part of a transaction; the cut point is what
- *   the driver then drops it by.
+ *   copy_data=false at CREATE SUBSCRIPTION writes the marker as 'n': S1 and
+ *   S2 run as always and only S3 is skipped, because what makes the stream
+ *   safe to start from is the slots and the cut point, not the copy.  A
+ *   slot begins at a position of its own on each source node, so a
+ *   distributed transaction in flight when the slots were made is in some
+ *   segments' streams and not others', and applying the half that is there
+ *   writes part of a transaction; the cut point is what the driver drops it
+ *   by.
  *   relid > 0 rows track each table: i -> d -> f -> r.  A table the source
  *   cannot decode (anything but heap) ends at 's' instead of 'r' when the
  *   subscription asked for unsupported_tables = 'snapshot': copied once, and
@@ -80,7 +97,6 @@
 int			gp_lr_slot_loss_action = LR_SLOT_LOSS_REINIT;
 
 #define LR_SYNC_MARKER_RELID	0
-#define LR_SYNC_BARRIER_TIMEOUT_MS	120000
 #define LR_SYNC_PORTS_TIMEOUT_MS	120000
 #define LR_SYNC_POLL_MS				100
 #define LR_SYNC_POLL_FIRST_MS		1
@@ -246,7 +262,6 @@ static void sync_fetch_tables(LrSync *s);
 static void sync_write_states(LrSync *s, char marker_state, char rel_state,
 							  bool truncate);
 static void sync_ensure_slots(LrSync *s);
-static void sync_barrier(LrSync *s);
 static void sync_cut_point(LrSync *s);
 static void sync_copy_all(LrSync *s);
 static void sync_cut_only(LrSync *s);
@@ -272,7 +287,6 @@ static void sync_finish(LrSync *s);
 static void sync_load_cuts(LrSync *s, LrWorkerConfig *cfg, MemoryContext cxt);
 static int	sync_count_slots(LrSync *s);
 static bool sync_handle_slot_loss(LrSync *s);
-static void sync_wait(LrSync *s, int ms);
 static void sync_check_interrupts(LrSync *s);
 
 /* ------------------------------------------------------------------------
@@ -350,14 +364,14 @@ LrInitialSync(LrWorkerConfig *cfg)
 			sync_fetch_tables(s);
 			sync_write_states(s, nocopy ? 'n' : 'd', 'i', restart);
 			sync_ensure_slots(s);
-			sync_barrier(s);
 
 			/*
 			 * A cut point, and the transaction that holds it, per table.
 			 * One transaction over the whole set would hold the source's
 			 * xmin back for as long as the slowest copy -- long enough,
-			 * measured, to stall another subscription's barrier -- and what
-			 * it buys is a snapshot consistent across the set, which is more
+			 * measured, to stall another subscription's slot creation --
+			 * and what it buys is a snapshot consistent across the set,
+			 * which is more
 			 * than the stream that follows preserves anyway.  The price is
 			 * that the streaming filter is per table (LrSyncCut): one
 			 * transaction can be inside one table's copy and not another's.
@@ -621,16 +635,6 @@ sync_check_interrupts(LrSync *s)
 		ereport(ERROR,
 				(errcode(ERRCODE_ADMIN_SHUTDOWN),
 				 errmsg("initial sync interrupted: the subscription changed")));
-}
-
-/* a latch wait that honours the worker's stop request */
-static void
-sync_wait(LrSync *s, int ms)
-{
-	sync_check_interrupts(s);
-	(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					 ms, WAIT_EVENT_LOGICAL_SYNC_DATA);
-	ResetLatch(MyLatch);
 }
 
 /* ------------------------------------------------------------------------
@@ -1447,7 +1451,7 @@ sync_finish(LrSync *s)
 }
 
 /* ------------------------------------------------------------------------
- * S1 slots, S2 barrier, S3 cut point
+ * S1 slots, S2 cut point
  * ------------------------------------------------------------------------
  */
 
@@ -1578,56 +1582,6 @@ sync_ensure_slots(LrSync *s)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("initial sync: created slot \"%s\" on %d of %d source nodes",
 						s->cfg->seg_slot, have, s->nsrcsegs + 1)));
-}
-
-/* one REPEATABLE READ transaction reading one column of the snapshot */
-static int64
-sync_snapshot_field(LrSync *s, const char *field)
-{
-	PGresult   *res;
-	char	   *sql = psprintf("SELECT %s FROM gp_current_distributed_snapshot()", field);
-	int64		v;
-
-	PQclear(sync_exec(s, s->src, "source", "BEGIN ISOLATION LEVEL REPEATABLE READ", 0, NULL));
-	res = sync_exec(s, s->src, "source", sql, 0, NULL);
-	v = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
-	PQclear(res);
-	PQclear(sync_exec(s, s->src, "source", "COMMIT", 0, NULL));
-	pfree(sql);
-	return v;
-}
-
-static void
-sync_barrier(LrSync *s)
-{
-	int64		xmax_pre = sync_snapshot_field(s, "xmax");
-	TimestampTz started = GetCurrentTimestamp();
-
-	/*
-	 * Say what is being waited for.  A barrier that sits here for its whole
-	 * budget and then fails is otherwise a minute of silence followed by one
-	 * number with nothing to compare it against.
-	 */
-	elog(LOG, "mpp apply worker: subscription %u: barrier: waiting for the distributed transactions below " INT64_FORMAT " to finish",
-		 s->cfg->subid, xmax_pre);
-
-	for (;;)
-	{
-		int64		xmin = sync_snapshot_field(s, "xmin");
-
-		if (xmin >= xmax_pre)
-		{
-			elog(LOG, "mpp apply worker: subscription %u: barrier passed (xmin " INT64_FORMAT " >= " INT64_FORMAT ")",
-				 s->cfg->subid, xmin, xmax_pre);
-			return;
-		}
-		if (TimestampDifferenceExceeds(started, GetCurrentTimestamp(), LR_SYNC_BARRIER_TIMEOUT_MS))
-			ereport(ERROR,
-					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("initial sync: distributed transactions in flight at slot creation did not finish within %d s (xmin " INT64_FORMAT ", waiting for " INT64_FORMAT ")",
-							LR_SYNC_BARRIER_TIMEOUT_MS / 1000, xmin, xmax_pre)));
-		sync_wait(s, 200);
-	}
 }
 
 /* opens the source transaction that every COPY runs in */
@@ -2314,7 +2268,7 @@ sync_lane_open(LrSync *lead)
 
 	/*
 	 * Its own sessions on both sides.  The lead reaches the source on its way
-	 * to the barrier; a lane never passes that way, so it connects here --
+	 * to the slots; a lane never passes that way, so it connects here --
 	 * which is also where its nsrcsegs comes from.
 	 */
 	sync_connect(lane);			/* reads the same settings for itself */
@@ -2434,12 +2388,14 @@ sync_copy_all(LrSync *s)
  * has one of its own (a lane inside one table's copy and not another's) does
  * not arise.
  *
- * What it is for here is the transactions the barrier just waited out: they
- * were in flight when the slots were made, so a segment that committed its
- * part before its own slot started left that part out of the stream while
- * another segment's part is in it.  Applying what arrived would write half a
- * transaction.  Under this cut point the driver drops them whole instead --
- * they belong to the state the target was declared to already hold.
+ * What it is for here is the transactions that were in flight when the slots
+ * were made: a segment that committed its part before its own slot started
+ * left that part out of the stream while another segment's part is in it.
+ * Applying what arrived would write half a transaction.  They have all
+ * finished by now -- creating a slot does not return until they have --
+ * so they are below this cut point, and under it the driver drops them
+ * whole instead; they belong to the state the target was declared to
+ * already hold.
  */
 static void
 sync_cut_only(LrSync *s)
@@ -2522,7 +2478,8 @@ LrSyncPendingNames(PGconn *qd, Oid subid)
  * only started deferring their changes when it noticed them, so whatever the
  * target holds may already be in the COPY.
  *
- * No S2 barrier here (unlike the initial sync): the slots exist and the
+ * Nothing is waited for first (unlike the initial sync, where creating the
+ * slots waits for a consistent point on every node): the slots exist and the
  * readers have been buffering the whole stream all along, so no transaction
  * can fall between "not in the stream" and "not in the snapshot".
  */
@@ -2783,9 +2740,8 @@ sync_open_state_table(const char *name, LOCKMODE lockmode)
 /*
  * copy_data = false: the tables are already in sync; write the marker as
  * 'n' so the worker runs the synchronisation without the copy -- it still
- * makes the slots, waits the barrier out and takes a cut point, which is
- * what decides where the stream may be believed from (see the top of this
- * file).
+ * makes the slots and takes a cut point, which is what decides where the
+ * stream may be believed from (see the top of this file).
  */
 void
 LrSyncMarkNoCopy(Oid subid)

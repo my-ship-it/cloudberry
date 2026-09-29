@@ -1523,11 +1523,11 @@ driver_collect_ready(LrDriver *d)
  * never end: a segment whose part of the transaction lies before that
  * segment's own slot, which its reader will never see.  That case is now
  * decided rather than guessed at.  Such a transaction was in flight when the
- * slots were made, the S2 barrier waits for every one of those to finish
- * before the cut point is taken, so the cut point covers it -- its rows are
- * in the initial copy -- and driver_collect_ready() drops it on that
- * evidence before it ever gets here.  Every subscription has a cut point,
- * copy_data = false included.
+ * slots were made, and creating a slot does not return until every
+ * transaction that was running on that node has finished, so it is below
+ * the cut point taken next -- its rows are in the initial copy -- and
+ * driver_collect_ready() drops it on that evidence before it ever gets
+ * here.  Every subscription has a cut point, copy_data = false included.
  *
  * So a wait that does not end means something is wrong rather than merely
  * slow, and the warning below says so without acting on it.
