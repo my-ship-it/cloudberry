@@ -2677,10 +2677,19 @@ ReorderBufferReplay(ReorderBufferTXN *txn,
 	 * database, so there's nothing to decode.  Note that
 	 * ReorderBufferCommitChild will have transferred any snapshots from
 	 * subtransactions if there were any.
+	 *
+	 * Its invalidation messages are another matter: nothing to decode is not
+	 * nothing to do, since the transaction could still have manipulated the
+	 * catalog, and below this the transaction may be freed and they would be
+	 * freed with it.  Executing them needs no snapshot (see
+	 * ReorderBufferForget), so the one this transaction has not got is no
+	 * reason to leave them unexecuted.
 	 */
 	if (txn->base_snapshot == NULL)
 	{
-		Assert(txn->ninvalidations == 0);
+		if (txn->ninvalidations > 0)
+			ReorderBufferImmediateInvalidation(rb, txn->ninvalidations,
+											   txn->invalidations);
 
 		/*
 		 * Removing this txn before a commit might result in the computation
@@ -4068,11 +4077,17 @@ ReorderBufferStreamTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 
 		/*
 		 * If this transaction has no snapshot, it didn't make any changes to
-		 * the database till now, so there's nothing to decode.
+		 * the database till now, so there's nothing to decode.  Its
+		 * invalidation messages are executed all the same, for the reason
+		 * given in ReorderBufferForget: they need no snapshot, and a
+		 * transaction whose contents do not interest us may still have
+		 * manipulated the catalog.
 		 */
 		if (txn->base_snapshot == NULL)
 		{
-			Assert(txn->ninvalidations == 0);
+			if (txn->ninvalidations > 0)
+				ReorderBufferImmediateInvalidation(rb, txn->ninvalidations,
+												   txn->invalidations);
 			return;
 		}
 
