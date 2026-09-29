@@ -1451,6 +1451,17 @@ driver_collect_ready(LrDriver *d)
 	 * of the same row, which may wait out the grace period because a
 	 * dispatched-but-empty segment never reports it).
 	 */
+	/*
+	 * Nothing is collected while the held transactions of a finished copy
+	 * are being replayed.  Those are the only units handed out then, and
+	 * committing one resets the context a collected batch lives in -- so a
+	 * batch collected here would be freed without ever being applied, and
+	 * its transactions left flagged in_batch, which is this loop's own
+	 * reason to ignore them ever after.
+	 */
+	if (d->catchup_mode)
+		return;
+
 	cap = hash_get_num_entries(d->gxids);
 	if (cap == 0)
 		return;
@@ -1999,8 +2010,14 @@ driver_drain(LrDriver *d, int64 gxid, int nsegs, const int16 *segs, int wait_ms)
 	pfree(relg.data);
 	pfree(rell.data);
 
-	/* local transactions join the batch as they come */
-	if (d->locals != NIL)
+	/*
+	 * Local transactions join the batch as they come -- but not while the
+	 * held transactions of a finished copy are being replayed, for the same
+	 * reason driver_collect_ready() collects nothing then: the batch lives in
+	 * the context a catch-up commit resets.  They stay staged in d->locals,
+	 * which is the driver's own memory, and join the next batch instead.
+	 */
+	if (d->locals != NIL && !d->catchup_mode)
 	{
 		oldcxt = MemoryContextSwitchTo(d->batchcxt);
 		if (d->batch_gxids == NIL && d->batch_locals == NIL)
@@ -2491,6 +2508,14 @@ driver_sync_progress(LrDriver *d)
 	 * in between, so nothing that arrives meanwhile slips in between the
 	 * catch-up and the moment the tables go live.
 	 */
+	/*
+	 * Not while a batch is pending, for the same reason: it lives in the
+	 * context the catch-up commit resets.  A batch closes on its own
+	 * latency, so this costs a pass of the apply loop and nothing else.
+	 */
+	if (d->batch_gxids != NIL || d->batch_locals != NIL)
+		return false;
+
 	d->catchup_mode = true;
 	return true;
 }
@@ -3170,7 +3195,17 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 		d->rep.last_commit_time = GetCurrentTimestamp();
 		driver_publish(d);
 		MemoryContextSwitchTo(oldcxt);
-		MemoryContextReset(d->batchcxt);
+
+		/*
+		 * A pending batch lives in this context, and there must not be one:
+		 * none is collected while catching up, and catching up does not
+		 * start while one is pending.  If there somehow were, resetting
+		 * would throw those transactions away unapplied -- leaking a context
+		 * is the better half of that bargain.
+		 */
+		Assert(d->batch_gxids == NIL && d->batch_locals == NIL);
+		if (d->batch_gxids == NIL && d->batch_locals == NIL)
+			MemoryContextReset(d->batchcxt);
 		return;
 	}
 
