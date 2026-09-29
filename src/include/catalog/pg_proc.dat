@@ -12393,6 +12393,28 @@
   proargtypes => '', proallargtypes => '{int8,int8,_int8}', proargmodes => '{o,o,o}',
   proargnames => '{xmin,xmax,in_progress}', prosrc => 'gp_current_distributed_snapshot' },
 
+{ oid => 7008, descr => 'create a logical replication slot on every node of the cluster',
+  proname => 'gp_create_cluster_logical_slot', prorows => '100', proretset => 't',
+  prorettype => 'record', provolatile => 'v', proparallel => 'u', proexeclocation => 'c',
+  proargtypes => 'name name bool bool',
+  proallargtypes => '{name,name,bool,bool,int4,name,pg_lsn}',
+  proargmodes => '{i,i,i,i,o,o,o}',
+  proargnames => '{p_slot_name,p_plugin,p_temporary,p_twophase,gp_segment_id,slot_name,lsn}',
+  prosrc => 'gp_create_cluster_logical_slot' },
+
+{ oid => 7009, descr => 'create a logical replication slot and hold it unpersisted',
+  proname => 'gp_replication_slot_create_unpersisted', prorettype => 'pg_lsn',
+  provolatile => 'v', proparallel => 'u', proexeclocation => 'a',
+  proargtypes => 'name name bool',
+  proargnames => '{p_slot_name,p_plugin,p_twophase}',
+  prosrc => 'gp_replication_slot_create_unpersisted' },
+
+{ oid => 7010, descr => 'make the replication slot this session holds permanent',
+  proname => 'gp_replication_slot_persist', prorettype => 'bool',
+  provolatile => 'v', proparallel => 'u', proexeclocation => 'a',
+  proargtypes => 'name', proargnames => '{p_slot_name}',
+  prosrc => 'gp_replication_slot_persist' },
+
 { oid => 7007, descr => 'local snapshot of each segment, for a cut point',
   proname => 'gp_lr_local_snapshot', prorows => '1000', proretset => 't', prorettype => 'record', provolatile => 'v', proparallel => 'u', proexeclocation => 's',
   proargtypes => '', proallargtypes => '{int4,int8,int8,_int8}', proargmodes => '{o,o,o,o}',

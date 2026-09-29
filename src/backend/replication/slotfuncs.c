@@ -12,7 +12,10 @@
  */
 #include "postgres.h"
 
+#include "libpq-fe.h"
+
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -25,6 +28,10 @@
 #include "utils/inval.h"
 #include "utils/pg_lsn.h"
 #include "utils/resowner.h"
+
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+#include "cdb/cdbvars.h"
 
 static void
 warn_slot_only_created_on_segment(const char *name) {
@@ -952,4 +959,219 @@ Datum
 pg_copy_physical_replication_slot_b(PG_FUNCTION_ARGS)
 {
 	return copy_replication_slot(fcinfo, false);
+}
+
+
+/* ------------------------------------------------------------------------
+ * Cloudberry: one logical slot on every node of the cluster
+ *
+ * Logical decoding of a Cloudberry cluster is not one stream but one per
+ * primary segment plus the coordinator's, so a receiver's first act is a slot
+ * on every one of them.  Two things have to be true of that set, and neither
+ * comes for free.
+ *
+ * The segments' slots have to be made before the coordinator's.  Creating a
+ * slot does not return until that node has a consistent decoding start point,
+ * and a node reaches one only once every transaction that was running there
+ * has ended, so a distributed transaction still running on a segment when
+ * that segment's slot was made holds that segment's start point back past its
+ * own end and the segment's stream cannot carry it.  With the coordinator's
+ * made afterwards its start point is later than every segment's, so such a
+ * transaction's commit record falls before it and the coordinator's stream
+ * does not carry it either: nothing is ever told about a transaction no
+ * segment can give it -- for which, having not finished, no copy taken
+ * afterwards holds the rows either.
+ *
+ * And the set has to be all or none.  Slots are not transactional: an
+ * ordinary CREATE persists one the moment it returns, so a failure on the
+ * third node leaves the first two behind, holding WAL on the segments for as
+ * long as nobody notices.  So they are made in two passes.  The first creates
+ * each as ephemeral and keeps hold of it -- an ephemeral slot is deleted when
+ * released, and released on a top-level error, on backend exit, and by the
+ * abort callback below, which is what a distributed abort reaches a segment
+ * as.  The second, once every node has answered, makes them permanent.
+ * Anything that goes wrong in between leaves nothing behind, and a crash
+ * leaves nothing behind either, since StartupReplicationSlots deletes
+ * ephemeral slots.
+ *
+ * What is left is the second pass failing partway, which no amount of this
+ * can prevent while slot state is outside the transaction system.  It leaves
+ * slots rather than losing them, which is the direction that can be seen:
+ * count them per node before believing the set exists.
+ * ------------------------------------------------------------------------
+ */
+
+static bool gp_slot_abort_cb_registered = false;
+
+/*
+ * Release the slot this session is holding if it is still ephemeral, which
+ * deletes it.  A segment learns that the transaction is over as a command,
+ * not as an error of its own, so nothing else would.
+ */
+static void
+gp_slot_abort_callback(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT)
+		return;
+	if (MyReplicationSlot != NULL &&
+		MyReplicationSlot->data.persistency == RS_EPHEMERAL)
+		ReplicationSlotRelease();
+}
+
+/*
+ * First pass, on one node: create the slot and hold it, unpersisted.
+ */
+Datum
+gp_replication_slot_create_unpersisted(PG_FUNCTION_ARGS)
+{
+	Name		name = PG_GETARG_NAME(0);
+	Name		plugin = PG_GETARG_NAME(1);
+	bool		two_phase = PG_GETARG_BOOL(2);
+
+	CheckSlotPermissions();
+	CheckLogicalDecodingRequirements();
+
+	if (MyReplicationSlot != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this session already holds replication slot \"%s\"",
+						NameStr(MyReplicationSlot->data.name))));
+
+	if (!gp_slot_abort_cb_registered)
+	{
+		RegisterXactCallback(gp_slot_abort_callback, NULL);
+		gp_slot_abort_cb_registered = true;
+	}
+
+	/*
+	 * Deliberately neither persisted nor released: the second pass does both,
+	 * and until it runs an abort takes the slot with it.
+	 */
+	create_logical_replication_slot(NameStr(*name), NameStr(*plugin),
+									false, two_phase, InvalidXLogRecPtr, true);
+
+	PG_RETURN_LSN(MyReplicationSlot->data.confirmed_flush);
+}
+
+/*
+ * Second pass, on one node: make the held slot permanent and let go of it.
+ */
+Datum
+gp_replication_slot_persist(PG_FUNCTION_ARGS)
+{
+	Name		name = PG_GETARG_NAME(0);
+
+	if (MyReplicationSlot == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this session holds no replication slot to persist")));
+	if (strcmp(NameStr(MyReplicationSlot->data.name), NameStr(*name)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this session holds replication slot \"%s\", not \"%s\"",
+						NameStr(MyReplicationSlot->data.name), NameStr(*name))));
+
+	ReplicationSlotPersist();
+	ReplicationSlotRelease();
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * The cluster-wide create: the two passes above, segments before the
+ * coordinator, reporting what each node made.
+ */
+Datum
+gp_create_cluster_logical_slot(PG_FUNCTION_ARGS)
+{
+	Name		name = PG_GETARG_NAME(0);
+	Name		plugin = PG_GETARG_NAME(1);
+	bool		temporary = PG_GETARG_BOOL(2);
+	bool		two_phase = PG_GETARG_BOOL(3);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcxt;
+	CdbPgResults results = {NULL, 0};
+	StringInfoData cmd;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+	XLogRecPtr	qd_lsn;
+
+	if (!IS_QUERY_DISPATCHER() || Gp_role != GP_ROLE_DISPATCH)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gp_create_logical_replication_slot() must run on the coordinator")));
+	if (temporary)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a cluster-wide logical replication slot cannot be temporary"),
+				 errdetail("A temporary slot belongs to the session that made it, and a segment's session is a gang this one does not outlive.")));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		(rsinfo->allowedModes & SFRM_Materialize) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gp_create_logical_replication_slot() must be called in a context that accepts a set")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcxt = MemoryContextSwitchTo(per_query_ctx);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcxt);
+
+	/* first pass: the segments, then this node */
+	initStringInfo(&cmd);
+	appendStringInfo(&cmd,
+					 "SELECT gp_execution_segment(), "
+					 "pg_catalog.gp_replication_slot_create_unpersisted(%s, %s, %s)",
+					 quote_literal_cstr(NameStr(*name)),
+					 quote_literal_cstr(NameStr(*plugin)),
+					 two_phase ? "true" : "false");
+	CdbDispatchCommand(cmd.data, DF_CANCEL_ON_ERROR, &results);
+
+	qd_lsn = DatumGetLSN(DirectFunctionCall3(gp_replication_slot_create_unpersisted,
+											 NameGetDatum(name),
+											 NameGetDatum(plugin),
+											 BoolGetDatum(two_phase)));
+
+	/* second pass: nothing failed, so make them permanent */
+	resetStringInfo(&cmd);
+	appendStringInfo(&cmd, "SELECT pg_catalog.gp_replication_slot_persist(%s)",
+					 quote_literal_cstr(NameStr(*name)));
+	CdbDispatchCommand(cmd.data, DF_CANCEL_ON_ERROR, NULL);
+
+	(void) DirectFunctionCall1(gp_replication_slot_persist, NameGetDatum(name));
+
+	/* and say what each node made, in the order it was made */
+	for (int i = 0; i < results.numResults; i++)
+	{
+		PGresult   *res = results.pg_results[i];
+
+		for (int row = 0; row < PQntuples(res); row++)
+		{
+			bool		err = false;
+
+			values[0] = Int32GetDatum((int32) strtol(PQgetvalue(res, row, 0), NULL, 10));
+			values[1] = NameGetDatum(name);
+			values[2] = LSNGetDatum(pg_lsn_in_internal(PQgetvalue(res, row, 1), &err));
+			if (err)
+				elog(ERROR, "could not read the slot position reported by a segment");
+			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		}
+	}
+	cdbdisp_clearCdbPgResults(&results);
+
+	values[0] = Int32GetDatum((int32) GpIdentity.segindex);
+	values[1] = NameGetDatum(name);
+	values[2] = LSNGetDatum(qd_lsn);
+	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+
+	pfree(cmd.data);
+	return (Datum) 0;
 }
