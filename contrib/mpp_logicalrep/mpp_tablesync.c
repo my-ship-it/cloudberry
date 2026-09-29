@@ -1563,12 +1563,37 @@ sync_ensure_slots(LrSync *s)
 	if (have == s->nsrcsegs + 1)
 		return;					/* coordinator + every segment */
 	if (have != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("initial sync: slot \"%s\" is usable on only %d of %d source nodes",
+	{
+		/*
+		 * Some nodes have one and some do not.  Nothing can be streamed from
+		 * such a set -- a distributed transaction needs every node's part --
+		 * so whatever WAL the ones that exist are retaining is unreachable,
+		 * and there is nothing to preserve by keeping them.  Drop them and
+		 * make the set afresh, which is what the caller used to be asked to
+		 * do by hand.
+		 *
+		 * Said out loud, because it does discard retained WAL: everything
+		 * between where those slots began and where the new ones do comes
+		 * from the initial copy instead, which is only sound because the
+		 * copy is redone under a cut point taken after them.
+		 */
+		ereport(WARNING,
+				(errmsg("replication slot \"%s\" is usable on only %d of %d source nodes; dropping it and making the set afresh",
 						s->cfg->seg_slot, have, s->nsrcsegs + 1),
-				 errdetail("The rest are missing, or were invalidated by the publisher because the WAL they asked for is gone."),
-				 errhint("Drop it everywhere with gp_drop_replication_slot() and retry.")));
+				 errdetail("The rest are missing, or were invalidated by the publisher because the WAL they asked for is gone. A set that is not on every node cannot be streamed from, so the ones that remain are of no use.")));
+
+		PQclear(sync_exec(s, s->src, "source",
+						  "SELECT pg_catalog.gp_drop_replication_slot($1)",
+						  1, params));
+
+		have = sync_count_slots(s);
+		if (have != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("initial sync: slot \"%s\" is still on %d source nodes after being dropped",
+							s->cfg->seg_slot, have),
+					 errhint("A slot in use cannot be dropped; check for a reader still holding it.")));
+	}
 
 	elog(LOG, "mpp apply worker: subscription %u: creating cluster-wide slot \"%s\" on the source",
 		 s->cfg->subid, s->cfg->seg_slot);
