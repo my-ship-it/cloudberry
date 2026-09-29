@@ -71,6 +71,7 @@
 #include "storage/shmem.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "libpq/pqsignal.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -358,14 +359,31 @@ slot_find(Oid subid)
  * is running and would start a second one.
  */
 static bool
-lr_worker_attach(Oid subid, Oid dbid)
+lr_worker_attach(Oid subid, Oid dbid, bool *taken)
 {
 	LrWorkerSlot *slot;
 	int			i;
 	bool		ok = false;
 
+	*taken = false;
 	LWLockAcquire(lr_shared->lock, LW_EXCLUSIVE);
 	slot = slot_find(subid);
+
+	/*
+	 * Someone got here first.  The launcher decides to start a worker from
+	 * the slot alone, and a worker claims its slot only once it is up, so a
+	 * launcher pass that falls in that window starts a second one for the
+	 * same subscription.  The loser has to be told apart from a shortage of
+	 * slots: it exits, and nothing is wrong.
+	 */
+	if (slot != NULL && slot->pid != 0 && slot->pid != MyProcPid &&
+		BackendPidGetProc(slot->pid) != NULL)
+	{
+		*taken = true;
+		LWLockRelease(lr_shared->lock);
+		return false;
+	}
+
 	if (slot == NULL)
 	{
 		LrWorkerSlot *idle = NULL;
@@ -631,13 +649,19 @@ LrWorkerClaim(Oid subid, Oid dbid)
 {
 	bool		found;
 	bool		enabled;
+	bool		taken;
 
-	if (!lr_worker_attach(subid, dbid))
+	if (!lr_worker_attach(subid, dbid, &taken))
 	{
-		ereport(LOG,
-				(errmsg("no mpp_logicalrep worker slot free for subscription %u",
-						subid),
-				 errhint("You might need to increase \"mpp_logicalrep.max_workers\".")));
+		if (taken)
+			ereport(LOG,
+					(errmsg("mpp_logicalrep: subscription %u already has a worker; this one exits",
+							subid)));
+		else
+			ereport(LOG,
+					(errmsg("no mpp_logicalrep worker slot free for subscription %u",
+							subid),
+					 errhint("You might need to increase \"mpp_logicalrep.max_workers\".")));
 		proc_exit(0);
 	}
 	on_shmem_exit(lr_worker_detach, ObjectIdGetDatum(subid));
