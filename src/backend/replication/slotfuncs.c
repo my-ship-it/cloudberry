@@ -1102,7 +1102,7 @@ gp_create_cluster_logical_slot(PG_FUNCTION_ARGS)
 	if (!IS_QUERY_DISPATCHER() || Gp_role != GP_ROLE_DISPATCH)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("gp_create_logical_replication_slot() must run on the coordinator")));
+				 errmsg("gp_create_cluster_logical_slot() must run on the coordinator")));
 	if (temporary)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1113,7 +1113,7 @@ gp_create_cluster_logical_slot(PG_FUNCTION_ARGS)
 		(rsinfo->allowedModes & SFRM_Materialize) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("gp_create_logical_replication_slot() must be called in a context that accepts a set")));
+				 errmsg("gp_create_cluster_logical_slot() must be called in a context that accepts a set")));
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
