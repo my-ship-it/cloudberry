@@ -946,6 +946,86 @@ worker 是**起来之后**才去 `lr_worker_attach()` 填 pid 的。落在这两
 **发现经过**：是在重启目标集群加载新 `.so` 之后，顺手看 `pg_stat_activity` 撞见的
 （两个 `mpp apply worker for subscription "s"`，etimes 都等于重启后的秒数）。
 
+### MEM1 — `reader_mem` 调大会让订阅永久卡死 —— **已修**（2026-10-08）
+
+**症状**（09-30 记为"可复现但原因未定位"）：把 `mpp_logicalrep.reader_mem` 调到 1GB，
+10M 单事务永远追不平。源端 10,000,000 行就位、目标端 0 行、三个段的 `pos` 完全冻结，
+reader 停在 `LogicalApplyMain`，**日志里没有一条 ERROR**。
+
+**根因在内核，不在插件**。`cdbutil.c:902` 的 `cleanupQE()`：
+
+```c
+	/* If a reader exceed the cached memory limitation, destroy it */
+	if (!segdbDesc->isWriter &&
+		(segdbDesc->conn->mop_high_watermark >> 20) > gp_vmem_protect_gang_cache_limit)
+		return false;
+```
+
+**reader QE 的 vmem 高水位超过 `gp_vmem_protect_segworker_cache_limit`（默认 500 MB）
+就不许进 gang 缓存**，调度器在语句结束时销毁它。而我们的 reader 把全部状态放在它自己的
+进程内存里，于是：
+
+```
+reader_mem 大 → 缓冲越过 500MB → QE 被销毁 → 下次 DRAIN 的 reader 是冷的
+   → 驱动 ERROR "reader of segment N is cold" → 整个 run 重启
+   → 重新 CONNECT、从 restart_lsn 重拉 → 源端把整笔事务重新解码（实测 1.7GB
+     reorderbuffer spill、walsender 100% CPU）→ 又涨到 500MB → 再被销毁
+```
+
+28 秒一轮，`35 events, 0 batches, 35 recoveries`，永不收敛。
+
+`mop_high_watermark` 是 QE 上报的 `VmemTracker_GetMaxReservedVmemBytes()`，在
+`PostgresMain` 每条消息开头被重置成**当前占用**——所以被判的是"语句之间常驻的占用 +
+语句内的尖峰"，两者都要压在线下。
+
+**两个放大因素**：
+
+1. **预算是按流算的，不是按订阅。** `maybe_spill(st)` 里的 `st` 是**一条源段流**的状态，
+   而 3 段源 → 2 段目标时有一个 QE 持有 **2 条流**。GUC 的说明写的是 "Per subscription."，
+   是错的。实测 `reader_mem = 400MB` 同样卡死（400×2 = 800MB）。
+2. **缓冲区是翻倍扩容。** `want = mem_alloc * 2`，于是 256MB 数据坐在 512MB 分配里；
+   而 `st->mem_bytes` 只记逻辑字节，我们自己的账比调度器看到的小一半。
+
+**三段 A/B**（release，:7500 三段 → :7700 两段，10M 单事务）：
+
+| 阈值 | `reader_mem` | 该 reader 的流数 | 结果 |
+|---|---|---|---|
+| 500 MB | 1 GB | 2 | **永不收敛** |
+| **4000 MB** | 1 GB | 2 | 44.8 s 完成 |
+| 500 MB | 400 MB | 2 | **永不收敛** |
+
+**改法**（用户提出的方向：按真实内存落盘，而不是只按自己的账）：
+
+1. `maybe_spill()` 在原有的 `reader_mem` 预算之外，再加一条按**真实 vmem** 的判据：
+   `VmemTracker_GetReservedVmemBytes()` 超过 `gp_vmem_protect_gang_cache_limit` 的
+   **75%** 就开始落盘。落盘会 `pfree` 内存，所以确实能把占用压回去。
+2. 落盘要**跨本 QE 的所有流**找最大的那笔（`spill_largest_held()` 走 `lr_readers`），
+   因为多条流共用同一份 vmem 账，正在读的那条未必是占得最多的。
+3. 给 changelog 的扩容加上限（`LR_CHANGELOG_GROW_STEP = 8MB`）：小的时候照旧翻倍，
+   大了之后按固定步长。不加这条时实测尖峰冲到 **538 MB**（已越过 500MB 硬线），
+   加了之后稳定在 **383 MB**。
+4. 第一次因此提前落盘时打一条 LOG，说明这是配置没要求的磁盘开销、以及是哪个 GUC 定的线。
+5. 更正 `reader_mem` 的 GUC 说明：按**源段流**算，且不是唯一的上限。
+
+**验证**：默认 500MB 阈值下，`reader_mem` = 1GB / 400MB / 64MB 三种设置分别
+**47.7 / 47.0 / 44.8 s** 完成，0 次 cold；加增长上限后 reader 报告的占用从 538MB 降到
+383MB。
+
+**顺带修掉的第二个缺陷：永不收敛的 run 不出声。** `reader of segment N is cold` 用的是
+`ERRCODE_CONNECTION_FAILURE`（08 类），`error_is_transient()` 判为可瞬时恢复，于是
+`stuck_errors = 0` —— 重试计数被无条件清零，`apply_max_retries` 永远够不着，整整 11 分钟
+除了 `DEBUG1` 没有任何提示。
+
+但**不能**据此直接放弃：源端集群重启看起来一模一样，而那种情况就该等下去
+（默认 `apply_error_action = disable` + `max_retries = 10`，直接计数会把正常重启的订阅停掉）。
+所以改成：新计数器 `no_progress` 记"自上次提交批次以来恢复了多少次"，瞬时错误**不清零**，
+每 10 次打一条 WARNING 说明已恢复多少次、最后一个错误是什么；**放弃的判定原封不动**。
+缺陷是沉默，不是缺少放弃机制。
+
+**没有新增自动化用例**：要触发需要单条流缓冲超过 ~375MB（约 40 万行宽行），对
+`make installcheck` 太重。复现用 `scratchpad/reldiag.sh <rows> <event_wait_ms> <reader_mem_kB>`
+做上面那张表的三段 A/B。
+
 ### SEC1 — copyhelper 的连接认证：令牌经 argv 泄漏（**未修**）
 
 **现状不是"谁都能连"**——已经有令牌，而且真的校验：
