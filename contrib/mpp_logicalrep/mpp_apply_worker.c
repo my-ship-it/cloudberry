@@ -106,6 +106,9 @@ int			gp_lr_apply_max_retries = 10;
  */
 #define LR_EVENT_QUIET_MS		10000
 
+/* how many recoveries without a committed batch between saying so */
+#define LR_NO_PROGRESS_SAY_EVERY	10
+
 /* one source segment's view of a transaction with a gxid */
 typedef struct LrSegPart
 {
@@ -242,6 +245,7 @@ typedef struct LrDriver
 	int			sync_poll_ms;	/* how soon the job wants to be stepped again */
 	bool		reading_held;	/* the readers are not consuming the source */
 	int			stuck_errors;	/* errors in a row that committed nothing */
+	int			no_progress;	/* recoveries since a batch last committed */
 
 	/* the unit handed to the sink, rebuilt for each one */
 	LogicalRepUnit unit;
@@ -3174,6 +3178,7 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 	if (d->unit_spec.catchup)
 	{
 		d->stuck_errors = 0;
+		d->no_progress = 0;
 		d->stats->batches++;
 		d->stats->txns_catchup += list_length(d->unit_batch);
 
@@ -3210,6 +3215,7 @@ assembly_advance(LogicalRepAssembly *self, const LogicalRepUnit *unit)
 	}
 
 	d->stuck_errors = 0;		/* the run is making progress again */
+	d->no_progress = 0;
 	d->coord_committed = d->unit_coord_lsn;
 	memcpy(d->seg_flush, d->unit_flush, sizeof(int64) * d->nsrcsegs);
 	d->stats->batches++;
@@ -3367,6 +3373,26 @@ static bool
 assembly_handle_error(LogicalRepAssembly *self, int sqlerrcode, const char *message)
 {
 	LrDriver   *d = LR_DRIVER(self);
+
+	/*
+	 * Recoveries since anything was applied, whatever the error's class.  A
+	 * transient error does not clear this; only a committed batch does.  An
+	 * error that keeps being transient while nothing is applied is not a
+	 * blip -- a reader the dispatcher destroys on every statement raises a
+	 * plain connection failure, and a subscription sat in that loop for
+	 * eleven minutes with nothing above DEBUG1 to say so.
+	 *
+	 * It is still not grounds to give up: a source that is down for a while
+	 * looks exactly the same from here and should be waited out.  So this
+	 * says so, and keeps saying so, and leaves the decision where it was.
+	 */
+	d->no_progress++;
+	if (d->no_progress % LR_NO_PROGRESS_SAY_EVERY == 0)
+		ereport(WARNING,
+				(errmsg("mpp apply worker: subscription %u has recovered %d times without applying anything; the last error was: %s",
+						d->cfg->subid, d->no_progress, message),
+				 errdetail("Recovering is normal while a source is unreachable. Recovering without ever applying a batch is not, and this has not applied one since it started counting."),
+				 errhint("Check that every source segment is up and that its replication slot is valid; mpp_logicalrep's own log says which segment it is waiting for.")));
 
 	if (error_is_transient(sqlerrcode))
 	{
