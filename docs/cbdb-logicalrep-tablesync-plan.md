@@ -1026,6 +1026,83 @@ reader_mem 大 → 缓冲越过 500MB → QE 被销毁 → 下次 DRAIN 的 read
 `make installcheck` 太重。复现用 `scratchpad/reldiag.sh <rows> <event_wait_ms> <reader_mem_kB>`
 做上面那张表的三段 A/B。
 
+### DUTY3 — apply 期间源端被堵死 —— **已做**（`a8cb470138e`，2026-10-08）
+
+DUTY1 解决的是"drain 之间没人读"，这一条解决的是"**apply 期间没人读**"。
+
+reader 只在执行语句时才碰 socket，而它执行时间最长的语句就是回放已缓冲的变更——
+10M 单事务那次是 **19 秒**，期间 `lr_source_next()` 的循环里一次 `LrReaderReceive()`
+都没有，源端 walsender 全程被 TCP 零窗口按住。形状和 DUTY1 完全一样，只是发生在 apply
+里而不是 drain 间隙。
+
+**改法**：在 `lr_source_next()` 的队列耗尽处，每排队 `LR_APPLY_SIP_ROWS`（16384）行就对
+本 QE 持有的每条流调一次 `LrReaderReceive(st, 0, 0, false)` —— `wait_ms = 0`，只把线上
+**已到**的收下来，绝不阻塞回放。这不是 drain：不汇报、不释放，只是别让源端停摆。
+
+**顺带必须修的一个新风险**：正在回放的事务不能被落盘。`LrChangesNext()` 对未落盘的事务
+返回的是 `log->mem + offset` 的**直接指针**，而 `changelog_spill()` 会 `pfree(log->mem)`
+并把文件位置留在末尾（`LrChangesBegin()` 只在**已经**落盘时才 seek 到 0）。在此之前这不
+可能发生，因为 apply 期间根本不接收。现在给 `LrTxn` 加 `replaying` 标志：
+`LrChangesBegin()` 置位、`LrChangesEnd()` 清除，两处落盘搜索（`maybe_spill()` 与
+MEM1 的 `spill_largest_held()`）都跳过它。
+
+**实测**（release，:7500 三段 → :7700 两段；10M 行写成 **100 笔**事务，订阅停用期间写入
+攒出积压，再启用追赶）：
+
+| | 追赶耗时 | walsender 卡在 `WalSenderWriteData` |
+|---|---|---|
+| 改前 | 31.3 / 27.9 s | 25.5% / 24.7% |
+| 改后 | **25.5 / 23.9 / 25.4 s** | **3.9% / 3.3% / 4.3%** |
+
+平均 29.6 → 24.9 s（**−16%**）。源端的等待从"发不出去"变成"没东西可发"
+（`WalSenderWaitForWAL` 样本 220 → 355），正是机制生效的样子。
+
+**对单笔大事务零收益**：apply 的时候已经没东西可收了。那一块要靠 OVERLAP1。
+
+**它同时是 OVERLAP1 的前提**：early apply 之后 apply 不再是一次性的短脉冲而是贯穿整个
+接收过程，那时若 apply 期间不读，源端就永远被堵着。
+
+### OVERLAP1 — 让 apply 和传输重叠（**未做**，设计讨论）
+
+10M 单事务 release 上 35.6s = 传输 ~17s + apply ~19s，**严格串行**。完美重叠的下限是
+`max(17,19) ≈ 19s`，上限收益 **47%**。
+
+**前提：gxid 必须在事务开始时就进 WAL。** 现在段的流里 gxid 最早只能在结尾出现——
+一阶段在提交记录的 `XACT_XINFO_HAS_DISTRIB`（`decode.c:795` 从 `parsed->distribXid` 取），
+两阶段在 PREPARE 的 gid 里。但**数据一直在内存里**：`StartTransaction()`（`xact.c:2668`）
+一进入分布式事务上下文就 `MyTmGxact->gxid = QEDtxContextInfo.distributedXid`，锁管理器
+就这么用。缺的不是信息，是**写入时机**。三小步：① `AssignTransactionId()` 路径上在
+`wal_level=logical && isDtxContext()` 时多写一条带 gxid 的逻辑记录；② `decode.c` 加分支调
+`ReorderBufferSetDistributedXid()`（PGBUG1 已经为"事务中途设 distribXid"扫清了障碍）；
+③ pgoutput 的 `cbdb_gxid` 从提交时发改成 BEGIN / stream_start 时发。
+副产品：LOSS1 那个"大事务只能报 `gxid = 0`"的妥协一并解决。
+
+**一个决定形状的硬约束**：apply 和 drain **共用同一个会话**（`mpp_sink_cbdb.c` 的
+`BEGIN`/`gp_lr_apply`/`COMMIT` 走的是同一个 `s->tr`），因为 apply 必须跑在持有 reader
+缓冲的那批 QE 上，而缓冲是 QE 进程私有的静态 `lr_readers`。所以 **early apply 同一时刻
+只能开一笔事务**——上游 PG 能做多笔并发，是因为每个 PA 是独立 backend、各有自己的事务
+上下文，leader 只是路由器（而且 leader 自己也能应用一笔，所以 `max_parallel_apply_workers
+_per_subscription = 1` 实际有 2 个上下文）。
+
+**因此取舍**：只在目标事务是**唯一在飞**时启动 early apply；别的事务事件一到就回滚
+early apply 退回常规路径。批量导入场景永远满足独占条件。而且**回滚不需要和任何东西排队**
+——上游在 STREAM ABORT 处不为顺序而等（`worker.c` 注释："we don't need to wait here ...
+as that is not required to maintain the commit order"），只有产生可见效果的事件才要排队。
+
+**四个仍待解的问题**：① 目标表锁从短批次变成整个接收时长（GDD 默认关，U/D 会被升级成
+ExclusiveLock）；② 回滚来源比上游多（源端 abort、切点事后判定已在 COPY 里、去重集、
+主动放弃）——启动前就该把能判的都判掉；③ 提交顺序倒置后恢复点不再是干净前缀，要靠
+`gp_subscription_applied` 去重，不变式要重新表述；④ 跨段死锁检测是 GDD，默认关着。
+
+**动手前先做一个证伪实验**：把同样 10M 行**分成 N 块**用现有路径应用，量总耗时。PERF1
+的教训是批量化让 apply 从 25.8s 降到 4.1s，分块很可能把每块的固定开销（快照、计划、
+Motion 建立）吐回来。如果分 20 块后 apply 从 19s 涨到 30s，重叠省下的就被吃掉大半。
+
+**更远的一条**：要达到上游那种**多事务并发**，必须先把 reader 缓冲从 QE 进程内存挪到
+**段的共享内存**（同一个 postmaster 内 DSM/主共享内存可用，跨协调器↔段则完全不可能）。
+那是架构级改动，但能一并解掉 MEM1 的 vmem 线、reader 冷重启要重拉、以及 reader 只在 drain
+里读。现在为并发单独付这个代价不划算。
+
 ### SEC1 — copyhelper 的连接认证：令牌经 argv 泄漏（**未修**）
 
 **现状不是"谁都能连"**——已经有令牌，而且真的校验：
