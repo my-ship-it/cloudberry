@@ -74,6 +74,14 @@ typedef struct LrKV
 	char	   *value;
 } LrKV;
 
+/*
+ * How many rows the apply queues between reads of the source.  Small enough
+ * that the source never waits long, large enough that the read is not a
+ * syscall per row: at roughly a megabyte of changes it is one read per
+ * sixteen thousand of them.
+ */
+#define LR_APPLY_SIP_ROWS	16384
+
 typedef struct LrSourceState
 {
 	CustomScanState css;
@@ -112,6 +120,7 @@ typedef struct LrSourceState
 	struct LrApplyItem *cur_item;	/* what the coordinator asked for it */
 	LrChangeCursor cur;
 	bool		cur_open;
+	int			since_sip;		/* rows queued since the source was last read */
 	LrRouter   *router;
 } LrSourceState;
 
@@ -240,6 +249,30 @@ lr_source_next(ScanState *ss)
 			state->queue_pos++;
 			return source_store_row(state, row->target_segid, row->relid,
 									row->op, row->data, row->len);
+		}
+
+		/*
+		 * A reader reads its source only while it is executing something, and
+		 * replaying what it has already buffered is the longest something it
+		 * ever does -- ten million rows took nineteen seconds of it, with the
+		 * socket untouched throughout and the source blocked on a window
+		 * nobody opened.  So take what has arrived, between rows, without
+		 * waiting for any: this is not the drain, it only keeps the source
+		 * moving while the drain is not running.
+		 */
+		if (state->spec.mode == LR_PLAN_APPLY &&
+			state->since_sip >= LR_APPLY_SIP_ROWS)
+		{
+			ListCell   *lc;
+
+			state->since_sip = 0;
+			foreach(lc, state->readers)
+			{
+				LrReaderState *st = (LrReaderState *) lfirst(lc);
+
+				if (LrReaderHasSource(st))
+					(void) LrReaderReceive(st, 0, 0, false);
+			}
 		}
 
 		/* queue drained; APPLY refills it record by record */
@@ -1259,6 +1292,7 @@ queue_row(LrSourceState *state, int32 target, Oid relid, char op,
 	memcpy(row->data, data, len);
 	row->len = len;
 	state->queue = lappend(state->queue, row);
+	state->since_sip++;
 	MemoryContextSwitchTo(oldcxt);
 }
 

@@ -84,6 +84,10 @@ typedef struct LrTxn
 								 * when there is no global deadlock detector */
 	bool		streamed;		/* arrived through the streaming protocol */
 	bool		reported;		/* handed to the coordinator as ready */
+	bool		replaying;		/* a cursor is open on it: it may not be
+								 * spilled, which would free the memory that
+								 * cursor is reading and move the file
+								 * position out from under it */
 	struct LrChangeLog *changes;
 
 	/* internal */

@@ -1840,7 +1840,7 @@ spill_largest_held(void)
 		hash_seq_init(&seq, rs->xids);
 		while ((txn = (LrTxn *) hash_seq_search(&seq)) != NULL)
 		{
-			if (txn->changes->spilled)
+			if (txn->changes->spilled || txn->replaying)
 				continue;
 			if (largest == NULL ||
 				txn->changes->total_len > largest->changes->total_len)
@@ -1890,7 +1890,7 @@ maybe_spill(LrReaderState *st)
 		hash_seq_init(&seq, st->xids);
 		while ((txn = (LrTxn *) hash_seq_search(&seq)) != NULL)
 		{
-			if (txn->changes->spilled)
+			if (txn->changes->spilled || txn->replaying)
 				continue;
 			if (largest == NULL ||
 				txn->changes->total_len > largest->changes->total_len)
@@ -1917,6 +1917,7 @@ LrChangesBegin(LrTxn *txn, LrChangeCursor *cur)
 	cur->offset = 0;
 	cur->buf = NULL;
 	cur->bufsize = 0;
+	txn->replaying = true;
 	if (txn->changes->spilled &&
 		BufFileSeek(txn->changes->file, 0, 0, SEEK_SET) != 0)
 		ereport(ERROR,
@@ -1966,6 +1967,8 @@ LrChangesNext(LrChangeCursor *cur, char *op, Oid *relid, const char **data,
 void
 LrChangesEnd(LrChangeCursor *cur)
 {
+	if (cur->txn)
+		cur->txn->replaying = false;
 	if (cur->buf)
 		pfree(cur->buf);
 	cur->buf = NULL;
