@@ -184,8 +184,12 @@ define_gucs(void)
 							PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("mpp_logicalrep.reader_mem",
-							"Memory a reader QE may use to buffer changes before spilling to disk.",
-							"Per subscription.",
+							"Memory a reader may use to buffer changes before spilling to disk.",
+							"Per source segment it streams from, so a reader that holds "
+							"several of them may use that many times this. It is not the "
+							"only bound: a reader is also spilled early enough to stay "
+							"under gp_vmem_protect_segworker_cache_limit, past which the "
+							"dispatcher destroys it instead of caching it.",
 							&gp_lr_reader_mem,
 							65536, 64, MAX_KILOBYTES,
 							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);

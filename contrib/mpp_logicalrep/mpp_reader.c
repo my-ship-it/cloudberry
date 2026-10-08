@@ -45,6 +45,8 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "cdb/cdbvars.h"
+#include "utils/vmem_tracker.h"
 #include "utils/wait_event.h"
 
 int			gp_lr_reader_mem = 65536;	/* kB */
@@ -181,6 +183,9 @@ struct LrReaderState
 };
 
 /* process-wide registry: subid -> state */
+/* how much a changelog grows by once doubling would waste too much */
+#define LR_CHANGELOG_GROW_STEP	((Size) 8 * 1024 * 1024)
+
 static List *lr_readers = NIL;
 
 static LrTxn *txn_lookup(LrReaderState *st, TransactionId xid, bool create);
@@ -1684,10 +1689,22 @@ changelog_append(LrReaderState *st, LrChangeLog *log, const void *data, Size len
 	{
 		if (log->total_len + len > log->mem_alloc)
 		{
-			Size		want = Max(log->mem_alloc * 2, (Size) 8192);
+			Size		want;
 
+			/*
+			 * Doubling costs nothing while the buffer is small.  Past a point
+			 * it does: it leaves as much again reserved and empty, and it is
+			 * the reservation -- not what we put in it -- that the dispatcher
+			 * counts when it decides whether this reader may be kept.  A
+			 * 256 MB buffer in a 512 MB allocation was enough to put a reader
+			 * over a 500 MB limit while our own accounting said half that.
+			 */
+			if (log->mem_alloc < LR_CHANGELOG_GROW_STEP)
+				want = Max(log->mem_alloc * 2, (Size) 8192);
+			else
+				want = log->mem_alloc + LR_CHANGELOG_GROW_STEP;
 			while (want < log->total_len + len)
-				want *= 2;
+				want += LR_CHANGELOG_GROW_STEP;
 			if (log->mem == NULL)
 				log->mem = MemoryContextAlloc(st->cxt, want);
 			else
@@ -1763,10 +1780,106 @@ changelog_free(LrReaderState *st, LrChangeLog *log)
 }
 
 /* over budget: spill the largest in-memory transactions until under it */
+/*
+ * How much of gp_vmem_protect_segworker_cache_limit this reader may take
+ * before it starts spilling.  The rest is for everything else the QE needs:
+ * the plan, the interconnect, libpq, the catalogue caches.
+ */
+#define LR_QE_VMEM_SHARE_PCT	75
+
+/*
+ * Is this QE close enough to the line that it would stop being reusable?
+ *
+ * A reader QE whose vmem high-water mark passes
+ * gp_vmem_protect_segworker_cache_limit megabytes is not kept in the gang
+ * cache: cleanupQE() destroys it when the statement ends (cdbutil.c).  The
+ * next DRAIN then finds a reader with no state, the driver calls it cold and
+ * restarts its run -- and the next run reaches exactly the same place, so it
+ * never ends.
+ *
+ * The mark is reset to what is reserved at the start of each message cycle
+ * (PostgresMain), so what is judged is what this reader holds between
+ * statements plus whatever it peaks at inside one.  Both have to stay under
+ * the line, which is why this asks the tracker for the whole QE's
+ * reservation rather than adding up our own buffers: those count the bytes
+ * we put in, not the bytes we asked the allocator for.
+ */
+static bool
+qe_vmem_over(int64 *reserved, int64 *ceiling)
+{
+	if (Gp_role != GP_ROLE_EXECUTE || gp_vmem_protect_gang_cache_limit <= 0)
+		return false;			/* nothing caches this process */
+
+	*ceiling = (int64) gp_vmem_protect_gang_cache_limit * 1024 * 1024
+		/ 100 * LR_QE_VMEM_SHARE_PCT;
+	*reserved = VmemTracker_GetReservedVmemBytes();
+	if (*reserved <= 0)
+		return false;			/* the tracker is not counting */
+	return *reserved > *ceiling;
+}
+
+/*
+ * Spill the largest transaction still in memory anywhere in this QE.  Every
+ * stream it holds draws on the same reservation, so the one to give up is
+ * not necessarily the one being read.  Returns false when there is nothing
+ * left in memory to spill.
+ */
+static bool
+spill_largest_held(void)
+{
+	ListCell   *lc;
+	LrReaderState *owner = NULL;
+	LrTxn	   *largest = NULL;
+
+	foreach(lc, lr_readers)
+	{
+		LrReaderState *rs = (LrReaderState *) lfirst(lc);
+		HASH_SEQ_STATUS seq;
+		LrTxn	   *txn;
+
+		hash_seq_init(&seq, rs->xids);
+		while ((txn = (LrTxn *) hash_seq_search(&seq)) != NULL)
+		{
+			if (txn->changes->spilled)
+				continue;
+			if (largest == NULL ||
+				txn->changes->total_len > largest->changes->total_len)
+			{
+				largest = txn;
+				owner = rs;
+			}
+		}
+	}
+	if (largest == NULL || largest->changes->total_len == 0)
+		return false;
+	changelog_spill(owner, largest->changes);
+	return true;
+}
+
+/* say it once per process: it explains disk the configuration did not ask for */
+static void
+qe_vmem_say_once(int64 reserved, int64 ceiling)
+{
+	static bool said = false;
+
+	if (said)
+		return;
+	said = true;
+	ereport(LOG,
+			(errmsg("mpp_logicalrep: spilling early to stay reusable: this reader has reserved " INT64_FORMAT " kB, over the " INT64_FORMAT " kB it may hold",
+					reserved / 1024, ceiling / 1024),
+			 errdetail("A reader over gp_vmem_protect_segworker_cache_limit (%d MB) is destroyed instead of cached, which loses everything it had buffered.",
+					   gp_vmem_protect_gang_cache_limit),
+			 errhint("mpp_logicalrep.reader_mem is %d kB, for each of the source segments this reader streams from.",
+					 gp_lr_reader_mem)));
+}
+
 static void
 maybe_spill(LrReaderState *st)
 {
 	Size		budget = (Size) gp_lr_reader_mem * 1024;
+	int64		reserved;
+	int64		ceiling;
 
 	while (st->mem_bytes > budget)
 	{
@@ -1786,6 +1899,14 @@ maybe_spill(LrReaderState *st)
 		if (largest == NULL || largest->changes->total_len == 0)
 			break;
 		changelog_spill(st, largest->changes);
+	}
+
+	/* and whatever the budget allows, not past what keeps this QE alive */
+	while (qe_vmem_over(&reserved, &ceiling))
+	{
+		if (!spill_largest_held())
+			break;				/* nothing in memory left to give */
+		qe_vmem_say_once(reserved, ceiling);
 	}
 }
 
