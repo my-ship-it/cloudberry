@@ -349,7 +349,7 @@ AccessExclusive 卡住它的 copy，而作业里任何一张表没拷完就不�
 
 **余下**：视图加 `paused` 列（需目录变更）；`LR_STAT_MAX_SEGS = 128` 以外的段判据看不见。
 
-### LOCK1 — GDD 关闭时 apply 的锁级别 —— **已修**（`ead71a321f0`，2026-09-25）
+### LOCK1 — apply 的锁级别 —— **已修**（`ead71a321f0` 2026-09-25，但真正生效是 2026-10-09）
 
 **用户提出**。Cloudberry 在 `gp_enable_global_deadlock_detector` 关闭时
 （**这是默认**）把 UPDATE/DELETE 的 `RowExclusiveLock` 升级为 `ExclusiveLock`
@@ -374,9 +374,46 @@ apply 与普通语句之间永远按同一个全序拿锁；`LOCK TABLE` 又会
 `CdbDispatchUtilityStatement` 分发到段（`lockcmds.c:80`），
 段上的表锁在任何 writer 动手之前就位，之后的到达顺序只涉及行锁。
 
-**未覆盖**：检测器**开着**时，同一条规则对 **AO/AOCO 目标表**的 UPDATE/DELETE 同样升级，
-而目标表的存取方法驱动现在不知道（`sync_fill_source_info` 取的是**源端**的 AM）。
-补法很小：`sync_fill_columns_all` 那条查询多取一列目标端 `pg_am.amname`。
+**补完（2026-10-09）**，而且补的过程发现**上面这次修复其实从未生效过**。
+
+**`lockmode_name()` 只认两个名字**：
+
+```c
+	return lockmode >= AccessExclusiveLock ? "ACCESS EXCLUSIVE" : "ROW EXCLUSIVE";
+```
+
+于是驱动算出的 `ExclusiveLock` 被渲染成 `LOCK TABLE … IN ROW EXCLUSIVE MODE` ——
+**整条升级路径被这个辅助函数悄悄抹平了**。09-25 那次只量了"修之前"（普通 UPDATE 拿
+ExclusiveLock、apply 拿 RowExclusiveLock），没量"修之后 apply 实际发的是什么"，所以漏掉了。
+改成 switch，并且**未知锁级别直接 ERROR** —— 挑一个碰巧能编译的名字正是这次的教训。
+
+**AO 那半**：内核规则的第 2.a 条（检测器开着时 AO/AOCO 目标表仍要升级）。原因和第 1 条
+完全不同：AO **根本没有行锁**——`appendonly_tuple_lock()` 直接
+`ereport(ERROR, "tuple locking is not supported on appendoptimized tables")`，注释说
+*"we lock at the table level instead"*。所以表锁是行锁的替代品，检测器再灵也救不了它
+（它能发现并打破行等待环，而 AO 产生的是**丢更新**，压根没有环）。
+换言之第 1 条是**死锁规避**，第 2 条是**正确性**。
+
+**改法**：策略整体从驱动移到 sink（`sink_lock_taken()`）。理由是契约上的——"目标能给什么"
+是目标的事：有没有行锁、行等待环会不会被打破，驱动都无从知道，而 sink 就是目标。
+`LogicalRepRelLock.lockmode` 的含义随之改成"**在目标不提供表级以下帮助时所需要的**"，
+由 sink 翻译成实际拿什么。目标表是不是 AO 由 sink 原本就在发的那条
+`SELECT to_regclass($1)::oid` 顺带取回，判据用 **amhandler**（与内核 `AMHandlerIsAO()`
+一致），不用 amname，免得被同名的自定义 AM 骗过。
+
+**四格实测**（看目标协调器日志里 apply 实际发的 `LOCK TABLE`）：
+
+| 目标集群 GDD | 目标表 | 实际发的 | |
+|---|---|---|---|
+| on | heap | `ROW EXCLUSIVE` | ✅ |
+| on | **AO** | `EXCLUSIVE` | ✅ 本次补的 |
+| off | heap | `EXCLUSIVE` | ✅ **原本就该如此，但一直是 ROW EXCLUSIVE** |
+| off | AO | `EXCLUSIVE` | ✅ 同上 |
+
+**回归用例**：`truncate_locks` 新增第 4 步。坑在于**普通 SELECT 挡不住 `ExclusiveLock`**
+——ACCESS SHARE 只和 ACCESS EXCLUSIVE 冲突，所以它既不挡 ROW EXCLUSIVE 也不挡 EXCLUSIVE，
+用它做判据会假通过。改用 `LOCK TABLE … IN ROW SHARE MODE`：它放行 ROW EXCLUSIVE、
+挡住 EXCLUSIVE，正好是要问的那个问题。未修复时该行 `t → f` 且跑满 60 秒超时，修复后 2.5 秒。
 
 ### LOSS1 — 大事务被当成"什么都没写"整笔丢掉 —— **已修**（2026-09-28）
 
