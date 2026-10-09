@@ -18,6 +18,7 @@ test: refresh_publication
 test: all_tables
 test: large_batches
 test: monitoring
+test: idle_feedback
 test: faults
 test: crash_recovery
 test: shutdown
