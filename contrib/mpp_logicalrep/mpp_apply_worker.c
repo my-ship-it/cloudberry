@@ -1136,19 +1136,55 @@ driver_pump_source(LrDriver *d, int timeout_ms)
 	}
 }
 
-/* standby status update on the coordinator slot: flush = last committed batch */
+/* is anything from the coordinator's stream still waiting to be applied? */
+static bool
+driver_outstanding(LrDriver *d)
+{
+	return hash_get_num_entries(d->gxids) > 0 ||
+		d->batch_gxids != NIL ||
+		d->batch_locals != NIL ||
+		d->locals != NIL ||
+		d->deferred_txns != NIL ||
+		d->sync != NULL;
+}
+
+/*
+ * Tell the source coordinator where we are.
+ */
 static void
 driver_send_feedback(LrDriver *d)
 {
 	StringInfoData buf;
+	int64		flush;
 
 	if (d->src == NULL || d->coord_pos == 0)
 		return;
+
+	/*
+	 * What the last batch committed at is the right thing to confirm while
+	 * anything is still waiting to be applied, and the wrong thing once
+	 * nothing is: everything received has been applied or dropped, so the
+	 * position that is safe to resume from is what was received.
+	 *
+	 * Confirming the batch position for ever is what an idle subscription
+	 * used to do, and it costs twice.  The source keeps every byte of WAL
+	 * since that batch -- measured at 234 MB and climbing on a subscription
+	 * that had nothing left to do -- and the source cannot be shut down,
+	 * because a walsender only leaves once the client has confirmed
+	 * everything it sent (WalSndDone), so a fast gpstop waits for a
+	 * confirmation that is never coming.
+	 *
+	 * The server's own apply worker says the same thing in send_feedback():
+	 * "No outstanding transactions to flush, we can report the latest
+	 * received position."
+	 */
+	flush = driver_outstanding(d) ? d->coord_committed : d->coord_pos;
+
 	initStringInfo(&buf);
 	pq_sendbyte(&buf, 'r');
 	pq_sendint64(&buf, d->coord_pos);
-	pq_sendint64(&buf, d->coord_committed);
-	pq_sendint64(&buf, d->coord_committed);
+	pq_sendint64(&buf, flush);
+	pq_sendint64(&buf, flush);
 	pq_sendint64(&buf, GetCurrentTimestamp());
 	pq_sendbyte(&buf, 0);
 	walrcv_send(d->src, buf.data, buf.len);
