@@ -1533,10 +1533,11 @@ LrReaderFillReport(LrReaderState *st, LrTxn *txn, int seg, LrReport *rpt)
 								 : pstrdup("?"));
 	}
 	/*
-	 * The lock this transaction would need of a session that had no global
-	 * deadlock detector to fall back on -- which is what the coordinator
-	 * decides from, since whether there is one is its cluster's business and
-	 * not this stream's.  See lock_for_policy() in mpp_apply_worker.c.
+	 * The lock this transaction would need of a target that gave it no help
+	 * below the table.  What the target can actually give -- whether rows
+	 * can be locked at all, whether a cycle of row waits would be broken --
+	 * is the target's business and not this stream's, so the sink decides
+	 * what is taken.  See sink_lock_taken() in mpp_sink_cbdb.c.
 	 */
 	rpt->lockmode = txn->has_truncate ? AccessExclusiveLock :
 		txn->has_rowlock ? ExclusiveLock : RowExclusiveLock;

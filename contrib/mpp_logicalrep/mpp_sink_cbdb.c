@@ -37,6 +37,7 @@
 #include "mpp_apply.h"
 #include "mpp_apply_internal.h"
 #include "storage/lockdefs.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/pg_lsn.h"
@@ -69,6 +70,40 @@ cmp_sink_item(const void *a, const void *b)
 	return x->pos < y->pos ? -1 : x->pos > y->pos;
 }
 
+/*
+ * What to take on a target relation for changes that need `needs`.
+ *
+ * The server upgrades an UPDATE or a DELETE from RowExclusiveLock to
+ * ExclusiveLock in two cases (CdbTryOpenTable), and they are upgrades for
+ * two different reasons:
+ *
+ *   no global deadlock detector   a cycle of row waits spread across
+ *                                 segments is invisible to each of them, so
+ *                                 nothing would ever break it.  Taking a
+ *                                 lock that cannot be held twice means the
+ *                                 cycle cannot form.  This is the default.
+ *
+ *   append-optimized target       there are no row locks to wait on at all,
+ *                                 so there is no cycle and nothing to
+ *                                 detect -- two concurrent updates would
+ *                                 simply lose one of each other.  The table
+ *                                 lock is standing in for a row lock, and a
+ *                                 detector does not change that.
+ *
+ * So the detector only buys the downgrade back for a heap target.  Only
+ * ExclusiveLock is ever given back: a TRUNCATE's AccessExclusiveLock and an
+ * insert-only RowExclusiveLock mean something else and are left alone.
+ */
+static int
+sink_lock_taken(int needs, bool target_is_ao)
+{
+	if (needs == ExclusiveLock &&
+		gp_enable_global_deadlock_detector &&
+		!target_is_ao)
+		return RowExclusiveLock;
+	return needs;
+}
+
 typedef struct LrSinkLock
 {
 	int64		oid;
@@ -88,7 +123,24 @@ cmp_sink_lock(const void *a, const void *b)
 static const char *
 lockmode_name(int lockmode)
 {
-	return lockmode >= AccessExclusiveLock ? "ACCESS EXCLUSIVE" : "ROW EXCLUSIVE";
+	switch (lockmode)
+	{
+		case RowExclusiveLock:
+			return "ROW EXCLUSIVE";
+		case ExclusiveLock:
+			return "EXCLUSIVE";
+		case AccessExclusiveLock:
+			return "ACCESS EXCLUSIVE";
+	}
+
+	/*
+	 * Anything else is a mode this sink was never taught, and the one thing
+	 * not to do with it is pick a name that happens to compile: naming
+	 * ExclusiveLock "ROW EXCLUSIVE" is what quietly undid the upgrade this
+	 * whole path exists for.
+	 */
+	elog(ERROR, "no LOCK TABLE name for lock mode %d", lockmode);
+	return NULL;				/* unreachable */
 }
 
 /* ------------------------------------------------------------------------
@@ -237,7 +289,23 @@ cbdb_sink_begin_unit(LogicalRepSink *self, const LogicalRepUnit *unit)
 
 		quoted = LrTransportQuoteRel(s->tr, rl->rel.nspname, rl->rel.relname);
 		params[0] = quoted;
-		res = LrTransportExecParams(s->tr, "SELECT to_regclass($1)::oid", 1, params);
+
+		/*
+		 * The access method comes back with the oid because it decides the
+		 * lock: an append-optimized table has no row locking at all
+		 * (appendonly_tuple_lock() raises "tuple locking is not supported on
+		 * appendoptimized tables"), so the table lock is the only thing that
+		 * can keep two row-touching transactions apart.  The test is the
+		 * handler, which is what the server's own AMHandlerIsAO() compares,
+		 * rather than the name a custom access method could borrow.
+		 */
+		res = LrTransportExecParams(s->tr,
+									"SELECT to_regclass($1)::oid,\n"
+									"       (SELECT a.amhandler IN ('ao_row_tableam_handler'::regproc,\n"
+									"                               'ao_column_tableam_handler'::regproc)\n"
+									"          FROM pg_class c JOIN pg_am a ON a.oid = c.relam\n"
+									"         WHERE c.oid = to_regclass($1))",
+									1, params);
 		if (PQgetisnull(res, 0, 0))
 		{
 			PQclear(res);
@@ -248,7 +316,10 @@ cbdb_sink_begin_unit(LogicalRepSink *self, const LogicalRepUnit *unit)
 		}
 		locks[nlocks].oid = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
 		locks[nlocks].quoted = quoted;
-		locks[nlocks].lockmode = rl->lockmode;
+		locks[nlocks].lockmode =
+			sink_lock_taken(rl->lockmode,
+							!PQgetisnull(res, 0, 1) &&
+							PQgetvalue(res, 0, 1)[0] == 't');
 		nlocks++;
 		PQclear(res);
 	}

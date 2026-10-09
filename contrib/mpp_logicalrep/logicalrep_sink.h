@@ -66,7 +66,18 @@ typedef struct LogicalRepRelIdent
 typedef struct LogicalRepRelLock
 {
 	LogicalRepRelIdent rel;
-	int			lockmode;		/* LOCKMODE of the target */
+
+	/*
+	 * What the changes need if the target gives no help below the table:
+	 * AccessExclusiveLock for a TRUNCATE, ExclusiveLock once anything locks
+	 * rows (an UPDATE or a DELETE), RowExclusiveLock for inserts alone.
+	 *
+	 * It is a requirement, not an instruction.  Whether rows can be locked
+	 * at all, and whether a waiting cycle among them would ever be broken,
+	 * are properties of the target -- so a sink that knows its target may
+	 * take less than this, and only it can know that it may.
+	 */
+	int			lockmode;
 } LogicalRepRelLock;
 
 /*
