@@ -1062,6 +1062,58 @@ MEM1 的 `spill_largest_held()`）都跳过它。
 **它同时是 OVERLAP1 的前提**：early apply 之后 apply 不再是一次性的短脉冲而是贯穿整个
 接收过程，那时若 apply 期间不读，源端就永远被堵着。
 
+### FEEDBACK1 — 空闲订阅把源端 WAL 永久钉住 —— **已修**（2026-10-09）
+
+**怎么发现的**：DUTY3 验证期间 `gpstop -a -M fast` 停源端集群卡了好几分钟，只有把目标端
+订阅 disable 掉才放行。看着像个运维小毛病，查下去是个更严重的问题。
+
+**根因**：`driver_send_feedback()` 无条件把 `d->coord_committed` 当作 flush 位点汇报，
+而它**只在批次提交时前进**。订阅空闲（没有任何事务要应用）时它就不动了，可 walsender 的
+`sentPtr` 会随 WAL 一直走。后果有二：
+
+1. **源端为一个空闲订阅无限囤积 WAL。** 实测：订阅完全追平、空闲，
+   `confirmed_flush` 落后 **234 MB 且纹丝不动**；
+   `sent=0/7EDD5F18 write=0/7EDD5F18 flush=0/70377C70`。
+2. **源端停不下来。** `WalSndDone()` 只在 `sentPtr == replicatedPtr` 时 `proc_exit(0)`，
+   而 `replicatedPtr` 取的就是对端汇报的 flush —— 永远等不到。
+
+**段上没有这个问题**：`LrReaderFlushPosition()` 从 `st->pos`（已收位点）起算，只为还没
+释放的事务回退，所以空闲时 flush = pos，实测三个段都 `behind=0 bytes`。**只有协调器那条
+流错了。**
+
+**上游有完全对应的处理，我们漏了**（`worker.c` 的 `send_feedback()`）：
+
+```c
+	/*
+	 * No outstanding transactions to flush, we can report the latest received
+	 * position. This is important for synchronous replication.
+	 */
+	if (!have_pending_txes)
+		flushpos = writepos = recvpos;
+```
+
+**改法**：加 `driver_outstanding()` —— 注册表 `d->gxids` 非空、批次列表非空、
+`d->locals` 非空、`deferred_txns` 非空、或有增表任务在飞，就还有未决事务；否则汇报
+`coord_pos`。安全性来自一个已有的事实：**协调器流的重启点就是 `coord_committed`**
+（`opts.startpoint = (XLogRecPtr) d->coord_committed`），所以"没有未决事务时推进到已收
+位点"恰好是正确的语义。
+
+**验证**：空闲订阅的 `behind` 从 234 MB 且增长变成稳定 **0 bytes**；订阅**保持启用**时
+`gpstop -a -M fast` 从卡死变成 **7 秒**干净停机。
+
+**新用例 `isolation2/idle_feedback`**（确定性，不像 CATCHUP1 / MEM1 那样只能概率复现）。
+写这个用例踩了两个坑，都和"什么样的 WAL 才不产生事件"有关：
+
+- **不能在订阅库里造噪声**（哪怕写的是没发布的表）：它仍然是分布式提交，协调器照样写
+  事件，驱动在 `driver_collect_ready()` 的 `t->nready == 0`（没有任何段报到）那条路上
+  自己就把 `coord_committed` 推过去了。
+- **不能靠"写很多行"**：200K 行写的是**段**的 WAL，协调器上只多一条提交记录。
+
+正确的噪声是**另一个数据库里的事务**：DB1 之后它们被 dbId 过滤掉，`sentPtr` 前进而驱动
+收不到事件。而且观测也必须在那个库里做（`pg_replication_slots` 跨库可见），否则观测本身
+就会产生事件。判据用"记下基准位点、等它超过"，不用阈值。
+未修复时 `followed_the_noise = f` 且跑满 125 秒；修复后 4 秒通过。
+
 ### OVERLAP1 — 让 apply 和传输重叠（**未做**，设计讨论）
 
 10M 单事务 release 上 35.6s = 传输 ~17s + apply ~19s，**严格串行**。完美重叠的下限是
