@@ -1,19 +1,31 @@
 -- The lock a unit takes on the target.
 --
 -- A transaction that truncates has to hold the target table exclusively while
--- it is applied; one that only writes rows must not, or ordinary readers on
--- the target would be stopped by every batch.  The mode is decided per
+-- it is applied; one that only inserts must not, or ordinary readers on the
+-- target would be stopped by every batch.  The mode is decided per
 -- transaction and not per table, so a transaction that truncates one table
 -- and writes another holds both exclusively.
 --
--- What makes this observable is a reader on the target holding the table:
--- ROW EXCLUSIVE does not conflict with it and the apply goes through, ACCESS
--- EXCLUSIVE does and the apply waits until the reader is done.
+-- Between those two there is a third mode.  Without a global deadlock
+-- detector -- which is the default -- the server upgrades an UPDATE or a
+-- DELETE to ExclusiveLock, because a cycle of row waits spread across
+-- segments is invisible to each of them and nothing would break it.  The
+-- apply has to upgrade with it: it takes its locks with LOCK TABLE, which
+-- gives what it is asked for and does not upgrade anything, so an apply that
+-- asked for ROW EXCLUSIVE would be the one session in the cluster holding
+-- cross-segment row locks under it.
 --
---   1  a reader does not stop ordinary changes being applied
+-- What makes all of this observable is a reader on the target holding the
+-- table: ROW EXCLUSIVE does not conflict with it and the apply goes through,
+-- EXCLUSIVE and ACCESS EXCLUSIVE do and the apply waits until the reader is
+-- done.
+--
+--   1  a reader does not stop inserts being applied
 --   2  a reader does stop a TRUNCATE, which lands as soon as it lets go
 --   3  one transaction that truncates one table and writes another waits for
 --      a reader of the table it only writes
+--   4  a reader does stop an UPDATE, which asks for EXCLUSIVE with no
+--      detector to rely on
 
 CREATE DATABASE mpp_lr_tl;
 CREATE
@@ -46,7 +58,7 @@ CREATE
 -- is the apply waiting for this table exclusively?  pg_locks reads the lock
 -- manager itself, so a loop over it sees the present state rather than a
 -- snapshot taken when the enclosing statement began
-1:@db_name mpp_lr_tl: CREATE FUNCTION lr_blocked_on(t text) RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 600 LOOP SELECT count(*) INTO n FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = t AND l.mode = 'AccessExclusiveLock' AND NOT l.granted; IF n > 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
+1:@db_name mpp_lr_tl: CREATE FUNCTION lr_blocked_on(t text, m text DEFAULT 'AccessExclusiveLock') RETURNS bool AS $$ DECLARE n int; BEGIN FOR i IN 1 .. 600 LOOP SELECT count(*) INTO n FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = t AND l.mode = m AND NOT l.granted; IF n > 0 THEN RETURN true; END IF; PERFORM pg_sleep(0.1); END LOOP; RETURN false; END $$ LANGUAGE plpgsql;
 CREATE
 
 1:@db_name mpp_lr_tl: DO $$ BEGIN EXECUTE format('CREATE SUBSCRIPTION tl_sub CONNECTION %L PUBLICATION tl_pub WITH (slot_name = ''tl_slot'')', 'dbname=mpp_lr_source port=' || current_setting('port')); END $$;
@@ -58,7 +70,7 @@ DO
 (1 row)
 
 -- ------------------------------------------------------------------
--- 1. a reader does not stop ordinary changes
+-- 1. a reader does not stop inserts
 -- ------------------------------------------------------------------
 2:@db_name mpp_lr_tl: BEGIN;
 BEGIN
@@ -157,6 +169,42 @@ COMMIT
  phase     | stuck_errors 
 -----------+--------------
  streaming | 0            
+(1 row)
+
+-- ------------------------------------------------------------------
+-- 4. an UPDATE asks for EXCLUSIVE when there is no detector
+-- ------------------------------------------------------------------
+-- The cluster the tests run on has gp_enable_global_deadlock_detector off,
+-- which is the default; with one on, this would be ROW EXCLUSIVE and the
+-- holder below would not stop it.
+--
+-- The holder is ROW SHARE rather than the plain reader used above, because
+-- that reader could not tell the two apart: ACCESS SHARE conflicts with
+-- ACCESS EXCLUSIVE and nothing else, so it stops neither ROW EXCLUSIVE nor
+-- EXCLUSIVE.  ROW SHARE stops EXCLUSIVE and lets ROW EXCLUSIVE through,
+-- which is exactly the question.
+1:@db_name mpp_lr_tl: SELECT current_setting('gp_enable_global_deadlock_detector') AS detector;
+ detector 
+----------
+ off      
+(1 row)
+2:@db_name mpp_lr_tl: BEGIN;
+BEGIN
+2:@db_name mpp_lr_tl: LOCK TABLE tl_b IN ROW SHARE MODE;
+LOCK
+UPDATE tl_b SET v = 'updated under a reader' WHERE id = 1;
+UPDATE 1
+1:@db_name mpp_lr_tl: SELECT lr_blocked_on('tl_b', 'ExclusiveLock') AS update_is_waiting_for_the_reader;
+ update_is_waiting_for_the_reader 
+----------------------------------
+ t                                
+(1 row)
+2:@db_name mpp_lr_tl: COMMIT;
+COMMIT
+1:@db_name mpp_lr_tl: SELECT lr_wait($$SELECT v = 'updated under a reader' FROM tl_b WHERE id = 1$$) AS updated_once_the_reader_let_go;
+ updated_once_the_reader_let_go 
+--------------------------------
+ t                              
 (1 row)
 
 2q: ... <quitting>
