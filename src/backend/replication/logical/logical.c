@@ -1226,6 +1226,43 @@ filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id)
 	return ret;
 }
 
+/*
+ * Cloudberry: a distributed commit event of the coordinator's WAL.  Not
+ * routed through the reorderbuffer (there is usually no transaction to
+ * attach it to); decode.c calls this directly, in WAL order.
+ */
+void
+distributed_commit_cb_wrapper(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+							  DistributedTransactionId gxid, int nsegs,
+							  const int16 *segs)
+{
+	LogicalErrorCallbackState state;
+	ErrorContextCallback errcallback;
+
+	if (ctx->callbacks.distributed_commit_cb == NULL || ctx->fast_forward)
+		return;
+
+	/* Push callback + info on the error context stack */
+	state.ctx = ctx;
+	state.callback_name = "distributed_commit";
+	state.report_location = lsn;
+	errcallback.callback = output_plugin_error_callback;
+	errcallback.arg = (void *) &state;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = InvalidTransactionId;
+	ctx->write_location = lsn;
+	ctx->end_xact = false;
+
+	ctx->callbacks.distributed_commit_cb(ctx, lsn, gxid, nsegs, segs);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
+}
+
 static void
 message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 				   XLogRecPtr message_lsn, bool transactional,

@@ -276,6 +276,68 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 				DecodeAbort(ctx, buf, &parsed, xid, two_phase);
 				break;
 			}
+		case XLOG_XACT_DISTRIBUTED_COMMIT:
+			{
+				/*
+				 * Cloudberry: the coordinator's record of a two-phase
+				 * distributed commit.  It is a normal commit record plus the
+				 * gxid.  Like xact_redo_distributed_commit(), decode it as a
+				 * commit when the coordinator's own transaction has an xid
+				 * (catalog changes); otherwise there is nothing to replay,
+				 * but the event itself is what a Cloudberry apply driver
+				 * waits for: hand it to the output plugin in WAL order.
+				 */
+				xl_xact_commit *xlrec;
+				xl_xact_parsed_commit parsed;
+				TransactionId xid = XLogRecGetXid(r);
+
+				xlrec = (xl_xact_commit *) XLogRecGetData(r);
+				ParseCommitRecord(XLogRecGetInfo(buf->record), xlrec, &parsed);
+
+				if (TransactionIdIsValid(xid))
+					DecodeCommit(ctx, buf, &parsed, xid, false);
+
+				/*
+				 * Only interested in our database: a distributed commit of
+				 * another one says nothing about this slot's streams, and an
+				 * apply driver would wait for segment streams that cannot
+				 * contain it (the target of a subscription inside the same
+				 * cluster commits like this).
+				 */
+				if (parsed.dbId == ctx->slot->data.database &&
+					SnapBuildCurrentState(builder) == SNAPBUILD_CONSISTENT &&
+					!SnapBuildXactNeedsSkip(builder, buf->origptr))
+					distributed_commit_cb_wrapper(ctx, buf->origptr,
+												  parsed.distribXid,
+												  parsed.nparticipants,
+												  parsed.participants);
+				break;
+			}
+		case XLOG_XACT_DISTRIBUTED_FORGET:
+			/* Cloudberry: bookkeeping of the distributed transaction manager */
+			break;
+		case XLOG_XACT_DISTRIBUTED_ONEPHASE:
+			{
+				/*
+				 * Cloudberry: the coordinator's marker of a one-phase commit,
+				 * written after the one participating segment committed.  The
+				 * same event as a distributed commit, with one participant,
+				 * and only interesting in its own database for the same
+				 * reason (above): the segment streams of this slot cannot
+				 * contain a transaction that committed in another one, so an
+				 * apply driver told about it would wait for parts that never
+				 * arrive.
+				 */
+				xl_xact_distributed_onephase *xlrec;
+
+				xlrec = (xl_xact_distributed_onephase *) XLogRecGetData(r);
+				if (xlrec->dbId == ctx->slot->data.database &&
+					SnapBuildCurrentState(builder) == SNAPBUILD_CONSISTENT &&
+					!SnapBuildXactNeedsSkip(builder, buf->origptr))
+					distributed_commit_cb_wrapper(ctx, buf->origptr, xlrec->gxid,
+												  1, &xlrec->seg);
+				break;
+			}
 		case XLOG_XACT_ASSIGNMENT:
 
 			/*
@@ -722,6 +784,18 @@ DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 		ReorderBufferCommitChild(ctx->reorder, xid, parsed->subxacts[i],
 								 buf->origptr, buf->endptr);
 	}
+
+	/*
+	 * Cloudberry: a segment's one-phase commit of a distributed transaction
+	 * carries the gxid; a two-phase one already has it in the gid.  Output
+	 * plugins may pass it on (pgoutput does, on a segment).  The transaction
+	 * is created if it has no decoded changes so that the plugin still sees
+	 * a (empty) transaction carrying the gxid.
+	 */
+	if (!two_phase && !ctx->fast_forward &&
+		(parsed->xinfo & XACT_XINFO_HAS_DISTRIB) && parsed->distribXid != 0)
+		ReorderBufferSetDistributedXid(ctx->reorder, xid, parsed->distribXid,
+									   buf->origptr);
 
 	/*
 	 * Send the final commit record if the transaction data is already

@@ -285,6 +285,12 @@ typedef struct ReorderBufferTXN
 	char	   *gid;
 
 	/*
+	 * Cloudberry: the distributed transaction id of a one-phase commit
+	 * (0 = none / unknown).  Two-phase transactions carry it in the gid.
+	 */
+	DistributedTransactionId distribXid;
+
+	/*
 	 * LSN of the first data carrying, WAL record with knowledge about this
 	 * xid. This is allowed to *not* be first record adorned with this xid, if
 	 * the previous records aren't relevant for logical decoding.
@@ -733,6 +739,8 @@ extern void ReorderBufferImmediateInvalidation(ReorderBuffer *rb, uint32 ninvali
 extern void ReorderBufferProcessXid(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn);
 
 extern void ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn);
+extern void ReorderBufferSetDistributedXid(ReorderBuffer *rb, TransactionId xid,
+										   DistributedTransactionId gxid, XLogRecPtr lsn);
 extern bool ReorderBufferXidHasCatalogChanges(ReorderBuffer *rb, TransactionId xid);
 extern bool ReorderBufferXidHasBaseSnapshot(ReorderBuffer *rb, TransactionId xid);
 

@@ -30,6 +30,7 @@ typedef struct
 	bool		include_xids;
 	bool		include_timestamp;
 	bool		skip_empty_xacts;
+	bool		include_gxid;	/* Cloudberry: print gxids and distributed commits */
 	bool		only_local;
 } TestDecodingData;
 
@@ -57,6 +58,9 @@ static void pg_output_begin(LogicalDecodingContext *ctx,
 							TestDecodingData *data,
 							ReorderBufferTXN *txn,
 							bool last_write);
+static void pg_decode_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+										 DistributedTransactionId gxid, int nsegs,
+										 const int16 *segs);
 static void pg_decode_commit_txn(LogicalDecodingContext *ctx,
 								 ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
 static void pg_decode_change(LogicalDecodingContext *ctx,
@@ -132,6 +136,7 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->change_cb = pg_decode_change;
 	cb->truncate_cb = pg_decode_truncate;
 	cb->commit_cb = pg_decode_commit_txn;
+	cb->distributed_commit_cb = pg_decode_distributed_commit;
 	cb->filter_by_origin_cb = pg_decode_filter;
 	cb->shutdown_cb = pg_decode_shutdown;
 	cb->message_cb = pg_decode_message;
@@ -167,6 +172,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 	data->include_xids = true;
 	data->include_timestamp = false;
 	data->skip_empty_xacts = false;
+	data->include_gxid = false;
 	data->only_local = false;
 
 	ctx->output_plugin_private = data;
@@ -222,6 +228,16 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 			if (elem->arg == NULL)
 				data->skip_empty_xacts = true;
 			else if (!parse_bool(strVal(elem->arg), &data->skip_empty_xacts))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+								strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-gxid") == 0)
+		{
+			if (elem->arg == NULL)
+				data->include_gxid = true;
+			else if (!parse_bool(strVal(elem->arg), &data->include_gxid))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -338,7 +354,32 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	if (data->include_timestamp)
 		appendStringInfo(ctx->out, " (at %s)",
 						 timestamptz_to_str(txn->xact_time.commit_time));
+	if (data->include_gxid && txn->distribXid != 0)
+		appendStringInfo(ctx->out, " (gxid " UINT64_FORMAT ")", txn->distribXid);
 
+	OutputPluginWrite(ctx, true);
+}
+
+/* Cloudberry: distributed commit event of a coordinator stream */
+static void
+pg_decode_distributed_commit(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+							 DistributedTransactionId gxid, int nsegs,
+							 const int16 *segs)
+{
+	TestDecodingData *data = ctx->output_plugin_private;
+
+	if (!data->include_gxid)
+		return;
+
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "DISTRIBUTED COMMIT gxid " UINT64_FORMAT " lsn %X/%X segs",
+					 gxid, LSN_FORMAT_ARGS(lsn));
+	if (nsegs < 0)
+		appendStringInfoString(ctx->out, " none");
+	else if (nsegs == 0)
+		appendStringInfoString(ctx->out, " *");
+	for (int i = 0; i < nsegs; i++)
+		appendStringInfo(ctx->out, " %d", segs[i]);
 	OutputPluginWrite(ctx, true);
 }
 

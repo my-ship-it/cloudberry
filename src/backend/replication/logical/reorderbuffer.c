@@ -3341,6 +3341,21 @@ ReorderBufferExecuteInvalidations(uint32 nmsgs, SharedInvalidationMessage *msgs)
 /*
  * Mark a transaction as containing catalog changes
  */
+/*
+ * Cloudberry: remember the distributed transaction id of xid's one-phase
+ * commit.  Creates the (top-level) transaction if nothing was decoded for
+ * it, so that the commit still reaches the output plugin.
+ */
+void
+ReorderBufferSetDistributedXid(ReorderBuffer *rb, TransactionId xid,
+							   DistributedTransactionId gxid, XLogRecPtr lsn)
+{
+	ReorderBufferTXN *txn;
+
+	txn = ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
+	txn->distribXid = gxid;
+}
+
 void
 ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid,
 								  XLogRecPtr lsn)

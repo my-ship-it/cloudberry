@@ -91,6 +91,20 @@ typedef void (*LogicalDecodeMessageCB) (struct LogicalDecodingContext *ctx,
 										const char *message);
 
 /*
+ * Called for every distributed commit of a Cloudberry coordinator
+ * (XLOG_XACT_DISTRIBUTED_COMMIT) and for one-phase commit markers, in WAL
+ * order and independently of any ReorderBufferTXN: the coordinator's part
+ * of a distributed transaction usually has no xid of its own.  segs lists
+ * the participating segments when the record carries them (nsegs 0 means
+ * unknown).  Optional.
+ */
+typedef void (*LogicalDecodeDistributedCommitCB) (struct LogicalDecodingContext *ctx,
+												  XLogRecPtr lsn,
+												  DistributedTransactionId gxid,
+												  int nsegs,
+												  const int16 *segs);
+
+/*
  * Filter changes by origin.
  */
 typedef bool (*LogicalDecodeFilterByOriginCB) (struct LogicalDecodingContext *ctx,
@@ -240,6 +254,9 @@ typedef struct OutputPluginCallbacks
 	LogicalDecodeStreamChangeCB stream_change_cb;
 	LogicalDecodeStreamMessageCB stream_message_cb;
 	LogicalDecodeStreamTruncateCB stream_truncate_cb;
+
+	/* Cloudberry: distributed commit events of a coordinator stream */
+	LogicalDecodeDistributedCommitCB distributed_commit_cb;
 } OutputPluginCallbacks;
 
 /* Functions in replication/logical/logical.c */
