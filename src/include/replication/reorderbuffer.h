@@ -636,6 +636,19 @@ struct ReorderBuffer
 	bool		output_rewrites;
 
 	/*
+	 * Cloudberry: give a prepared transaction a base snapshot even when
+	 * nothing was decoded for it, so that it
+	 * is replayed and announced like any other.  On a segment every prepared
+	 * transaction is a distributed one -- PrepareTransaction() assigns an
+	 * xid to each, so even a participant that wrote nothing leaves a PREPARE
+	 * record, and its gid is the gxid.  A consumer that waits for every
+	 * participant of a distributed transaction needs to hear from those too;
+	 * without this they are the one kind of participant that never reports,
+	 * and telling them apart from one that is merely slow is not possible.
+	 */
+	bool		announce_empty_prepared;
+
+	/*
 	 * Private memory context.
 	 */
 	MemoryContext context;

@@ -320,6 +320,8 @@ ReorderBufferAllocate(void)
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 
 	buffer->context = new_ctx;
+	/* off unless an output plugin turns it on (pgoutput does, on a segment) */
+	buffer->announce_empty_prepared = false;
 
 	buffer->change_context = SlabContextCreate(new_ctx,
 											   "Change",
