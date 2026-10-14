@@ -187,6 +187,8 @@ typedef struct SavedTransactionCharacteristics
 #define XLOG_XACT_INVALIDATIONS		0x60
 #define XLOG_XACT_DISTRIBUTED_COMMIT 0x70
 #define XLOG_XACT_DISTRIBUTED_FORGET 0x80
+#define XLOG_XACT_DISTRIBUTED_ONEPHASE 0x90	/* coordinator marker of a one-phase
+											 * commit; logical decoding only */
 
 /* mask for filtering opcodes out of xl_info */
 #define XLOG_XACT_OPMASK			0xF0
@@ -209,6 +211,7 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_DROPPED_STATS	(1U << 8)
 #define XACT_XINFO_HAS_DISTRIB			(1U << 9)
 #define XACT_XINFO_HAS_DELDBS			(1U << 10)
+#define XACT_XINFO_HAS_DISTRIB_SEGS		(1U << 11)	/* participating segments follow xl_xact_distrib */
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
  * need to occur when emulating transaction effects during recovery.
@@ -270,6 +273,20 @@ typedef struct xl_xact_distrib
 {
 	DistributedTransactionId distrib_xid;
 } xl_xact_distrib;
+
+/*
+ * Participating segments of a distributed commit (XACT_XINFO_HAS_DISTRIB_SEGS,
+ * only in the coordinator's XLOG_XACT_DISTRIBUTED_COMMIT record): the content
+ * ids the transaction was dispatched to, i.e. those that prepared.  Lets
+ * logical decoding tell an apply driver which segment streams carry the
+ * transaction.
+ */
+typedef struct xl_xact_distrib_segs
+{
+	int16		nsegs;
+	int16		segs[FLEXIBLE_ARRAY_MEMBER];
+} xl_xact_distrib_segs;
+#define MinSizeOfXactDistribSegs offsetof(xl_xact_distrib_segs, segs)
 
 typedef struct xl_xact_dbinfo
 {
@@ -459,6 +476,10 @@ typedef struct xl_xact_parsed_commit
 	TimestampTz origin_timestamp;
 
 	DistributedTransactionId        distribXid;
+	int			nparticipants;	/* XACT_XINFO_HAS_DISTRIB_SEGS: the segments
+								 * the transaction was dispatched to;
+								 * 0 = the record does not say */
+	int16	   *participants;
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
@@ -498,6 +519,26 @@ typedef struct xl_xact_distributed_forget
 {
 	DistributedTransactionId gxid;
 } xl_xact_distributed_forget;
+
+/*
+ * xl_xact_distributed_onephase - written by the coordinator, after the single
+ * participating segment acknowledged a one-phase commit and before the gxid
+ * is marked complete, only when wal_level is logical.  Not flushed, ignored
+ * by redo: it exists so that logical decoding of the coordinator's WAL sees
+ * every distributed commit in commit order (mpp logical replication apply).
+ *
+ * The database is part of it because a slot must not be told about commits
+ * in another one.  A two-phase commit is a commit record and carries the
+ * database already; this record is all there is of a one-phase one, so it
+ * has to say.  A reader told about a transaction whose segment parts are in
+ * a database its stream does not cover waits for parts that cannot arrive.
+ */
+typedef struct xl_xact_distributed_onephase
+{
+	DistributedTransactionId gxid;
+	Oid			dbId;			/* the database it committed in */
+	int16		seg;			/* content id of the participating segment */
+} xl_xact_distributed_onephase;
 
 /* ----------------
  *		extern definitions
@@ -582,6 +623,7 @@ extern void RegisterSubXactCallback(SubXactCallback callback, void *arg);
 extern void UnregisterSubXactCallback(SubXactCallback callback, void *arg);
 
 extern XLogRecPtr RecordDistributedForgetCommitted(DistributedTransactionId gxid);
+extern XLogRecPtr RecordDistributedOnePhaseCommit(DistributedTransactionId gxid, int16 seg);
 extern bool IsSubTransactionAssignmentPending(void);
 extern void MarkSubTransactionAssigned(void);
 extern bool IsSubxactTopXidLogPending(void);

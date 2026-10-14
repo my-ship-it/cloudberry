@@ -23,6 +23,7 @@
 #include "cdb/cdbtm.h"
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
+#include "tcop/tcopprot.h"
 #include "miscadmin.h"
 #include "replication/syncrep.h"
 #include "storage/lmgr.h"
@@ -39,6 +40,7 @@
 #include "cdb/cdbvars.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "cdb/cdbfts.h"
@@ -122,6 +124,8 @@ int gp_gxid_prefetch_num;
  */
 static void doPrepareTransaction(void);
 static XLogRecPtr doInsertForgetCommitted(void);
+
+
 static void doNotifyingOnePhaseCommit(void);
 static void doNotifyingCommitPrepared(void);
 static void doNotifyingAbort(void);
@@ -910,12 +914,30 @@ prepareDtxTransaction(void)
 	if (!TopXactExecutorDidWriteXLog() ||
 		(!markXidCommitted && list_length(MyTmGxactLocal->dtxSegments) < 2))
 	{
+		bool		wrote = TopXactExecutorDidWriteXLog();
+
 		setCurrentDtxState(DTX_STATE_ONE_PHASE_COMMIT);
 		/*
 		 * Notify one phase commit to QE before local transaction xlog recording
 		 * since if it fails we still have chance of aborting the transaction.
 		 */
 		doNotifyingOnePhaseCommit();
+
+		/*
+		 * Logical decoding of the coordinator's WAL sees every two-phase
+		 * commit (XLOG_XACT_DISTRIBUTED_COMMIT) but nothing of a one-phase
+		 * one: leave a marker so that a Cloudberry apply driver gets the
+		 * commit order of all distributed transactions from one stream.
+		 * Written after the segment acknowledged (its commit record is
+		 * flushed and decodable) and before the gxid is marked complete, so
+		 * that anything that saw this transaction's effects is ordered after
+		 * it.  Only for transactions that wrote WAL: a read-only one leaves
+		 * no commit record on the segment for the driver to wait for.
+		 */
+		if (wrote && XLogLogicalInfoActive() &&
+			list_length(MyTmGxactLocal->dtxSegments) == 1)
+			RecordDistributedOnePhaseCommit(MyTmGxact->gxid,
+											(int16) linitial_int(MyTmGxactLocal->dtxSegments));
 		return;
 	}
 
@@ -1299,6 +1321,7 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 					segmentsToContentStr(dtxSegments))));
 
 	ErrorData *qeError;
+
 	results = CdbDispatchDtxProtocolCommand(dtxProtocolCommand,
 											dtxProtocolCommandStr,
 											gid,
@@ -1359,6 +1382,7 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 			cmdStatus = PQcmdStatus(results[i]);
 
 			elog(DEBUG3, "DTM: status message cmd '%s' [%d] result '%s'", dtxProtocolCommandStr, i, cmdStatus);
+
 			if (strncmp(cmdStatus, dtxProtocolCommandStr, strlen(cmdStatus)) != 0)
 			{
 				/* failed */
@@ -2082,6 +2106,7 @@ performDtxProtocolPrepare(const char *gid)
 
 	setDistributedTransactionContext(DTX_CONTEXT_QE_PREPARED);
 }
+
 
 static void
 sendWaitGxidsToQD(List *waitGxids)

@@ -155,6 +155,16 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 		parsed->distribXid = xl_distrib->distrib_xid;
 		data += sizeof(xl_xact_distrib);
 	}
+
+	if (parsed->xinfo & XACT_XINFO_HAS_DISTRIB_SEGS)
+	{
+		xl_xact_distrib_segs *xl_segs = (xl_xact_distrib_segs *) data;
+
+		/* the record lists the participants; none at all = -1 (0 = unknown) */
+		parsed->nparticipants = xl_segs->nsegs > 0 ? xl_segs->nsegs : -1;
+		parsed->participants = xl_segs->segs;
+		data += MinSizeOfXactDistribSegs + xl_segs->nsegs * sizeof(int16);
+	}
 }
 
 void
@@ -448,6 +458,15 @@ xact_desc_distributed_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, 
 
 	appendStringInfoString(buf, timestamptz_to_str(xlrec->xact_time));
 	appendStringInfo(buf, " gxid = "UINT64_FORMAT, parsed.distribXid);
+	if (parsed.nparticipants > 0)
+	{
+		appendStringInfoString(buf, " segs = {");
+		for (int i = 0; i < parsed.nparticipants; i++)
+			appendStringInfo(buf, "%s%d", i ? "," : "", parsed.participants[i]);
+		appendStringInfoChar(buf, '}');
+	}
+	else if (parsed.nparticipants < 0)
+		appendStringInfoString(buf, " segs = {}");
 }
 
 static void
@@ -594,6 +613,13 @@ xact_desc(StringInfo buf, XLogReaderState *record)
 		appendStringInfo(buf, "distributed forget ");
 		xact_desc_distributed_forget(buf, xlrec);
 	}
+	else if (info == XLOG_XACT_DISTRIBUTED_ONEPHASE)
+	{
+		xl_xact_distributed_onephase *xlrec = (xl_xact_distributed_onephase *) rec;
+
+		appendStringInfo(buf, "distributed one-phase commit gxid " UINT64_FORMAT " dbid %u seg %d",
+						 xlrec->gxid, xlrec->dbId, xlrec->seg);
+	}
 	else if (info == XLOG_XACT_INVALIDATIONS)
 	{
 		xl_xact_invals *xlrec = (xl_xact_invals *) rec;
@@ -633,6 +659,9 @@ xact_identify(uint8 info)
 			break;
 		case XLOG_XACT_DISTRIBUTED_FORGET:
 			id = "DISTRIBUTED_FORGET";
+			break;
+		case XLOG_XACT_DISTRIBUTED_ONEPHASE:
+			id = "DISTRIBUTED_ONEPHASE";
 			break;
 		case XLOG_XACT_INVALIDATIONS:
 			id = "INVALIDATION";
