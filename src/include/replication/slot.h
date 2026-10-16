@@ -253,6 +253,17 @@ extern void CheckPointReplicationSlots(void);
 extern void CheckSlotRequirements(void);
 extern void CheckSlotPermissions(void);
 
+/*
+ * Cloudberry: what pg_create_logical_replication_slot() is made of.  A
+ * cluster-wide slot is the same slot on every node, so whatever makes one
+ * here has to make the others too, and nothing about this is private to
+ * slotfuncs.c.
+ */
+extern void create_logical_replication_slot(char *name, char *plugin,
+											bool temporary, bool two_phase,
+											XLogRecPtr restart_lsn,
+											bool find_startpoint);
+
 extern void ReplicationSlotDropIfExists(const char *name);
 
 #endif							/* SLOT_H */

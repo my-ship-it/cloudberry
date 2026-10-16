@@ -123,7 +123,7 @@ pg_create_physical_replication_slot(PG_FUNCTION_ARGS)
  * When find_startpoint is false, the slot's confirmed_flush is not set; it's
  * caller's responsibility to ensure it's set to something sensible.
  */
-static void
+void
 create_logical_replication_slot(char *name, char *plugin,
 								bool temporary, bool two_phase,
 								XLogRecPtr restart_lsn,
